@@ -294,3 +294,29 @@ export interface SkillsList {
 export interface SkillDetail extends SkillInfo {
   content: string
 }
+
+export interface KnowledgeItem {
+  id: string
+  kind: 'skill' | 'memory' | 'doc'
+  kindLabel: string
+  title: string
+  source: string
+  modified: number
+  preview: string
+}
+
+export interface KnowledgeList {
+  query: string
+  count: number
+  items: KnowledgeItem[]
+  sources: Record<string, number>
+}
+
+export interface KnowledgeContent {
+  kind: string
+  name: string
+  title: string
+  source: string
+  modified: number
+  content: string
+}

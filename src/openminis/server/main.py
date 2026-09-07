@@ -44,6 +44,7 @@ from ..settings.remote_models import (
 from ..settings.store import SettingsError, SettingsStore
 from ..skills import SkillStore
 from . import chat_api, compaction, fs_api, workspaces, chat_store
+from .knowledge_api import router as knowledge_router
 from .skills_api import router as skills_router
 from .system_api import router as system_router
 
@@ -93,6 +94,7 @@ app.include_router(workspaces.router)
 app.include_router(fs_api.router)
 app.include_router(system_router)
 app.include_router(skills_router)
+app.include_router(knowledge_router)
 
 
 # ---------------------------------------------------------------------------

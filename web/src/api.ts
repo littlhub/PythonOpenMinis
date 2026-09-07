@@ -13,6 +13,8 @@ import type {
   FsRoot,
   HealthInfo,
   HistoryEntry,
+  KnowledgeContent,
+  KnowledgeList,
   MemoryDoc,
   MemoryList,
   ServerFrame,
@@ -203,6 +205,15 @@ export const api = {
       `/skills/${encodeURIComponent(name)}`,
       { method: 'DELETE' },
     ),
+
+  // -- knowledge (知识库搜索) -------------------------------------
+  knowledgeSearch: (q = '', kind = '', limit = 80) =>
+    request<KnowledgeList>(
+      `/knowledge?q=${encodeURIComponent(q)}&kind=${encodeURIComponent(kind)}&limit=${limit}`,
+    ),
+
+  knowledgeContent: (kind: string, name: string) =>
+    request<KnowledgeContent>(`/knowledge/content/${kind}/${encodeURIComponent(name)}`),
 }
 
 /** Trigger a browser download for a backend file endpoint (GET). */
