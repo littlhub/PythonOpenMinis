@@ -202,7 +202,28 @@ def _write_wiki(topics: list[tuple[str, str]]) -> list[str]:
         content = f"# {title}\n\n{body.strip()}\n"
         (wiki / fname).write_text(content, encoding="utf-8")
         written.append(f"wiki/{fname}")
+    _refresh_index()
     return sorted(set(written))
+
+
+def _refresh_index() -> None:
+    """Rebuild wiki/index.md from the current topic files (each file = one
+    retrievable corpus chunk — the index the knowledge-wiki skill consults)."""
+    wiki = _wiki_dir()
+    if not wiki.is_dir():
+        return
+    lines = ["# 知识库索引", "", "> 自动生成：memory 整理 / knowledge-wiki 技能每次写入后更新。", ""]
+    for p in sorted(wiki.glob("*.md")):
+        if p.name == "index.md":
+            continue
+        title = ""
+        for raw in p.read_text(encoding="utf-8", errors="replace").splitlines()[:5]:
+            if raw.startswith("# "):
+                title = raw[2:].strip()
+                break
+        lines.append(f"- [{title or p.stem}]({p.name})")
+    if len(lines) > 4:
+        (wiki / "index.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 async def _summarize(provider: Any, source: str) -> str:

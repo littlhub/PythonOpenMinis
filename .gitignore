@@ -28,3 +28,6 @@ ccjcode1.exe
 
 # Vite config timestamp leftovers
 web/vite.config.ts.timestamp-*.mjs
+
+# Non-bundled third-party skill copied in by external tools
+src/openminis/skills/builtin/skill-creator/

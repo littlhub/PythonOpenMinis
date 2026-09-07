@@ -92,6 +92,10 @@ class SkillStore:
         bundled = _bundled_dir()
         if bundled.is_dir():
             for src in sorted(p for p in bundled.iterdir() if p.is_dir()):
+                # A `.skip` marker (e.g. third-party skills dropped in by
+                # other tools) keeps a bundle out of the install set.
+                if (src / ".skip").exists():
+                    continue
                 dest = self.root / src.name
                 # Never clobber: a user-edited skill stays user-edited.
                 if not (dest / SKILL_FILE).exists():
