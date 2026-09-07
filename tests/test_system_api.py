@@ -113,12 +113,17 @@ def test_memory_write_read_list_delete(isolated_home):
 
 @pytest.mark.parametrize(
     "name",
-    ["../outside.md", "a/b.md", "evil.exe", "GLOBAL.MD.exe", "x" * 90, "..%2F..%2Fx.md"],
+    ["../outside.md", "./x.md", "a//b.md", "a/./b.md", "evil.exe",
+     "GLOBAL.MD.exe", "x" * 90, "..%2F..%2Fx.md"],
 )
 def test_memory_name_is_whitelisted(isolated_home, name):
     """The hostile names exercise the resolver directly (raw HTTP paths get
     normalised by client/router before the guard runs); a benign invalid name
-    is checked over HTTP too."""
+    is checked over HTTP too.
+
+    Category sub-paths (``wiki/topic.md``) are *allowed* — see
+    test_memory_category_subpaths.
+    """
     with pytest.raises(HTTPException) as exc:
         _resolve_memory(name)
     assert exc.value.status_code == 400
@@ -131,6 +136,36 @@ def test_memory_name_is_whitelisted(isolated_home, name):
         == 400
     )
     assert client.delete("/api/system/memory/evil.exe").status_code == 400
+
+
+def test_memory_category_subpaths(isolated_home):
+    """wiki/<topic>.md / rules/RULES.md can be written, listed and read."""
+    client, tmp = isolated_home
+    mem = tmp / "memory"
+    mem.mkdir(exist_ok=True)
+
+    for rel, content in [
+        ("wiki/project-conventions.md", "# 项目约定\n\n- 用 uv\n"),
+        ("rules/RULES.md", "- 永远说中文\n"),
+    ]:
+        r = client.put(f"/api/system/memory/{rel}", json={"content": content})
+        assert r.status_code == 200, r.text
+
+    names = [f["name"] for f in client.get("/api/system/memory").json()["files"]]
+    assert "wiki/project-conventions.md" in names
+    assert "rules/RULES.md" in names
+
+    got = client.get("/api/system/memory/wiki/project-conventions.md").json()
+    assert "用 uv" in got["content"]
+    assert client.get("/api/system/memory/rules/RULES.md").status_code == 200
+
+    # traversal through a subdir is refused by the resolver (raw ".." names
+    # cannot even reach the router — httpx normalises them first)
+    with pytest.raises(HTTPException):
+        _resolve_memory("wiki/../GLOBAL.md")
+    assert (
+        client.get("/api/system/memory/wiki/../GLOBAL.md").status_code in {400, 404}
+    )
 
 
 def test_backup_zip_contains_settings_memory_prefs(isolated_home):

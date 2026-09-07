@@ -320,3 +320,13 @@ export interface KnowledgeContent {
   modified: number
   content: string
 }
+
+/** Result of a memory-organize pass (daily logs → RULES.md + wiki/*). */
+export interface OrganizeResponse {
+  ok: boolean
+  applied: boolean
+  message: string
+  logsRead: number
+  rules: number
+  wiki: string[]
+}

@@ -17,6 +17,7 @@ import type {
   KnowledgeList,
   MemoryDoc,
   MemoryList,
+  OrganizeResponse,
   ServerFrame,
   SettingsInfo,
   SettingsPayload,
@@ -187,6 +188,9 @@ export const api = {
       `/system/memory/${encodeURIComponent(name)}`,
       { method: 'DELETE' },
     ),
+
+  memoryOrganize: () =>
+    request<OrganizeResponse>('/system/memory/organize', { method: 'POST' }),
 
   // -- skills (技能) ----------------------------------------------
   skillsList: () => request<SkillsList>('/skills'),

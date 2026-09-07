@@ -24,6 +24,7 @@ from fastapi import APIRouter, HTTPException, Query
 from ..core.context import app_context  # noqa: F401
 from ..skills import SkillStore
 from ..tools.memory_tools import _memory_dir
+from .system_api import _resolve_memory
 
 router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
 
@@ -36,7 +37,6 @@ _DOC_FILES = {
     "PORTING_MAP.md",
 }
 
-_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
 _KIND_ORDER = {"skill": 0, "memory": 1, "doc": 2}
 _KIND_LABEL = {"skill": "技能", "memory": "记忆", "doc": "项目文档"}
 
@@ -61,18 +61,19 @@ def _iter_docs() -> Iterator[_Doc]:
             modified=0,
             text=entry.body or "",
         )
-    # memory files
+    # memory files — daily logs, wiki/<topic>.md, rules/RULES.md (recursive)
     root = _memory_dir()
     if root.is_dir():
-        for p in sorted(root.glob("*.md"), key=lambda x: x.name):
+        for p in sorted(root.rglob("*.md"), key=lambda x: x.as_posix()):
             try:
                 text = p.read_text(encoding="utf-8", errors="replace")
             except OSError:  # pragma: no cover
                 continue
+            rel = p.relative_to(root).as_posix()
             yield _Doc(
                 kind="memory",
-                name=p.name,
-                title=p.name.removesuffix(".md"),
+                name=rel,
+                title=rel.removesuffix(".md"),
                 modified=int(p.stat().st_mtime * 1000),
                 text=text,
             )
@@ -165,20 +166,17 @@ async def knowledge_content(kind: str, name: str) -> dict[str, Any]:
             "content": entry.body,
         }
     if kind == "memory":
-        if not _NAME_RE.match(name):
-            raise HTTPException(status_code=400, detail="invalid_name")
-        p = (_memory_dir() / name).resolve()
-        if p.parent != _memory_dir().resolve() or p.suffix.lower() not in {".md", ".txt"}:
-            raise HTTPException(status_code=400, detail="invalid_name")
-        if not p.is_file():
+        path = _resolve_memory(name)  # raises HTTPException(400) on bad name
+        if not path.is_file():
             raise HTTPException(status_code=404, detail="not_found")
-        text = p.read_text(encoding="utf-8", errors="replace")
+        text = path.read_text(encoding="utf-8", errors="replace")
+        rel = path.relative_to(_memory_dir()).as_posix()
         return {
             "kind": kind,
-            "name": p.name,
-            "title": p.name.removesuffix(".md"),
-            "source": p.name,
-            "modified": int(p.stat().st_mtime * 1000),
+            "name": rel,
+            "title": rel.removesuffix(".md"),
+            "source": rel,
+            "modified": int(path.stat().st_mtime * 1000),
             "content": text,
         }
     # doc — whitelist only

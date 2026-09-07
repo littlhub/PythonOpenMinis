@@ -22,6 +22,23 @@ function rank(name: string): number {
   return 2
 }
 
+type Category = 'all' | 'daily' | 'wiki' | 'rules' | 'core'
+
+function categoryOf(name: string): Category {
+  if (name.startsWith('wiki/')) return 'wiki'
+  if (name.startsWith('rules/')) return 'rules'
+  if (/^\d{4}-\d{2}-\d{2}\.md$/.test(name)) return 'daily'
+  return 'core'
+}
+
+const CATEGORY_LABEL: Record<Category, string> = {
+  all: '全部',
+  daily: '日常',
+  wiki: '长期 wiki',
+  rules: '规则',
+  core: '核心',
+}
+
 export function MemoryView() {
   const [files, setFiles] = useState<MemoryFileInfo[]>([])
   const [dir, setDir] = useState('')
@@ -38,6 +55,8 @@ export function MemoryView() {
 
   const [creating, setCreating] = useState(false)
   const [newName, setNewName] = useState('')
+  const [category, setCategory] = useState<Category>('all')
+  const [organizing, setOrganizing] = useState(false)
 
   const load = async () => {
     setLoading(true)
@@ -139,12 +158,29 @@ export function MemoryView() {
     }
   }
 
+  const doOrganize = async () => {
+    if (organizing) return
+    setOrganizing(true)
+    setNotice('')
+    setError('')
+    try {
+      const r = await api.memoryOrganize()
+      setNotice(r.message)
+      await load()
+    } catch (e) {
+      setNotice(e instanceof Error ? e.message : String(e))
+    } finally {
+      setOrganizing(false)
+    }
+  }
+
   const filtered = files
     .filter(
       (f) =>
-        !search ||
-        f.name.toLowerCase().includes(search.toLowerCase()) ||
-        f.preview.toLowerCase().includes(search.toLowerCase()),
+        (category === 'all' || categoryOf(f.name) === category) &&
+        (!search ||
+          f.name.toLowerCase().includes(search.toLowerCase()) ||
+          f.preview.toLowerCase().includes(search.toLowerCase())),
     )
     .sort((a, b) => rank(a.name) - rank(b.name) || b.mtime - a.mtime)
 
@@ -153,9 +189,19 @@ export function MemoryView() {
       <div className="pane-card">
         <div className="kb-header">
           <h2>🧠 记忆管理</h2>
-          <span className="kb-count">
-            {loading ? '加载中…' : `${files.length} 个记忆文件`}
-          </span>
+          <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+            <span className="kb-count">
+              {loading ? '加载中…' : `${files.length} 个记忆文件`}
+            </span>
+            <button
+              className="memory-action-btn"
+              title="把日常日志整理成 RULES.md + wiki/ 主题文档（需已配置模型）"
+              disabled={organizing}
+              onClick={() => void doOrganize()}
+            >
+              {organizing ? '整理中…' : '🧹 整理记忆'}
+            </button>
+          </div>
         </div>
 
         {error && <div className="note note-warn">加载失败：{error}</div>}
@@ -166,6 +212,18 @@ export function MemoryView() {
         <div style={{ display: 'flex', gap: 16, alignItems: 'stretch', marginTop: 10 }}>
           {/* 左栏：搜索 + 文件列表 */}
           <div style={{ width: 280, flex: '0 0 280px', display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <div className="kb-categories" style={{ flex: '0 0 auto', flexWrap: 'wrap' }}>
+              {(Object.keys(CATEGORY_LABEL) as Category[]).map((c) => (
+                <button
+                  key={c}
+                  className={`kb-cat-btn ${category === c ? 'active' : ''}`}
+                  onClick={() => setCategory(c)}
+                >
+                  {CATEGORY_LABEL[c]}
+                </button>
+              ))}
+            </div>
+
             <div className="kb-search" style={{ flex: '0 0 auto' }}>
               <span className="kb-search-icon">🔍</span>
               <input
@@ -180,7 +238,7 @@ export function MemoryView() {
               <div className="create-task-form" style={{ display: 'flex', gap: 6 }}>
                 <input
                   type="text"
-                  placeholder="文件名（自动补 .md）"
+                  placeholder="如 wiki/主题 或 rules/xxx 或 2026-09-08"
                   value={newName}
                   autoFocus
                   onChange={(e) => setNewName(e.target.value)}

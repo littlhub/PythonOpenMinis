@@ -36,14 +36,12 @@ from ..soul import (
     contains_injection_pattern,
 )
 from ..tools.memory_tools import _memory_dir  # shared single source of truth
+from .memory_organizer import organize_memories
 
 logger = get_logger(__name__)
 
 router = APIRouter(prefix="/api/system", tags=["system"])
 
-#: Memory files are plain Markdown/text in the memory dir only.
-_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$")
-_ALLOWED_SUFFIX = {".md", ".txt"}
 _LOG_MAIN = "minis.log"
 
 __all__ = ["router"]
@@ -68,11 +66,25 @@ def _dir_stats(root: Path) -> tuple[int, int]:
 
 
 def _resolve_memory(name: str) -> Path:
-    if not _NAME_RE.match(name):
+    """Resolve a memory file name to a path inside the memory root.
+
+    ``name`` may be a bare file (``2026-09-08.md``) or a relative path into a
+    category folder (``wiki/project-conventions.md``, ``rules/RULES.md``).
+    Anything that escapes the memory root is rejected.
+    """
+    if not name or ".." in name or name.startswith(("/", "\\")):
         raise HTTPException(status_code=400, detail="invalid_name")
-    path = (_memory_dir() / name).resolve()
+    candidate = name.replace("\\", "/")
+    if len(candidate) > 240:
+        raise HTTPException(status_code=400, detail="invalid_name")
+    parts = candidate.split("/")
+    if any(part in {"", "."} or len(part) > 80 for part in parts):
+        raise HTTPException(status_code=400, detail="invalid_name")
+    if not parts[-1].lower().endswith((".md", ".txt")):
+        raise HTTPException(status_code=400, detail="invalid_name")
+    path = (_memory_dir() / candidate).resolve()
     mem_root = _memory_dir().resolve()
-    if path.parent != mem_root or path.suffix.lower() not in _ALLOWED_SUFFIX:
+    if mem_root not in path.parents or path.suffix.lower() not in {".md", ".txt"}:
         raise HTTPException(status_code=400, detail="invalid_name")
     return path
 
@@ -228,15 +240,15 @@ async def memory_list() -> dict[str, Any]:
     root = _memory_dir()
     files: list[dict[str, Any]] = []
     if root.is_dir():
-        for p in sorted(root.glob("*.md"), key=lambda x: x.name):
-            stat = p.stat()
+        for p in sorted(root.rglob("*.md"), key=lambda x: x.as_posix()):
             try:
+                stat = p.stat()
                 text = p.read_text(encoding="utf-8", errors="replace")
             except OSError:  # pragma: no cover
                 continue
             files.append(
                 {
-                    "name": p.name,
+                    "name": p.relative_to(root).as_posix(),
                     "size": stat.st_size,
                     "mtime": int(stat.st_mtime * 1000),
                     "preview": _preview(text),
@@ -245,7 +257,7 @@ async def memory_list() -> dict[str, Any]:
     return {"dir": str(root), "files": files}
 
 
-@router.get("/memory/{name}")
+@router.get("/memory/{name:path}")
 async def memory_get(name: str) -> dict[str, Any]:
     path = _resolve_memory(name)
     if not path.exists():
@@ -254,7 +266,7 @@ async def memory_get(name: str) -> dict[str, Any]:
     return {"name": path.name, "size": len(text.encode("utf-8")), "content": text}
 
 
-@router.put("/memory/{name}")
+@router.put("/memory/{name:path}")
 async def memory_put(name: str, payload: dict[str, Any]) -> dict[str, Any]:
     """Overwrite one memory file (``{"content": str}``). New files may be
     created by PUTting a name that does not exist yet."""
@@ -267,7 +279,7 @@ async def memory_put(name: str, payload: dict[str, Any]) -> dict[str, Any]:
     return {"name": path.name, "size": len(content.encode("utf-8")), "content": content}
 
 
-@router.delete("/memory/{name}")
+@router.delete("/memory/{name:path}")
 async def memory_delete(name: str) -> dict[str, Any]:
     path = _resolve_memory(name)
     if not path.exists():
@@ -281,6 +293,40 @@ async def memory_delete(name: str) -> dict[str, Any]:
         ) from None
     logger.info("memory deleted: %s", path.name)
     return {"ok": True, "name": path.name}
+
+
+@router.post("/memory/organize")
+async def memory_organize() -> dict[str, Any]:
+    """整理记忆: 把日常日志/规则/wiki 交给模型, 归纳为 RULES.md + wiki/<topic>.md。
+
+    Requires an LLM provider to be configured (same setup as chat).
+    """
+    try:
+        result = await organize_memories()
+    except Exception as e:
+        logger.exception("memory organise failed")
+        raise HTTPException(
+            status_code=400,
+            detail=f"整理失败：{e or '未知错误'}（请确认已在 设置 → 模型服务 配置模型）",
+        ) from None
+    if not result.applied:
+        return {
+            "ok": True,
+            "applied": False,
+            "message": result.skipped or "没有需要整理的内容",
+            "logsRead": result.logs_read,
+            "rules": 0,
+            "wiki": [],
+        }
+    return {
+        "ok": True,
+        "applied": True,
+        "message": f"已整理 {result.logs_read} 份日志 → {result.rules_lines} 条规则、"
+        f"{len(result.wiki_files)} 篇 wiki",
+        "logsRead": result.logs_read,
+        "rules": result.rules_lines,
+        "wiki": result.wiki_files,
+    }
 
 
 # ---------------------------------------------------------------------------
