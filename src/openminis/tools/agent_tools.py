@@ -27,10 +27,14 @@ from .browser_use_tool import BrowserUseTool
 from .file_edit_tool import FileEditTool
 from .file_read_tool import FileReadTool
 from .file_write_tool import FileWriteTool
+from .ls_tool import LsTool
 from .memory_tools import memory_get_definition, memory_write_definition
 from .read_image_tool import ReadImageTool
+from .search_files_tool import SearchFilesTool
 from .shell_execute_tool import ShellExecuteTool
 from .vision_group_resolver import VisionGroupResolver
+from .web_fetch_tool import WebFetchTool
+from .web_search_tool import WebSearchTool
 
 __all__ = ["AgentTools", "make_agent_tools"]
 
@@ -49,6 +53,11 @@ class AgentTools:
             FileReadTool.definition(),
             FileWriteTool.definition(),
             FileEditTool.definition(),
+            # First-agent toolset additions (see tools/firstagenttools):
+            # listing + content/name search + web fetch/search. Cheap to expose
+            # unconditionally — web_search reports "not configured" at call time.
+            LsTool.definition(),
+            SearchFilesTool.definition(),
         ]
         # [T-android-vision-group / GH#182] when the main model can't see
         # natively but a Vision Group is bound, still expose read_image so
@@ -56,6 +65,8 @@ class AgentTools:
         if supports_image_input or vision_group_configured:
             out.append(ReadImageTool.definition())
         out.append(BrowserUseTool.definition())
+        out.append(WebFetchTool.definition())
+        out.append(WebSearchTool.definition())
         # [T-memory-toggle-gates-injection-and-tools-android] memory off
         # means memory_write / memory_get are dropped from the schema so the
         # model can't even attempt them.

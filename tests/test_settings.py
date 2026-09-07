@@ -46,6 +46,10 @@ def test_default_settings_have_catalog(store):
         "browser_use",
         "memory_write",
         "memory_get",
+        "ls",
+        "search_files",
+        "web_fetch",
+        "web_search",
     ]
 
 
@@ -148,9 +152,13 @@ async def test_chat_setup_roundtrip_with_fake_engine(store, monkeypatch):
         "file_edit",
         "file_read",
         "file_write",
+        "ls",
         "memory_get",
         "memory_write",
+        "search_files",
         "shell_execute",
+        "web_fetch",
+        "web_search",
     ]
     assert options.system_prompt  # identity persona injected
 

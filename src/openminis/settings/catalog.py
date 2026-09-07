@@ -20,6 +20,7 @@ from ..tools.browser_use_tool import BrowserUseTool
 from ..tools.file_edit_tool import FileEditTool
 from ..tools.file_read_tool import FileReadTool
 from ..tools.file_write_tool import FileWriteTool
+from ..tools.ls_tool import LsTool
 from ..tools.memory_tools import (
     MemoryGetTool,
     MemoryWriteTool,
@@ -27,8 +28,11 @@ from ..tools.memory_tools import (
     memory_write_definition,
 )
 from ..tools.read_image_tool import ReadImageTool
+from ..tools.search_files_tool import SearchFilesTool
 from ..tools.shell_execute_tool import ShellExecuteTool
 from ..tools.vision_group_resolver import VisionGroupResolver
+from ..tools.web_fetch_tool import WebFetchTool
+from ..tools.web_search_tool import WebSearchTool
 
 __all__ = [
     "ProviderMeta",
@@ -165,6 +169,10 @@ BUILTIN_IDENTITIES: list[Identity] = [
             "file_read",
             "file_write",
             "file_edit",
+            "ls",
+            "search_files",
+            "web_fetch",
+            "web_search",
             "memory_write",
             "memory_get",
         ],
@@ -183,6 +191,10 @@ BUILTIN_IDENTITIES: list[Identity] = [
             "file_read",
             "file_write",
             "file_edit",
+            "ls",
+            "search_files",
+            "web_fetch",
+            "web_search",
             "memory_write",
             "memory_get",
         ],
@@ -201,6 +213,8 @@ BUILTIN_IDENTITIES: list[Identity] = [
             "file_read",
             "file_write",
             "file_edit",
+            "ls",
+            "search_files",
             "read_image",
             "memory_write",
             "memory_get",
@@ -227,6 +241,10 @@ IDENTITY_TOOL_MATCH: dict[str, list[str]] = {
         "file_read",
         "file_write",
         "file_edit",
+        "ls",
+        "search_files",
+        "web_fetch",
+        "web_search",
         "memory_write",
         "memory_get",
     ],
@@ -235,6 +253,10 @@ IDENTITY_TOOL_MATCH: dict[str, list[str]] = {
         "file_read",
         "file_write",
         "file_edit",
+        "ls",
+        "search_files",
+        "web_fetch",
+        "web_search",
         "memory_write",
         "memory_get",
     ],
@@ -243,6 +265,8 @@ IDENTITY_TOOL_MATCH: dict[str, list[str]] = {
         "file_read",
         "file_write",
         "file_edit",
+        "ls",
+        "search_files",
         "read_image",
         "memory_write",
         "memory_get",
@@ -277,6 +301,14 @@ def _tool_desc(tool_id: str) -> str:
             return memory_write_definition().description
         if tool_id == "memory_get":
             return memory_get_definition().description
+        if tool_id == "ls":
+            return LsTool.definition().description
+        if tool_id == "search_files":
+            return SearchFilesTool.definition().description
+        if tool_id == "web_fetch":
+            return WebFetchTool.definition().description
+        if tool_id == "web_search":
+            return WebSearchTool.definition().description
     except Exception:  # pragma: no cover - defensive
         pass
     return tool_id
@@ -334,6 +366,30 @@ TOOL_CATALOG: list[dict] = [
         "name": "读取记忆",
         "description": _tool_desc("memory_get"),
         "category": "Memory",
+    },
+    {
+        "id": "ls",
+        "name": "列目录",
+        "description": _tool_desc("ls"),
+        "category": "Files",
+    },
+    {
+        "id": "search_files",
+        "name": "搜索文件",
+        "description": _tool_desc("search_files"),
+        "category": "Files",
+    },
+    {
+        "id": "web_fetch",
+        "name": "抓取网页",
+        "description": _tool_desc("web_fetch"),
+        "category": "Web",
+    },
+    {
+        "id": "web_search",
+        "name": "联网搜索",
+        "description": _tool_desc("web_search"),
+        "category": "Web",
     },
 ]
 
@@ -418,6 +474,22 @@ def build_tool_registry(enabled_ids: list[str]) -> dict[str, ToolExecutor]:
         elif tool_id == "memory_get":
             out[tool_id] = _wrap_static_executor(
                 MemoryGetTool.definition(), MemoryGetTool.execute
+            )
+        elif tool_id == "ls":
+            out[tool_id] = _wrap_async_static_executor(
+                LsTool.definition(), LsTool.execute
+            )
+        elif tool_id == "search_files":
+            out[tool_id] = _wrap_async_static_executor(
+                SearchFilesTool.definition(), SearchFilesTool.execute
+            )
+        elif tool_id == "web_fetch":
+            out[tool_id] = _wrap_async_static_executor(
+                WebFetchTool.definition(), WebFetchTool.execute
+            )
+        elif tool_id == "web_search":
+            out[tool_id] = _wrap_async_static_executor(
+                WebSearchTool.definition(), WebSearchTool.execute
             )
     return out
 
