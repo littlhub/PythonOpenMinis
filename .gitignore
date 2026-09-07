@@ -1,0 +1,30 @@
+# Python port runtime artifacts
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Web service runtime
+.minis-server.pid
+*.log
+
+# Frontend
+web/node_modules/
+web/dist/
+web/*.tsbuildinfo
+
+# Scratch / local temp (never tracked)
+tmp/
+
+# Tooling
+.coverage
+htmlcov/
+
+# Local snapshot / tooling binaries (not part of the port)
+.ccjcode_versions/
+ccjcode1.exe
+
+# Vite config timestamp leftovers
+web/vite.config.ts.timestamp-*.mjs
