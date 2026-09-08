@@ -286,6 +286,13 @@ class AgentRuntime:
                 if rec.level == LoopLevel.WARNING and rec.message:
                     out_text = f"{out_text}\n\n{rec.message}"
 
+                # One-line run-trace entry so server logs keep an auditable
+                # "which tool ran when" trail (name, success, output size).
+                logger.info(
+                    "tool_call session=%s name=%s ok=%s chars=%s",
+                    session_id, tu.name, result.success, len(out_text or ""),
+                )
+
                 if not result.success and not result.output.startswith("[command timed out"):
                     out_text = out_text or "(failed with no output)"
 

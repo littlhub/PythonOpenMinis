@@ -93,6 +93,13 @@ class ToolLoopConfig:
     unknown_tool_threshold: int = 10
     critical_threshold: int = 20
     global_circuit_breaker_threshold: int = 30
+    #: Query-style tools (memory_get / web_search / web_fetch) get a stricter
+    #: *same-name* guard: N consecutive calls of the same query tool count even
+    #: when every call has different arguments (the classic "keep re-searching
+    #: with new keywords" spiral that identical-args detection never sees).
+    query_tools: tuple[str, ...] = ("memory_get", "web_search", "web_fetch")
+    query_warning_threshold: int = 5
+    query_critical_threshold: int = 10
 
 
 class ToolLoopDetector:
@@ -192,7 +199,51 @@ class ToolLoopDetector:
                 return LoopCheckResult(LoopLevel.WARNING, msg,
                                        f"repeat:{tool_name}:{args_hash}")
 
+        # 5. query_tool_runaway — memory_get / web_search / web_fetch called
+        #    many times in a row *regardless of arguments*. Identical-args
+        #    detection (rules 2-4) never fires here because the model shuffles
+        #    keywords each call, yet the survey makes no progress — exactly the
+        #    "整理知识 → 反复 memory_get" spiral. A different tool in between
+        #    resets the streak.
+        if tool_name in self.config.query_tools:
+            streak = self._consecutive_same_tool_streak(tool_name)
+            if streak >= self.config.query_critical_threshold:
+                msg = (
+                    f"[LOOP BLOCKED] CRITICAL: you have called {tool_name} "
+                    f"{streak} times in a row with no other tool in between. "
+                    "Re-searching does not add information. Stop now and answer "
+                    "with what you already have, or tell the user the task needs "
+                    "more input."
+                )
+                logger.warning("CRITICAL query_tool_runaway tool=%s streak=%s",
+                               tool_name, streak)
+                return LoopCheckResult(LoopLevel.CRITICAL, msg)
+            if streak >= self.config.query_warning_threshold:
+                msg = (
+                    f"[LOOP WARNING] {tool_name} has now been called "
+                    f"{streak} times in a row. If the last calls did not find "
+                    "new information, stop searching and proceed with what you "
+                    "have."
+                )
+                key = f"queryrun:{tool_name}"
+                if self._should_emit_warning(key, streak):
+                    logger.debug("WARNING query_tool_runaway tool=%s streak=%s",
+                                 tool_name, streak)
+                    return LoopCheckResult(LoopLevel.WARNING, msg, key)
+
         return LoopCheckResult.none()
+
+    def _consecutive_same_tool_streak(self, tool_name: str) -> int:
+        """Count trailing records that all used the *same tool* (any args)."""
+        streak = 0
+        for rec in reversed(self._history):
+            if rec.unknown_tool_name is not None:
+                break
+            if rec.tool_name == tool_name:
+                streak += 1
+            else:
+                break
+        return streak
 
     # ─── after-execution hook ───────────────────────────────────────────────
     def record(
