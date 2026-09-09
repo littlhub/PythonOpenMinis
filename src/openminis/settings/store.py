@@ -11,6 +11,7 @@ Room database (``ProviderInstanceEntity`` etc.) plus Keychain for secrets.
 from __future__ import annotations
 
 import json
+import re
 import threading
 from pathlib import Path
 from typing import Any
@@ -43,7 +44,9 @@ def _defaults() -> dict[str, Any]:
         "version": _VERSION,
         "activeProviderId": None,
         "activeIdentityId": "assistant",
-        #: type -> {type, apiKey, baseUrl, model}
+        #: instance_id -> {id, type, label?, apiKey, baseUrl, model, modelHints?}
+        #: Multiple instances may share one provider *type* (e.g. two OpenAI-
+        #: compatible gateways); ``activeProviderId`` points at an instance id.
         "providers": {},
         #: identity id -> {"enabledTools": [...]}  (built-in overrides only)
         "identityOverrides": {},
@@ -69,6 +72,42 @@ def _defaults() -> dict[str, Any]:
 
 def _valid_type(provider_type: str) -> bool:
     return any(p.type == provider_type for p in PROVIDER_TYPES)
+
+
+#: provider instance id charset — ids are user-visible slugs ("openAI-2").
+_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+def _normalize_providers(providers: Any) -> dict[str, dict[str, Any]]:
+    """Canonicalise the stored ``providers`` map into ``{instance_id: conf}``.
+
+    Older files keyed providers by **provider type** and stored no ``id`` on
+    the entry — the id then equals the type, which keeps ``activeProviderId``
+    (previously the type) resolving to the same record.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    if not isinstance(providers, dict):
+        return out
+    for key, conf in providers.items():
+        if not isinstance(conf, dict):
+            continue
+        cid = str(conf.get("id") or key or "").strip()
+        if not cid:
+            continue
+        entry = dict(conf)
+        entry["id"] = cid
+        # legacy shape stored the type as both map key and conf["type"]
+        entry.setdefault("type", str(key))
+        out[cid] = entry
+    return out
+
+
+def _provider_display_label(conf: dict[str, Any]) -> str:
+    """User-facing name of a stored provider instance."""
+    label = str(conf.get("label") or "").strip()
+    if label:
+        return label
+    return provider_type_label(str(conf.get("type") or ""))
 
 
 class SettingsStore:
@@ -116,6 +155,8 @@ class SettingsStore:
             for k in data:
                 if k in raw:
                     data[k] = raw[k]
+        # one-time migration: providers keyed by type → instance map (id=type)
+        data["providers"] = _normalize_providers(data["providers"])
         return data
 
     def save(self, data: dict[str, Any]) -> None:
@@ -136,9 +177,14 @@ class SettingsStore:
         data = self.load()
         errors: list[str] = []
 
-        # providers: full replacement list of {type, apiKey, baseUrl, model}
+        # providers: full replacement list of
+        #   {id?, type, label?, apiKey, baseUrl, model}
+        # id 为空时(旧客户端/旧测试)按 type upsert 该类型的现有实例;新实例
+        # 由前端分配 id,后端校验唯一性与格式。
         if "providers" in payload:
-            new_providers: dict[str, dict] = {}
+            existing = _normalize_providers(data["providers"])
+            new_map: dict[str, dict[str, Any]] = {}
+            seen: set[str] = set()
             raw_providers = payload["providers"]
             if not isinstance(raw_providers, list):
                 raise SettingsError("providers 必须是列表")
@@ -150,27 +196,46 @@ class SettingsStore:
                 if not _valid_type(ptype):
                     errors.append(f"未知厂商: {ptype}")
                     continue
-                entry = {"type": ptype}
+                cid = str(conf.get("id") or "").strip()
+                if not cid:
+                    # legacy no-id entry → keep the existing instance of this
+                    # type (or take the type itself as the first instance id)
+                    legacy = next(
+                        (i for i in existing.values() if i["type"] == ptype),
+                        None,
+                    )
+                    cid = str(legacy["id"]) if legacy else ptype
+                if not _ID_RE.match(cid):
+                    errors.append(f"非法的厂商实例 id: {cid or '(空)'}")
+                    continue
+                if cid in seen:
+                    errors.append(f"重复的厂商实例: {cid}")
+                    continue
+                seen.add(cid)
+                entry: dict[str, Any] = {"id": cid, "type": ptype}
+                label = conf.get("label")
+                if isinstance(label, str) and label.strip():
+                    entry["label"] = label.strip()
                 api_key = conf.get("apiKey")
                 if isinstance(api_key, str) and api_key:
                     entry["apiKey"] = api_key
-                elif ptype in data["providers"]:
+                elif cid in existing and existing[cid].get("apiKey"):
                     # blank key on update = keep existing secret
-                    entry["apiKey"] = data["providers"][ptype].get("apiKey", "")
+                    entry["apiKey"] = existing[cid].get("apiKey", "")
                 base_url = conf.get("baseUrl")
                 entry["baseUrl"] = (base_url if isinstance(base_url, str) else "").strip()
                 model = conf.get("model")
                 entry["model"] = (model if isinstance(model, str) else "").strip()
                 # remote model hints are owned by fetch-models; a plain save
                 # must not wipe them
-                if ptype in data["providers"]:
-                    hints = data["providers"][ptype].get("modelHints")
+                if cid in existing:
+                    hints = existing[cid].get("modelHints")
                     if isinstance(hints, list) and all(
                         isinstance(h, str) for h in hints
                     ):
                         entry["modelHints"] = hints
-                new_providers[ptype] = entry
-            data["providers"] = new_providers
+                new_map[cid] = entry
+            data["providers"] = new_map
 
         if "identityEdits" in payload:
             edits = payload["identityEdits"]
@@ -241,9 +306,7 @@ class SettingsStore:
             aid = payload["activeProviderId"]
             if aid is not None:
                 aid = str(aid)
-                if not _valid_type(aid):
-                    errors.append(f"未知厂商: {aid}")
-                elif aid not in data["providers"]:
+                if aid not in data["providers"]:
                     errors.append(f"厂商 {aid} 尚未配置,无法激活")
                 else:
                     data["activeProviderId"] = aid
@@ -292,18 +355,31 @@ class SettingsStore:
         return data
 
     # -- read helpers ------------------------------------------------------
-    def set_model_hints(self, provider_type: str, hints: list[str]) -> None:
-        """Persist remote model ids fetched from a provider's Base URL.
+    def set_model_hints(self, provider_id: str, hints: list[str]) -> None:
+        """Persist remote model ids fetched from a provider instance's Base URL.
 
         Hints extend (not replace) the static catalogued models in the UI.
-        No-op when the provider has no stored config yet.
+        No-op when the instance has no stored config yet.
         """
         data = self.load()
-        conf = data["providers"].get(provider_type)
+        conf = data["providers"].get(provider_id)
         if conf is None:
             return
         conf["modelHints"] = list(dict.fromkeys(h for h in hints if isinstance(h, str)))
         self.save(data)
+
+    def provider_conf(self, provider_id: str) -> dict[str, Any] | None:
+        """Stored config of one provider instance (by instance id)."""
+        return self.load()["providers"].get(str(provider_id or ""))
+
+    def provider_instances(self) -> list[dict[str, Any]]:
+        """Every configured provider instance, insertion-stable.
+
+        The stored map is id-keyed; entries carry their own ``id`` + ``type``,
+        so the caller renders instances as first-class rows (multiple rows may
+        share a type = several OpenAI-compatible gateways).
+        """
+        return list(_normalize_providers(self.load()["providers"]).values())
 
     def agent_config(self) -> dict[str, Any]:
         """Agent 对话参数 with defaults applied (safe even on old files)."""

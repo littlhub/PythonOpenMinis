@@ -154,7 +154,10 @@ def _model_label() -> str:
         conf = (data["providers"].get(pid) if pid else None) or {}
         model = conf.get("model") or ""
         if pid:
-            return f"{provider_label(pid)}{(' · ' + model) if model else ''}"
+            label = str(conf.get("label") or "").strip()
+            if not label:
+                label = provider_label(str(conf.get("type") or pid))
+            return f"{label}{(' · ' + model) if model else ''}"
     except Exception:  # pragma: no cover - never fail storage over cosmetics
         pass
     return ""

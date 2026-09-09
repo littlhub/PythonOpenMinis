@@ -34,9 +34,11 @@ def test_default_settings_have_catalog(store):
     assert body["activeIdentityId"] == "assistant"
     assert body["activeProviderId"] is None
     assert len(body["identities"]) == 4
-    assert len(body["providers"]) == 6
-    assert any(p["type"] == "anthropic" and p["engine"] == "anthropic"
-               for p in body["providers"])
+    # no vendor instance configured yet — the catalog of *types* is separate
+    assert body["providers"] == []
+    assert len(body["providerTypes"]) == 6
+    assert any(t["type"] == "anthropic" and t["engine"] == "anthropic"
+               for t in body["providerTypes"])
     assert [t["id"] for t in body["toolCatalog"]] == [
         "shell_execute",
         "file_read",
@@ -72,6 +74,41 @@ def test_put_provider_activate_identity(store):
         assert body["activeIdentityId"] == "coder"
         # persisted with the secret intact
         assert store.load()["providers"]["anthropic"]["apiKey"] == "sk-secret-1"
+
+
+def test_multiple_instances_of_same_type(store):
+    """Two OpenAI-compatible gateways must coexist as separate instances."""
+    with TestClient(app) as c:
+        body = _put(
+            c,
+            providers=[
+                {"id": "gw-a", "type": "openAI", "label": "网关A",
+                 "apiKey": "sk-a", "model": "gpt-4o", "baseUrl": "https://a/v1"},
+                {"id": "gw-b", "type": "openAI", "label": "网关B",
+                 "apiKey": "sk-b", "model": "qwen-max", "baseUrl": "https://b/v1"},
+            ],
+            activeProviderId="gw-b",
+        )
+        assert [p["id"] for p in body["providers"]] == ["gw-a", "gw-b"]
+        assert [p["type"] for p in body["providers"]] == ["openAI", "openAI"]
+        assert [p["label"] for p in body["providers"]] == ["网关A", "网关B"]
+        assert [p["isActive"] for p in body["providers"]] == [False, True]
+    saved = store.load()["providers"]
+    assert saved["gw-a"]["apiKey"] == "sk-a"
+    assert saved["gw-b"]["apiKey"] == "sk-b"
+    assert saved["gw-a"]["baseUrl"] == "https://a/v1"
+    assert store.load()["activeProviderId"] == "gw-b"
+
+
+def test_duplicate_instance_id_is_rejected(store):
+    with TestClient(app) as c:
+        r = c.put("/api/settings", json={
+            "providers": [
+                {"id": "gw-a", "type": "openAI", "apiKey": "1", "model": "", "baseUrl": ""},
+                {"id": "gw-a", "type": "openAI", "apiKey": "2", "model": "", "baseUrl": ""},
+            ],
+        })
+        assert r.status_code == 400
 
 
 def test_blank_key_on_update_keeps_secret(store):

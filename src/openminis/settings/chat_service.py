@@ -87,18 +87,22 @@ def _model_for(provider_type: str, model_id: str) -> LLMModel | None:
     return None
 
 
-def build_provider(provider_type: str, conf: dict[str, Any]):  # noqa: ANN201
+def build_provider(provider_id: str, conf: dict[str, Any]):  # noqa: ANN201
     """Instantiate the LLM provider for a stored provider config.
 
+    ``provider_id`` is the instance id; the wire protocol (and thus the
+    engine) comes from ``conf["type"]``, so several OpenAI-compatible
+    instances each get an OpenAIProvider with their own base URL.
     Only engines present in :data:`ENGINE_READY` can actually run.
     """
-    engine = engine_for(provider_type)
+    ptype = str(conf.get("type") or provider_id or "")
+    engine = engine_for(ptype)
     if engine not in ENGINE_READY:
-        raise ChatSetupError(f"厂商 {provider_type} 的引擎尚未移植,暂不能对话")
+        raise ChatSetupError(f"厂商 {ptype} 的引擎尚未移植,暂不能对话")
     api_key = (conf.get("apiKey") or "").strip()
     if not api_key:
         raise ChatSetupError("尚未配置 API Key,请先在 设置 → 模型服务 中填写")
-    model = _model_for(provider_type, (conf.get("model") or "").strip())
+    model = _model_for(ptype, (conf.get("model") or "").strip())
     base_url = (conf.get("baseUrl") or "").strip()
     if engine == "anthropic":
         # DEFAULT_BASE_PATH is a module-level constant on the provider module,

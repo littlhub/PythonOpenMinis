@@ -136,8 +136,11 @@ export interface ModelOption {
   name: string
 }
 
+/** 一个已配置的厂商实例。同 type 可有多条(例如两个 OpenAI 兼容网关)。 */
 export interface ProviderInfo {
+  id: string
   type: string
+  typeLabel: string
   label: string
   engine: string | null // 'anthropic' | 'openai' when the engine is ported
   note: string
@@ -147,6 +150,15 @@ export interface ProviderInfo {
   defaultModel: string
   models: ModelOption[]
   isActive: boolean
+}
+
+/** 厂商目录(可添加的类型),与已配置实例分开。 */
+export interface ProviderTypeInfo {
+  type: string
+  label: string
+  engine: string | null
+  note: string
+  defaultModel: string
 }
 
 export interface IdentityInfo {
@@ -171,6 +183,7 @@ export interface SettingsInfo {
   activeProviderId: string | null
   activeIdentityId: string
   providers: ProviderInfo[]
+  providerTypes: ProviderTypeInfo[]
   identities: IdentityInfo[]
   toolCatalog: ToolInfo[]
   /** Agent 对话参数(模型设置):上下文预算/记忆轮次/工具步数/深度思考. */
@@ -186,6 +199,8 @@ export interface AgentConfig {
 }
 
 export interface FetchModelsRequest {
+  /** 厂商实例 id(优先);老版本传 type 也兼容。 */
+  id?: string
   type: string
   baseUrl: string
   apiKey: string
@@ -211,7 +226,14 @@ export interface CustomIdentityDraft {
 export interface SettingsPayload {
   activeProviderId?: string | null
   activeIdentityId?: string
-  providers?: { type: string; apiKey: string; baseUrl: string; model: string }[]
+  providers?: {
+    id?: string
+    type: string
+    label?: string
+    apiKey: string
+    baseUrl: string
+    model: string
+  }[]
   identityEdits?: { id: string; enabledTools: string[] }[]
   customIdentities?: CustomIdentityDraft[]
   /** Partial Agent 对话参数 — 只合并传入的键,其余保持默认. */
@@ -372,7 +394,10 @@ export interface SubagentInfo {
   emoji: string
   description: string
   persona: string
-  providerType: string
+  /** 厂商实例 id（模型服务里的一个实例）。 */
+  providerId: string
+  /** 协议类型；旧配置可能只有它，保存时会被解析成 providerId。 */
+  providerType?: string
   model: string
   tools: string[]
   skills: string[]
@@ -382,6 +407,7 @@ export interface SubagentInfo {
 
 /** A provider as seen by the subagent registry: may lack a key or engine. */
 export interface SubagentProviderOption {
+  id: string
   type: string
   label: string
   engine: string | null

@@ -49,6 +49,9 @@ DEFAULT_FIELDS: dict[str, Any] = {
     "emoji": "🤖",
     "description": "",
     "persona": "",
+    # providerId = provider instance id (see providers registry); providerType
+    # is derived by _validate for compatibility with older configs/clients.
+    "providerId": "",
     "providerType": "",
     "model": "",
     "tools": [],
@@ -74,13 +77,34 @@ def _table(store) -> dict[str, Any]:
     return sub
 
 
+def _with_instance_id(store, cfg: dict[str, Any]) -> dict[str, Any]:
+    """Backfill ``providerId`` on configs written before multi-vendor.
+
+    Old subagents only carry ``providerType`` (the protocol). The UI needs a
+    concrete instance id, so resolve the type to its first instance (legacy
+    data keeps ``id == type``, so this is usually a no-op rename).
+    """
+    out = dict(cfg)
+    if str(out.get("providerId") or "").strip():
+        return out
+    pid = str(out.get("providerType") or "").strip()
+    instances = store.provider_instances()
+    match = next((c for c in instances if c.get("id") == pid), None)
+    if match is None:
+        match = next((c for c in instances if c.get("type") == pid), None)
+    if match is not None:
+        pid = str(match.get("id") or pid)
+    out["providerId"] = pid
+    return out
+
+
 def list_subagents(store) -> list[dict[str, Any]]:
-    return [dict(cfg) for cfg in _table(store).values()]
+    return [_with_instance_id(store, cfg) for cfg in _table(store).values()]
 
 
 def get_subagent(store, sid: str) -> dict[str, Any] | None:
     cfg = _table(store).get(sid)
-    return dict(cfg) if cfg else None
+    return _with_instance_id(store, cfg) if cfg else None
 
 
 def slugify_name(name: str) -> str:
@@ -115,9 +139,6 @@ def _clean_strings(field: str, value: Any, sid: str, label: str) -> list[str]:
 
 
 def _validate(store, cfg: dict[str, Any], existing: bool) -> None:
-    from ..settings.catalog import ENGINE_READY, PROVIDER_TYPES, VALID_TOOLS
-    from ..settings.store import provider_type_label
-
     sid = str(cfg.get("id") or "").strip()
     if not _SLUG_RE.match(sid):
         raise SubagentError(
@@ -129,10 +150,23 @@ def _validate(store, cfg: dict[str, Any], existing: bool) -> None:
     if not existing and sid in _table(store):
         raise SubagentError(f"subagent 已存在: {sid}")
 
-    ptype = str(cfg.get("providerType") or "").strip()
-    conf = store.load()["providers"].get(ptype)
-    if not conf or not str(conf.get("apiKey") or "").strip():
-        raise SubagentError(f"模型服务未配置或未填 Key: {ptype or '(空)'}")
+    # model service: new configs carry ``providerId`` (a provider *instance*
+    # id — several OpenAI-compatible instances may exist). Legacy configs only
+    # have ``providerType`` (the wire protocol); resolve it to the first
+    # instance of that type so old subagents keep working.
+    from ..settings.catalog import ENGINE_READY, PROVIDER_TYPES, VALID_TOOLS
+    from ..settings.store import provider_type_label
+
+    pid = str(cfg.get("providerId") or cfg.get("providerType") or "").strip()
+    if not pid:
+        raise SubagentError("providerId 不能为空（模型服务实例里选一个）")
+    instances = store.provider_instances()
+    conf = next((c for c in instances if c.get("id") == pid), None)
+    if conf is None:
+        conf = next((c for c in instances if c.get("type") == pid), None)
+    if conf is None or not str(conf.get("apiKey") or "").strip():
+        raise SubagentError(f"模型服务未配置或未填 Key: {pid}")
+    ptype = str(conf.get("type") or "")
     engine = next((p.engine for p in PROVIDER_TYPES if p.type == ptype), None)
     if engine not in ENGINE_READY:
         raise SubagentError(
@@ -141,6 +175,11 @@ def _validate(store, cfg: dict[str, Any], existing: bool) -> None:
     model = str(cfg.get("model") or "").strip()
     if not model:
         raise SubagentError("model 不能为空")
+    # normalise: providerId = the concrete instance; providerType kept as the
+    # protocol type for older clients / planner output.
+    cfg["providerId"] = str(conf.get("id") or pid)
+    if ptype:
+        cfg["providerType"] = ptype
 
     cfg["tools"] = _clean_tools(cfg.get("tools"), VALID_TOOLS, sid)
     cfg["skills"] = _clean_strings("skills", cfg.get("skills"), sid, "skills")
@@ -203,19 +242,26 @@ def build_registry(store) -> dict[str, Any]:
     data = store.load()
     active_pid = data.get("activeProviderId")
 
+    # providers = configured *instances* (several may share one protocol type)
     providers = []
-    for meta in PROVIDER_TYPES:
-        conf = data["providers"].get(meta.type) or {}
+    for conf in store.provider_instances():
+        ptype = str(conf.get("type") or "")
+        meta = next((p for p in PROVIDER_TYPES if p.type == ptype), None)
+        engine = meta.engine if meta else None
         has_key = bool(str(conf.get("apiKey") or "").strip())
-        usable = has_key and meta.engine in ENGINE_READY
+        label = str(conf.get("label") or "").strip() or (
+            meta.label if meta else ptype
+        )
+        cid = str(conf.get("id") or "")
         providers.append({
-            "type": meta.type,
-            "label": meta.label,
-            "engine": meta.engine,
+            "id": cid,
+            "type": ptype,
+            "label": label,
+            "engine": engine,
             "hasKey": has_key,
-            "ready": bool(meta.engine in ENGINE_READY),
-            "usable": usable,
-            "isActive": meta.type == active_pid,
+            "ready": bool(engine in ENGINE_READY),
+            "usable": has_key and bool(engine in ENGINE_READY),
+            "isActive": cid == active_pid,
             "model": str(conf.get("model") or ""),
         })
 
@@ -226,7 +272,8 @@ def build_registry(store) -> dict[str, Any]:
             models.append({"providerType": ptype, "providerLabel": label,
                            "id": mid, "display": display})
     # providers may have fetched extra model ids — surface them too.
-    for ptype, conf in data["providers"].items():
+    for conf in store.provider_instances():
+        ptype = str(conf.get("type") or "")
         for mid in (conf.get("modelHints") or []):
             if not any(m["providerType"] == ptype and m["id"] == mid
                        for m in models):
@@ -270,8 +317,8 @@ _PLAN_INSTRUCTIONS = """需求：{request}
   "emoji": "单个 emoji",
   "description": "一句话职责",
   "persona": "系统提示/人设，200 字内，中文，说明身份、工作方式、输出风格",
-  "providerType": "从注册表 providers 中选 usable=true 的一个 type",
-  "model": "从注册表 models 中选与 providerType 匹配的一个 id",
+  "providerId": "从注册表 providers 中选 usable=true 的一个 id（= 模型服务实例）",
+  "model": "从注册表 models 中选与 providerId 所属协议匹配的一个 id",
   "tools": ["只选能帮助完成该职责的工具 id，从注册表 tools 的 id 中选，1-6 个"],
   "skills": ["从注册表 skills 的 name 中选相关的，0-4 个"],
   "maxRounds": 6
@@ -355,7 +402,9 @@ async def plan_subagent(store, request: str, *, auto_save: bool = False,
     name = str(obj.get("name") or request).strip()
     obj["name"] = name
     obj["id"] = str(obj.get("id") or slugify_name(name)).strip()
-    obj["providerType"] = str(obj.get("providerType") or "").strip()
+    obj["providerId"] = str(
+        obj.get("providerId") or obj.get("providerType") or ""
+    ).strip()
     obj["model"] = str(obj.get("model") or "").strip()
     # Drop fabricated ids: tools/skills must exist in the registry.
     tool_ids = {t["id"] for t in registry["tools"]}

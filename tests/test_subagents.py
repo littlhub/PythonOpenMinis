@@ -63,6 +63,36 @@ def test_upsert_fills_defaults(store):
     assert [s["id"] for s in list_subagents(store)] == ["writer"]
 
 
+def test_legacy_provider_type_is_resolved_to_instance(store):
+    """Old configs carry only the protocol; both write and read must end up
+    with a concrete provider instance id."""
+    store.apply_full({
+        "providers": [
+            {"id": "gw-a", "type": "openAI", "apiKey": "sk-a", "model": "gpt-4o", "baseUrl": ""},
+            {"id": "gw-b", "type": "openAI", "apiKey": "sk-b", "model": "qwen-max", "baseUrl": ""},
+        ],
+    })
+    cfg = upsert_subagent(store, {
+        "id": "writer", "name": "写作", "providerType": "openAI",
+        "model": "gpt-4o",
+    })
+    assert cfg["providerId"] == "gw-a"       # first instance of that protocol
+    assert cfg["providerType"] == "openAI"
+
+    # a stored config without providerId must still read back with one
+    table = store.load()["subagents"]
+    table["writer"].pop("providerId", None)
+    store.save(store.load())
+    assert get_subagent(store, "writer")["providerId"] == "gw-a"
+
+    # an explicit instance id wins over the protocol
+    cfg2 = upsert_subagent(store, {
+        "id": "writer-b", "name": "写作B", "providerId": "gw-b",
+        "model": "qwen-max",
+    })
+    assert cfg2["providerId"] == "gw-b"
+
+
 def test_upsert_rejects_bad_id(store):
     _configure(store)
     with pytest.raises(SubagentError):

@@ -38,8 +38,32 @@ interface FetchMsg {
 }
 
 // ---------------------------------------------------------------------------
-// 模型服务 — API Key / Base URL / 默认模型 / 设为当前
+// 模型服务 — 厂商实例(同协议可多家) / API Key / Base URL / 默认模型 / 设为当前
 // ---------------------------------------------------------------------------
+/** 一行的可编辑状态:已保存实例 + 尚未落盘的新实例。 */
+interface ProviderRow {
+  id: string
+  type: string
+  label: string
+  typeLabel: string
+  apiKey: string // draft only; '' = 保留原 Key
+  baseUrl: string
+  model: string
+  hasKey: boolean
+  engine: string | null
+  note: string
+  defaultModel: string
+  models: { id: string; name: string }[]
+  saved: boolean // false = 本次新增,还没 POST 过
+}
+
+const rowFrom = (p: ProviderInfo): ProviderRow => ({
+  id: p.id, type: p.type, label: p.label, typeLabel: p.typeLabel,
+  apiKey: '', baseUrl: p.baseUrl, model: p.model, hasKey: p.hasKey,
+  engine: p.engine, note: p.note, defaultModel: p.defaultModel,
+  models: [...p.models], saved: true,
+})
+
 export function ProvidersPage(props: { onBack: () => void }) {
   const [settings, setSettings] = useState<SettingsInfo | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -47,9 +71,10 @@ export function ProvidersPage(props: { onBack: () => void }) {
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [activeProvider, setActiveProvider] = useState<string | null>(null)
-  const [drafts, setDrafts] = useState<Record<string, { apiKey: string; baseUrl: string; model: string }>>({})
+  const [rows, setRows] = useState<ProviderRow[]>([])
   const [fetchBusy, setFetchBusy] = useState<Record<string, boolean>>({})
   const [fetchMsg, setFetchMsg] = useState<Record<string, FetchMsg | undefined>>({})
+  const [newType, setNewType] = useState('')
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -58,9 +83,8 @@ export function ProvidersPage(props: { onBack: () => void }) {
       const s = await api.settingsGet()
       setSettings(s)
       setActiveProvider(s.activeProviderId)
-      const d: Record<string, { apiKey: string; baseUrl: string; model: string }> = {}
-      for (const p of s.providers) d[p.type] = { apiKey: '', baseUrl: p.baseUrl, model: p.model }
-      setDrafts(d)
+      setRows(s.providers.map(rowFrom))
+      setNewType(s.providerTypes[0]?.type ?? '')
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -73,22 +97,21 @@ export function ProvidersPage(props: { onBack: () => void }) {
   }, [load])
 
   const save = useCallback(async () => {
-    if (!settings) return
     setSaving(true)
     setError(null)
     setSaved(null)
     try {
-      const providers = settings.providers.map((p) => ({
-        type: p.type,
-        apiKey: drafts[p.type]?.apiKey ?? '',
-        baseUrl: drafts[p.type]?.baseUrl ?? p.baseUrl,
-        model: drafts[p.type]?.model ?? p.model,
+      const providers = rows.map((r) => ({
+        id: r.id,
+        type: r.type,
+        label: r.label,
+        apiKey: r.apiKey,
+        baseUrl: r.baseUrl,
+        model: r.model,
       }))
       const s = await api.settingsPut({ activeProviderId: activeProvider, providers })
       setSettings(s)
-      const d: Record<string, { apiKey: string; baseUrl: string; model: string }> = {}
-      for (const p of s.providers) d[p.type] = { apiKey: '', baseUrl: p.baseUrl, model: p.model }
-      setDrafts(d)
+      setRows(s.providers.map(rowFrom))
       setSaved('已保存 ✓')
       setTimeout(() => setSaved(null), 2500)
     } catch (e) {
@@ -96,119 +119,163 @@ export function ProvidersPage(props: { onBack: () => void }) {
     } finally {
       setSaving(false)
     }
-  }, [settings, drafts, activeProvider])
+  }, [rows, activeProvider])
 
-  const patch = (type: string, p: Partial<{ apiKey: string; baseUrl: string; model: string }>) =>
-    setDrafts((prev) => ({ ...prev, [type]: { ...(prev[type] ?? {}), ...p } }))
+  const patch = (id: string, p: Partial<ProviderRow>) =>
+    setRows((prev) => prev.map((r) => (r.id === id ? { ...r, ...p } : r)))
+
+  const nextId = (type: string) => {
+    const used = new Set(rows.map((r) => r.id))
+    if (!used.has(type)) return type
+    let n = 2
+    while (used.has(`${type}-${n}`)) n += 1
+    return `${type}-${n}`
+  }
+
+  const addProvider = () => {
+    const t = settings?.providerTypes.find((x) => x.type === newType)
+    if (!t) return
+    setRows((prev) => [
+      ...prev,
+      {
+        id: nextId(t.type), type: t.type, label: t.label, typeLabel: t.label,
+        apiKey: '', baseUrl: '', model: t.defaultModel, hasKey: false,
+        engine: t.engine, note: t.note, defaultModel: t.defaultModel,
+        models: [], saved: false,
+      },
+    ])
+    setError(null)
+  }
+
+  const removeProvider = (id: string) => {
+    if (!window.confirm(`删除厂商实例「${id}」?`)) return
+    setRows((prev) => prev.filter((r) => r.id !== id))
+    if (activeProvider === id) setActiveProvider(null)
+  }
 
   const fetchRemote = useCallback(
-    async (p: ProviderInfo) => {
-      const baseUrl = ((drafts[p.type]?.baseUrl ?? p.baseUrl) ?? '').trim()
+    async (r: ProviderRow) => {
+      const baseUrl = r.baseUrl.trim()
       if (!baseUrl) {
-        setFetchMsg((m) => ({ ...m, [p.type]: { ok: false, text: '请先填写 Base URL,再获取模型列表。' } }))
+        setFetchMsg((m) => ({ ...m, [r.id]: { ok: false, text: '请先填写 Base URL,再获取模型列表。' } }))
         return
       }
-      setFetchBusy((b) => ({ ...b, [p.type]: true }))
-      setFetchMsg((m) => ({ ...m, [p.type]: undefined }))
+      setFetchBusy((b) => ({ ...b, [r.id]: true }))
+      setFetchMsg((m) => ({ ...m, [r.id]: undefined }))
       try {
-        const r = await api.fetchModels({
-          type: p.type,
+        const res = await api.fetchModels({
+          id: r.saved ? r.id : undefined,
+          type: r.type,
           baseUrl,
-          apiKey: (drafts[p.type]?.apiKey ?? '').trim(),
+          apiKey: r.apiKey.trim(),
         })
-        setSettings((s) =>
-          s
-            ? {
-                ...s,
-                providers: s.providers.map((x) =>
-                  x.type === p.type ? { ...x, models: mergeModels(x.models, r.models) } : x,
-                ),
-              }
-            : s,
+        setRows((prev) =>
+          prev.map((x) => (x.id === r.id ? { ...x, models: mergeModels(x.models, res.models) } : x)),
         )
-        setFetchMsg((m) => ({ ...m, [p.type]: { ok: true, text: `从 ${shortUrl(r.source)} 获取到 ${r.models.length} 个模型。` } }))
+        setFetchMsg((m) => ({
+          ...m,
+          [r.id]: { ok: true, text: `从 ${shortUrl(res.source)} 获取到 ${res.models.length} 个模型。` },
+        }))
       } catch (e) {
-        setFetchMsg((m) => ({ ...m, [p.type]: { ok: false, text: (e as Error).message } }))
+        setFetchMsg((m) => ({ ...m, [r.id]: { ok: false, text: (e as Error).message } }))
       } finally {
-        setFetchBusy((b) => ({ ...b, [p.type]: false }))
+        setFetchBusy((b) => ({ ...b, [r.id]: false }))
       }
     },
-    [drafts],
+    [],
   )
 
   if (loading) return <DetailShell title="模型服务" onBack={props.onBack}><Spinner /></DetailShell>
 
-  const providers = settings?.providers ?? []
+  const types = settings?.providerTypes ?? []
+  const current = rows.find((r) => r.id === activeProvider)
+
   return (
     <DetailShell
       title="模型服务"
-      subtitle="配置各厂商 API Key 与模型,选择当前对话使用的厂商。Key 只保存在本机 settings.json;留空表示保留原 Key。"
+      subtitle="同一协议(如 OpenAI 兼容)可添加多家厂商实例,各自独立的 Key / Base URL / 模型。Key 只保存在本机 settings.json;留空表示保留原 Key。"
       onBack={props.onBack}
       extra={
         <>
           <StatusLine ok={saved} err={error} />
-          <button onClick={() => void save()} disabled={saving || !settings}>
+          <button onClick={() => void save()} disabled={saving}>
             {saving ? 'Saving…' : '保存'}
           </button>
         </>
       }
     >
-      {providers.filter((p) => p.hasKey || p.type === activeProvider).length > 0 && (
+      {current && (
         <p className="statusline">
           当前对话使用:{' '}
           <strong>
-            {providers.find((p) => p.type === activeProvider)?.label ?? '—'} ·{' '}
-            {providers.find((p) => p.type === activeProvider)?.model || '未设模型'}
+            {current.label || current.typeLabel} · {current.model || '未设模型'}
           </strong>
+          <span className="muted"> ({current.id})</span>
         </p>
+      )}
+      {rows.length === 0 && (
+        <p className="empty">还没有配置任何厂商。从下方「添加厂商」选一个协议开始。</p>
       )}
 
       <div className="provider-list">
-        {providers.map((p) => {
-          const isActive = activeProvider === p.type
-          const draft = drafts[p.type]
-          const ready = !!p.engine
+        {rows.map((r) => {
+          const isActive = activeProvider === r.id
+          const ready = !!r.engine
+          const canActivate = ready && (r.apiKey || r.hasKey)
           return (
-            <div key={p.type} className={`provider-card ${isActive ? 'active' : ''}`}>
+            <div key={r.id} className={`provider-card ${isActive ? 'active' : ''}`}>
               <div className="provider-head">
                 <div className="provider-title">
-                  <strong>{p.label}</strong>
-                  {ready ? <span className="pill ok">引擎就绪</span> : <span className="pill warn">{p.note}</span>}
+                  <input
+                    className="provider-label-input"
+                    value={r.label}
+                    placeholder={r.typeLabel}
+                    onChange={(e) => patch(r.id, { label: e.target.value })}
+                  />
+                  <span className="pill soft">{r.typeLabel}</span>
+                  {ready ? <span className="pill ok">引擎就绪</span> : <span className="pill warn">{r.note}</span>}
                   {isActive && <span className="pill current">当前</span>}
+                  {!r.saved && <span className="pill warn">未保存</span>}
                 </div>
-                <button
-                  className="link"
-                  disabled={!ready || !(draft?.apiKey || p.hasKey)}
-                  onClick={() => setActiveProvider(p.type)}
-                >
-                  设为当前
-                </button>
+                <div className="provider-actions">
+                  <button
+                    className="link"
+                    disabled={!canActivate}
+                    onClick={() => setActiveProvider(r.id)}
+                  >
+                    设为当前
+                  </button>
+                  <button className="link danger" onClick={() => removeProvider(r.id)}>
+                    删除
+                  </button>
+                </div>
               </div>
+              <p className="muted pathline">id: {r.id}</p>
               <div className="provider-fields">
                 <label>
                   API Key
                   <input
                     type="password"
-                    value={draft?.apiKey ?? ''}
-                    placeholder={p.hasKey ? '•••••••• (已配置,留空不变)' : 'sk-…'}
-                    onChange={(e) => patch(p.type, { apiKey: e.target.value })}
+                    value={r.apiKey}
+                    placeholder={r.hasKey ? '•••••••• (已配置,留空不变)' : 'sk-…'}
+                    onChange={(e) => patch(r.id, { apiKey: e.target.value })}
                   />
                 </label>
                 <label>
                   <span className="field-row">
                     模型
-                    <button type="button" className="link" disabled={!!fetchBusy[p.type]} onClick={() => void fetchRemote(p)}>
-                      {fetchBusy[p.type] ? '获取中…' : '从 URL 获取列表'}
+                    <button type="button" className="link" disabled={!!fetchBusy[r.id]} onClick={() => void fetchRemote(r)}>
+                      {fetchBusy[r.id] ? '获取中…' : '从 URL 获取列表'}
                     </button>
                   </span>
                   <input
-                    list={`models-${p.type}`}
-                    value={draft?.model ?? p.model}
-                    placeholder={p.defaultModel || '手动输入模型 ID'}
-                    onChange={(e) => patch(p.type, { model: e.target.value })}
+                    list={`models-${r.id}`}
+                    value={r.model}
+                    placeholder={r.defaultModel || '手动输入模型 ID'}
+                    onChange={(e) => patch(r.id, { model: e.target.value })}
                   />
-                  <datalist id={`models-${p.type}`} key={`${p.type}-${p.models.length}`}>
-                    {p.models.map((m) => (
+                  <datalist id={`models-${r.id}`} key={`${r.id}-${r.models.length}`}>
+                    {r.models.map((m) => (
                       <option key={m.id} value={m.id}>{m.name}</option>
                     ))}
                   </datalist>
@@ -216,31 +283,47 @@ export function ProvidersPage(props: { onBack: () => void }) {
                 <label className="wide">
                   Base URL (可选)
                   <input
-                    value={draft?.baseUrl ?? ''}
-                    placeholder={p.engine === 'openai' ? 'https://api.openai.com/v1' : '官方地址或代理'}
-                    onChange={(e) => patch(p.type, { baseUrl: e.target.value })}
+                    value={r.baseUrl}
+                    placeholder={r.engine === 'openai' ? 'https://api.openai.com/v1' : '官方地址或代理'}
+                    onChange={(e) => patch(r.id, { baseUrl: e.target.value })}
                   />
                 </label>
               </div>
-              {p.models.some((m) => m.name.endsWith('(远程)')) && (
+              {r.models.some((m) => m.name.endsWith('(远程)')) && (
                 <div className="remote-models">
                   <span className="muted">远程模型(点击选用):</span>
                   <div className="tool-chips">
-                    {p.models
+                    {r.models
                       .filter((m) => m.name.endsWith('(远程)'))
                       .map((m) => (
-                        <button type="button" key={m.id} className="chip on" onClick={() => patch(p.type, { model: m.id })}>
+                        <button type="button" key={m.id} className="chip on" onClick={() => patch(r.id, { model: m.id })}>
                           {m.id}
                         </button>
                       ))}
                   </div>
                 </div>
               )}
-              {fetchMsg[p.type] && <div className={`fetch-msg ${fetchMsg[p.type]?.ok ? 'ok' : 'bad'}`}>{fetchMsg[p.type]?.text}</div>}
+              {fetchMsg[r.id] && <div className={`fetch-msg ${fetchMsg[r.id]?.ok ? 'ok' : 'bad'}`}>{fetchMsg[r.id]?.text}</div>}
             </div>
           )
         })}
       </div>
+
+      <SectionCard
+        title="添加厂商"
+        hint="同一协议可添加多个实例(例如两个 OpenAI 兼容网关),各自独立配置。"
+      >
+        <div className="row-actions">
+          <select value={newType} onChange={(e) => setNewType(e.target.value)}>
+            {types.map((t) => (
+              <option key={t.type} value={t.type}>
+                {t.label}{t.engine ? '' : ` · ${t.note}`}
+              </option>
+            ))}
+          </select>
+          <button onClick={addProvider} disabled={!newType}>＋ 添加</button>
+        </div>
+      </SectionCard>
     </DetailShell>
   )
 }

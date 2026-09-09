@@ -94,14 +94,27 @@ class SubagentDelegateTool:
             )
 
         # -- build the subagent's own provider ------------------------------
+        # cfg.providerId names a provider *instance*; legacy configs only have
+        # providerType (protocol) → fall back to the first instance of it.
         from ..settings.chat_service import build_provider
 
-        ptype = cfg["providerType"]
+        pid = str(cfg.get("providerId") or cfg.get("providerType") or "")
         data = store.load()
-        conf = dict(data["providers"].get(ptype) or {})
+        conf = dict(data["providers"].get(pid) or {})
+        if not conf:
+            conf = next(
+                (dict(c) for c in store.provider_instances()
+                 if c.get("type") == pid),
+                {},
+            )
+        if not conf:
+            return ToolExecutionResult(
+                f"Error: subagent {sid} 的模型服务实例不存在: {pid or '(空)'}",
+                False, tool_title=tool_title,
+            )
         conf["model"] = cfg.get("model") or conf.get("model", "")
         try:
-            provider = build_provider(ptype, conf)
+            provider = build_provider(pid, conf)
         except Exception as exc:  # missing key / unported engine
             return ToolExecutionResult(
                 f"Error: subagent {sid} 的模型服务不可用: {exc}",

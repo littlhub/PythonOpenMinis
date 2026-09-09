@@ -8,7 +8,7 @@ const EMPTY: SubagentInfo = {
   emoji: '🤖',
   description: '',
   persona: '',
-  providerType: '',
+  providerId: '',
   model: '',
   tools: [],
   skills: [],
@@ -65,17 +65,24 @@ export function SubagentsView() {
     [registry],
   )
 
-  const modelsFor = useCallback(
-    (ptype: string) =>
-      (registry?.models ?? []).filter((m) => m.providerType === ptype),
+  /** 实例 id → 该实例的协议类型（注册表 models 仍按协议分组）。 */
+  const typeOf = useCallback(
+    (pid: string) =>
+      (registry?.providers ?? []).find((p) => p.id === pid)?.type ?? '',
     [registry],
+  )
+
+  const modelsFor = useCallback(
+    (pid: string) =>
+      (registry?.models ?? []).filter((m) => m.providerType === typeOf(pid)),
+    [registry, typeOf],
   )
 
   const startNew = () => {
     const p = usableProviders[0]
     setDraft({
       ...EMPTY,
-      providerType: p?.type ?? '',
+      providerId: p?.id ?? '',
       model: p?.model ?? '',
       tools: p ? ['file_read', 'file_write'] : [],
     })
@@ -168,10 +175,10 @@ export function SubagentsView() {
   const toolLabel = (id: string) =>
     registry?.tools.find((t) => t.id === id)?.name ?? id
 
-  const providerLabel = (type: string) =>
-    registry?.providers.find((p) => p.type === type)?.label ?? type
+  const providerLabel = (pid: string) =>
+    registry?.providers.find((p) => p.id === pid)?.label ?? (pid || '—')
 
-  const draftModels = draft ? modelsFor(draft.providerType) : []
+  const draftModels = draft ? modelsFor(draft.providerId) : []
 
   return (
     <div className="pane">
@@ -225,7 +232,7 @@ export function SubagentsView() {
               </div>
               <div className="sa-desc">{s.description || '（无描述）'}</div>
               <div className="sa-meta muted">
-                {providerLabel(s.providerType)} · {s.model || '未选模型'} · 最多{' '}
+                {providerLabel(s.providerId)} · {s.model || '未选模型'} · 最多{' '}
                 {s.maxRounds} 轮
               </div>
               <div className="sa-tags">
@@ -346,20 +353,20 @@ export function SubagentsView() {
               <div>
                 <label className="sa-label">模型服务</label>
                 <select
-                  value={draft.providerType}
+                  value={draft.providerId}
                   onChange={(e) => {
-                    const ptype = e.target.value
-                    const p = usableProviders.find((x) => x.type === ptype)
+                    const pid = e.target.value
+                    const p = usableProviders.find((x) => x.id === pid)
                     setDraft({
                       ...draft,
-                      providerType: ptype,
+                      providerId: pid,
                       model: p?.model ?? '',
                     })
                   }}
                 >
                   <option value="">— 选择 —</option>
                   {usableProviders.map((p) => (
-                    <option key={p.type} value={p.type}>
+                    <option key={p.id} value={p.id}>
                       {p.label}
                       {p.isActive ? '（当前）' : ''}
                     </option>
@@ -453,7 +460,7 @@ export function SubagentsView() {
             <div className="sa-actions">
               <button
                 className="btn-create"
-                disabled={busy || !draft.name.trim() || !draft.providerType}
+                disabled={busy || !draft.name.trim() || !draft.providerId}
                 onClick={() => void save()}
               >
                 {busy ? '保存中…' : isEdit ? '保存修改' : '创建'}

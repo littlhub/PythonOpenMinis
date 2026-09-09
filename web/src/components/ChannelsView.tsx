@@ -182,7 +182,7 @@ export function ChannelsView() {
               <div className="set-title">模型服务通道</div>
               <div className="channels-list">
                 {providers.map((p) => (
-                  <ProviderCard key={p.type} p={p} />
+                  <ProviderCard key={p.id} p={p} />
                 ))}
               </div>
             </div>

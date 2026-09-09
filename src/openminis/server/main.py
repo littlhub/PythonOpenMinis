@@ -213,22 +213,36 @@ def _settings_view(store: SettingsStore | None = None) -> dict[str, Any]:
     store = store or SettingsStore.get()
     data = store.load()
     providers: list[dict[str, Any]] = []
-    for meta in PROVIDER_TYPES:
-        conf = data["providers"].get(meta.type)
+    for conf in store.provider_instances():
+        ptype = str(conf.get("type") or "")
+        meta = next((m for m in PROVIDER_TYPES if m.type == ptype), None)
+        label = str(conf.get("label") or "").strip()
         providers.append(
             {
-                "type": meta.type,
-                "label": meta.label,
-                "engine": meta.engine,
-                "note": meta.note,
-                "hasKey": bool(conf and conf.get("apiKey")),
-                "baseUrl": (conf or {}).get("baseUrl", ""),
-                "model": ((conf or {}).get("model") or meta.default_model),
-                "defaultModel": meta.default_model,
-                "models": _provider_models(meta.type, conf),
-                "isActive": data.get("activeProviderId") == meta.type,
+                "id": str(conf.get("id") or ""),
+                "type": ptype,
+                "typeLabel": meta.label if meta else ptype,
+                "label": label or (meta.label if meta else ptype),
+                "engine": meta.engine if meta else None,
+                "note": meta.note if meta else "",
+                "hasKey": bool(conf.get("apiKey")),
+                "baseUrl": conf.get("baseUrl", ""),
+                "model": (conf.get("model") or (meta.default_model if meta else "")),
+                "defaultModel": meta.default_model if meta else "",
+                "models": _provider_models(ptype, conf),
+                "isActive": data.get("activeProviderId") == conf.get("id"),
             }
         )
+    provider_types = [
+        {
+            "type": m.type,
+            "label": m.label,
+            "engine": m.engine,
+            "note": m.note,
+            "defaultModel": m.default_model,
+        }
+        for m in PROVIDER_TYPES
+    ]
     identities = [
         {
             "id": i.id,
@@ -246,6 +260,7 @@ def _settings_view(store: SettingsStore | None = None) -> dict[str, Any]:
         "activeProviderId": data.get("activeProviderId"),
         "activeIdentityId": data.get("activeIdentityId"),
         "providers": providers,
+        "providerTypes": provider_types,
         "identities": identities,
         "toolCatalog": TOOL_CATALOG,
         "agent": store.agent_config(),
@@ -275,15 +290,26 @@ async def settings_put(payload: dict[str, Any]) -> dict[str, Any]:
 async def settings_fetch_models(payload: dict[str, Any]) -> dict[str, Any]:
     """Probe a provider's Base URL and return the model ids it advertises.
 
-    Body: ``{type, baseUrl?, apiKey?}`` — blank baseUrl/apiKey fall back to the
-    stored config (or the vendor default for baseUrl). The fetched list is
-    persisted as ``modelHints`` and merged into the GET settings view.
+    Body: ``{id, type, baseUrl?, apiKey?}`` — ``id`` selects a stored provider
+    instance (``type`` is used as a fallback: the first instance of that type).
+    Blank baseUrl/apiKey fall back to the stored config (or the vendor default
+    for baseUrl). The fetched list is persisted as ``modelHints`` on that
+    instance and merged into the GET settings view.
     """
     store = SettingsStore.get()
+    instances = store.provider_instances()
+    pid = str(payload.get("id") or "").strip()
     ptype = str(payload.get("type") or "").strip()
+    conf = None
+    if pid:
+        conf = next((c for c in instances if c.get("id") == pid), None)
+        if conf is None:
+            raise HTTPException(status_code=400, detail=f"未知厂商实例: {pid}")
+        ptype = str(conf.get("type") or ptype)
+    else:
+        conf = next((c for c in instances if c.get("type") == ptype), None) or {}
     if not any(m.type == ptype for m in PROVIDER_TYPES):
         raise HTTPException(status_code=400, detail=f"未知厂商: {ptype}")
-    conf = store.load()["providers"].get(ptype) or {}
     api_key = str(payload.get("apiKey") or "").strip() or conf.get("apiKey", "")
     if not api_key:
         raise HTTPException(
@@ -299,9 +325,10 @@ async def settings_fetch_models(payload: dict[str, Any]) -> dict[str, Any]:
         result = await fetch_remote_models(ptype, base_url, api_key)
     except ModelsFetchError as e:
         raise HTTPException(status_code=400, detail=str(e)) from None
-    store.set_model_hints(ptype, result.models)
-    logger.info("[fetch-models] %s ← %s (%d models)", ptype, result.source,
-                len(result.models))
+    # persist on the concrete instance (fall back to its type when it has no id)
+    store.set_model_hints(conf.get("id") or ptype, result.models)
+    logger.info("[fetch-models] %s (%s) ← %s (%d models)", ptype,
+                conf.get("id") or ptype, result.source, len(result.models))
     return {"models": result.models, "source": result.source}
 
 

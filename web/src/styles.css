@@ -958,6 +958,36 @@ details summary {
 .provider-fields label.wide {
   grid-column: span 3;
 }
+.provider-label-input {
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 2px 6px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  background: transparent;
+  min-width: 120px;
+}
+.provider-label-input:hover,
+.provider-label-input:focus {
+  border-color: var(--border);
+  background: #fff;
+  outline: none;
+}
+.provider-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.provider-card .pathline {
+  margin: -4px 0 0;
+  font-size: 11px;
+}
+.pill.soft {
+  background: var(--accent-soft);
+  border-color: transparent;
+  color: var(--accent);
+}
 
 .pill {
   font-size: 11px;
