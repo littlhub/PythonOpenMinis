@@ -297,3 +297,33 @@ async def test_fetch_models_api_endpoint(store):
             assert "远程" in remote["name"]
     finally:
         srv.shutdown()
+
+
+def test_agent_defaults_and_config_helper(store):
+    cfg = store.agent_config()
+    assert cfg["maxContextTokens"] == 511998
+    assert cfg["maxMemoryRounds"] == 30
+    assert cfg["maxToolSteps"] == 40
+    assert cfg["deepThinking"] is False
+
+
+def test_apply_full_agent_partial_merge_and_clamp(store):
+    out = store.apply_full({
+        "agent": {"maxToolSteps": 7, "deepThinking": True},
+    })
+    cfg = out["agent"]
+    assert cfg["maxToolSteps"] == 7
+    assert cfg["deepThinking"] is True
+    # unset keys keep defaults (partial merge)
+    assert cfg["maxContextTokens"] == 511998
+    assert cfg["maxMemoryRounds"] == 30
+    # out-of-range values clamp instead of failing the whole save
+    out2 = store.apply_full({"agent": {"maxContextTokens": 10 ** 12}})
+    assert out2["agent"]["maxContextTokens"] == 100_000_000
+    # non-numeric values fail loudly (whole-save 400) so the UI surfaces them
+    import pytest as _pytest
+
+    from openminis.settings.store import SettingsError
+
+    with _pytest.raises(SettingsError):
+        store.apply_full({"agent": {"maxMemoryRounds": "not-a-number"}})

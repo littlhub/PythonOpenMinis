@@ -6,6 +6,7 @@ export type SetPageId =
   | 'providers'
   | 'identities'
   | 'usage'
+  | 'agent'
   | 'appearance'
   | 'soul'
   | 'skills'
@@ -70,6 +71,14 @@ export const GROUPS: SettingsGroupDef[] = [
         subtitle: '会话内计数与历史统计',
         icon: '📊',
         tint: BLUE,
+        kind: 'page',
+      },
+      {
+        id: 'agent',
+        title: '对话参数',
+        subtitle: '上下文预算 · 记忆轮次 · 工具步数上限 · 深度思考',
+        icon: '🎛️',
+        tint: TEAL,
         kind: 'page',
       },
     ],

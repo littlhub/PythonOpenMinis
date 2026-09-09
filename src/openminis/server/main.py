@@ -248,6 +248,7 @@ def _settings_view(store: SettingsStore | None = None) -> dict[str, Any]:
         "providers": providers,
         "identities": identities,
         "toolCatalog": TOOL_CATALOG,
+        "agent": store.agent_config(),
     }
 
 
@@ -501,9 +502,16 @@ async def _handle_chat(client_id: str, msg: dict[str, Any]) -> None:
                 await chat_store.append_turn(
                     sid, "assistant", final_text, model_label=model_label
                 )
-        # 20 轮一压缩:顺带把值得长期保留的事实写进记忆日志。压缩失败不影响
-        # 本轮回答,所以 maybe_compact 内部吞掉异常。
-        compacted = await compaction.maybe_compact(sid, provider)
+        # 到达轮次(默认 30)或接近上下文预算(默认 511998 tokens)时压缩:
+        # 顺带把值得长期保留的事实写进记忆日志。压缩失败不影响本轮回答,
+        # 所以 maybe_compact 内部吞掉异常。
+        _ag = SettingsStore.get().agent_config()
+        compacted = await compaction.maybe_compact(
+            sid,
+            provider,
+            threshold=int(_ag.get("maxMemoryRounds") or 30),
+            context_limit=int(_ag.get("maxContextTokens") or 0) or None,
+        )
         if compacted is not None and compacted.applied:
             logger.info(
                 "auto-compacted %s (%d messages → summary, %d memories)",

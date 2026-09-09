@@ -55,6 +55,15 @@ def _defaults() -> dict[str, Any]:
         #: skill names the main agent may load (技能调用范围,空=不启用).
         #: Activation is per-skill and edited from the 技能 page.
         "activeSkills": [],
+        #: Agent 对话运行参数（对应 UI「模型设置」里的 Agent 参数项）。
+        #: maxContextTokens=超过该预算时智能压缩; maxMemoryRounds=几轮问答后
+        #: 压缩; maxToolSteps=单次对话工具调用上限; deepThinking=是否深度思考。
+        "agent": {
+            "maxContextTokens": 511998,
+            "maxMemoryRounds": 30,
+            "maxToolSteps": 40,
+            "deepThinking": False,
+        },
     }
 
 
@@ -251,6 +260,32 @@ class SettingsStore:
             else:
                 errors.append(f"未知身份: {iid}")
 
+        # Agent 对话参数 — 只合并传入的键,越界值钳制到合理区间而不是拒绝,
+        # 这样一次误填不会让整个设置保存失败。
+        if "agent" in payload:
+            raw = payload["agent"]
+            if not isinstance(raw, dict):
+                errors.append("agent 必须是对象")
+            else:
+                agent = dict(data.get("agent") or _defaults()["agent"])
+                ints = {
+                    "maxContextTokens": (1, 100_000_000),
+                    "maxMemoryRounds": (1, 1000),
+                    "maxToolSteps": (1, 1000),
+                }
+                for key, (lo, hi) in ints.items():
+                    if key in raw:
+                        try:
+                            agent[key] = max(lo, min(hi, int(raw[key])))
+                        except (TypeError, ValueError):
+                            errors.append(f"agent.{key} 必须是整数")
+                if "deepThinking" in raw:
+                    dt = raw["deepThinking"]
+                    agent["deepThinking"] = (
+                        dt if isinstance(dt, bool) else str(dt).lower() in ("1", "true", "on")
+                    )
+                data["agent"] = agent
+
         if errors:
             raise SettingsError("; ".join(errors))
         self.save(data)
@@ -269,6 +304,12 @@ class SettingsStore:
             return
         conf["modelHints"] = list(dict.fromkeys(h for h in hints if isinstance(h, str)))
         self.save(data)
+
+    def agent_config(self) -> dict[str, Any]:
+        """Agent 对话参数 with defaults applied (safe even on old files)."""
+        defaults = _defaults()["agent"]
+        stored = self.load().get("agent") or {}
+        return {**defaults, **{k: stored[k] for k in defaults if k in stored}}
 
     # -- active skills (主 agent 的技能调用范围) -------------------------
     def active_skills(self) -> list[str]:

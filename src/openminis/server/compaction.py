@@ -93,6 +93,18 @@ def _now_ms() -> int:
 
 
 # -- trigger ----------------------------------------------------------------
+def estimate_tokens(text: str) -> int:
+    """Rough token estimate for CJK-heavy transcripts.
+
+    CJK characters ≈ 1 token each; latin runs ≈ 4 chars/token. Good enough
+    for a compaction *budget*: it only decides *when* to fold, not how.
+    """
+    if not text:
+        return 0
+    cjk = sum(1 for ch in text if ord(ch) > 0x2E7F)
+    return cjk + (len(text) - cjk) // 4
+
+
 async def turns_since_last_compact(session_id: str) -> int:
     """User turns accumulated since the last marker (或会话开头)."""
     await chat_store.ensure_db()
@@ -107,16 +119,32 @@ async def maybe_compact(
     provider: Any = None,
     *,
     threshold: int = COMPACT_EVERY_TURNS,
+    context_limit: int | None = None,
 ) -> CompactResult | None:
-    """Compact when the session has reached ``threshold`` turns since last time.
+    """Compact when the session passed ``threshold`` turns since last time —
+    or, when ``context_limit`` is given, when the kept transcript's estimated
+    tokens reach ~80% of it. Either condition triggers the fold.
 
     Returns ``None`` when nothing happened (the common case) so callers can log
     only on an actual compaction. Errors are swallowed: a failed compaction must
     never break the turn the user is waiting for.
     """
     try:
-        if await turns_since_last_compact(session_id) < threshold:
-            return None
+        await chat_store.ensure_db()
+        rows = await chat_store.load_raw_messages(session_id)
+        marker = await chat_store.latest_compact_marker(session_id)
+        start = chat_store.first_kept_index(rows, marker)
+        recent = rows[start:]
+        turns = sum(1 for r in recent if r.role == "user")
+        if turns < threshold:
+            if context_limit:
+                transcript = "".join(
+                    chat_store.parts_to_text(r.parts_json) for r in recent
+                )
+                if estimate_tokens(transcript) < int(context_limit) * 0.8:
+                    return None
+            else:
+                return None
         return await compact_session(session_id, provider=provider)
     except Exception as e:  # pragma: no cover - defensive
         logger.warning("compaction skipped for %s: %s", session_id, e)

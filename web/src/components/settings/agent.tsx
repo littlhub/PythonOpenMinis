@@ -680,6 +680,160 @@ export function SkillsPage(props: { onBack: () => void; go: (id: SetPageId) => v
 // ---------------------------------------------------------------------------
 // Token 用量
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// 对话参数 (AgentConfig) — 上下文预算 / 记忆轮次 / 工具步数 / 深度思考
+// ---------------------------------------------------------------------------
+export function AgentConfigPage(props: { onBack: () => void }) {
+  const [cfg, setCfg] = useState<{
+    maxContextTokens: number
+    maxMemoryRounds: number
+    maxToolSteps: number
+    deepThinking: boolean
+  } | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+  const [saving, setSaving] = useState(false)
+  const [saved, setSaved] = useState<string | null>(null)
+
+  useEffect(() => {
+    let alive = true
+    api
+      .settingsGet()
+      .then((s) => {
+        if (alive) setCfg({ ...s.agent })
+      })
+      .catch((e) => {
+        if (alive) setError((e as Error).message)
+      })
+      .finally(() => {
+        if (alive) setLoading(false)
+      })
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  const save = async () => {
+    if (!cfg) return
+    setSaving(true)
+    setError(null)
+    setSaved(null)
+    try {
+      await api.settingsPut({ agent: cfg })
+      setSaved('已保存 ✓')
+      setTimeout(() => setSaved(null), 2000)
+    } catch (e) {
+      setError((e as Error).message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (loading) {
+    return (
+      <DetailShell title="对话参数" onBack={props.onBack}>
+        <Spinner text="加载设置…" />
+      </DetailShell>
+    )
+  }
+
+  return (
+    <DetailShell
+      title="对话参数"
+      subtitle="控制 Agent 单次对话的上下文预算、压缩时机与工具步数上限。"
+      onBack={props.onBack}
+    >
+      {error && <Note kind="warn">{error}</Note>}
+      {saved && <Note kind="ok">{saved}</Note>}
+      {cfg && (
+        <>
+          <SectionCard title="上下文与压缩" hint="超过上限后会自动把旧对话压缩为摘要,历史数据不丢。">
+            <div className="provider-fields">
+              <label className="wide">
+                <span>最大上下文 Token</span>
+                <input
+                  type="number"
+                  min={1024}
+                  step={1024}
+                  value={cfg.maxContextTokens}
+                  onChange={(e) =>
+                    setCfg({ ...cfg, maxContextTokens: Number(e.target.value) || 0 })
+                  }
+                />
+                <span className="muted" style={{ fontSize: 12 }}>
+                  对话历史接近该预算时智能压缩(约 80% 触发)
+                </span>
+              </label>
+              <label className="wide">
+                <span>最大记忆轮次</span>
+                <input
+                  type="number"
+                  min={1}
+                  value={cfg.maxMemoryRounds}
+                  onChange={(e) =>
+                    setCfg({ ...cfg, maxMemoryRounds: Number(e.target.value) || 1 })
+                  }
+                />
+                <span className="muted" style={{ fontSize: 12 }}>
+                  一问一答为一轮,超过后会智能压缩处理
+                </span>
+              </label>
+            </div>
+          </SectionCard>
+
+          <SectionCard title="执行控制">
+            <div className="provider-fields">
+              <label className="wide">
+                <span>最大执行步数</span>
+                <input
+                  type="number"
+                  min={1}
+                  max={1000}
+                  value={cfg.maxToolSteps}
+                  onChange={(e) =>
+                    setCfg({ ...cfg, maxToolSteps: Number(e.target.value) || 1 })
+                  }
+                />
+                <span className="muted" style={{ fontSize: 12 }}>
+                  单次对话中 Agent 最多调用工具的次数
+                </span>
+              </label>
+              <div
+                className="cfg-row"
+                style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '4px 0' }}
+              >
+                <label className="skill-toggle" title="深度思考开关">
+                  <input
+                    type="checkbox"
+                    checked={cfg.deepThinking}
+                    onChange={(e) => setCfg({ ...cfg, deepThinking: e.target.checked })}
+                  />
+                  <span className="skill-toggle-track" />
+                </label>
+                <div>
+                  <div style={{ fontWeight: 600 }}>深度思考</div>
+                  <div className="muted" style={{ fontSize: 12 }}>
+                    开启后使用 HIGH 思考档位;推理型任务更稳、速度略慢
+                  </div>
+                </div>
+              </div>
+            </div>
+          </SectionCard>
+
+          <div style={{ marginTop: 14 }}>
+            <button className="btn-create" disabled={saving} onClick={() => void save()}>
+              {saving ? '保存中…' : '保存'}
+            </button>
+          </div>
+        </>
+      )}
+    </DetailShell>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Token 用量 (UsageStats 占位)
+// ---------------------------------------------------------------------------
 export function UsagePage(props: { onBack: () => void }) {
   return (
     <DetailShell

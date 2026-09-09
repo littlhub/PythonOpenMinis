@@ -1,6 +1,7 @@
 import { useState } from 'react'
 import { GROUPS, type SetPageId } from './settings/entries'
 import {
+  AgentConfigPage,
   IdentitiesPage,
   MemoryPage,
   ProvidersPage,
@@ -39,6 +40,7 @@ export function SettingsView() {
   if (page === 'providers') return <ProvidersPage onBack={onBack} />
   if (page === 'identities') return <IdentitiesPage onBack={onBack} />
   if (page === 'usage') return <UsagePage onBack={onBack} />
+  if (page === 'agent') return <AgentConfigPage onBack={onBack} />
   if (page === 'appearance') return <AppearancePage onBack={onBack} />
   if (page === 'soul') return <SoulPage onBack={onBack} go={go} />
   if (page === 'skills') return <SkillsPage onBack={onBack} go={go} />

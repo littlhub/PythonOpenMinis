@@ -173,6 +173,16 @@ export interface SettingsInfo {
   providers: ProviderInfo[]
   identities: IdentityInfo[]
   toolCatalog: ToolInfo[]
+  /** Agent 对话参数(模型设置):上下文预算/记忆轮次/工具步数/深度思考. */
+  agent: AgentConfig
+}
+
+/** Agent 对话运行参数 — 对应「模型设置」里的那几项。 */
+export interface AgentConfig {
+  maxContextTokens: number
+  maxMemoryRounds: number
+  maxToolSteps: number
+  deepThinking: boolean
 }
 
 export interface FetchModelsRequest {
@@ -204,6 +214,8 @@ export interface SettingsPayload {
   providers?: { type: string; apiKey: string; baseUrl: string; model: string }[]
   identityEdits?: { id: string; enabledTools: string[] }[]
   customIdentities?: CustomIdentityDraft[]
+  /** Partial Agent 对话参数 — 只合并传入的键,其余保持默认. */
+  agent?: Partial<AgentConfig>
 }
 
 // ---------------------------------------------------------------------------

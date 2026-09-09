@@ -8,8 +8,8 @@ from __future__ import annotations
 
 from typing import Any, Awaitable, Callable
 
-from ..agent.agent_runtime import AgentRuntime, AgentRuntimeOptions
-from ..data.model import LLMModel
+from ..agent.agent_runtime import MAX_AGENT_TURNS, AgentRuntime, AgentRuntimeOptions
+from ..data.model import LLMModel, ThinkingLevel
 from ..data.model.agent_content_part import ToolUse  # noqa: F401  (re-exported for tests)
 from ..provider.anthropic.anthropic_provider import AnthropicProvider
 from ..provider.openai.openai_provider import OpenAIProvider
@@ -140,6 +140,14 @@ def build_chat_setup(  # noqa: ANN201
     identity = store.active_identity()
     tools = build_tool_registry(identity.effective_tools())
     runtime = AgentRuntime(tools=tools, chunk_sink=chunk_sink)
+    # Agent 对话参数(模型设置):执行步数上限 + 深度思考开关。缺省不深思考,
+    # 步数上限用设置里的值(默认 40),保证单次对话不会无限跑工具。
+    agent_cfg = store.agent_config()
     options = AgentRuntimeOptions(
-        system_prompt=identity.persona + active_skills_block(store))
+        system_prompt=identity.persona + active_skills_block(store),
+        max_turns=int(agent_cfg.get("maxToolSteps") or MAX_AGENT_TURNS),
+        thinking_level=(
+            ThinkingLevel.HIGH if agent_cfg.get("deepThinking") else ThinkingLevel.OFF
+        ),
+    )
     return provider, runtime, options, identity, conf
