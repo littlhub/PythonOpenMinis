@@ -30,6 +30,7 @@ from ..tools.memory_tools import (
 from ..tools.read_image_tool import ReadImageTool
 from ..tools.search_files_tool import SearchFilesTool
 from ..tools.shell_execute_tool import ShellExecuteTool
+from ..tools.subagent_tool import SubagentDelegateTool
 from ..tools.vision_group_resolver import VisionGroupResolver
 from ..tools.web_fetch_tool import WebFetchTool
 from ..tools.web_search_tool import WebSearchTool
@@ -173,6 +174,7 @@ BUILTIN_IDENTITIES: list[Identity] = [
             "search_files",
             "web_fetch",
             "web_search",
+            "subagent_delegate",
             "memory_write",
             "memory_get",
         ],
@@ -195,6 +197,7 @@ BUILTIN_IDENTITIES: list[Identity] = [
             "search_files",
             "web_fetch",
             "web_search",
+            "subagent_delegate",
             "memory_write",
             "memory_get",
         ],
@@ -245,6 +248,7 @@ IDENTITY_TOOL_MATCH: dict[str, list[str]] = {
         "search_files",
         "web_fetch",
         "web_search",
+        "subagent_delegate",
         "memory_write",
         "memory_get",
     ],
@@ -257,6 +261,7 @@ IDENTITY_TOOL_MATCH: dict[str, list[str]] = {
         "search_files",
         "web_fetch",
         "web_search",
+        "subagent_delegate",
         "memory_write",
         "memory_get",
     ],
@@ -309,6 +314,8 @@ def _tool_desc(tool_id: str) -> str:
             return WebFetchTool.definition().description
         if tool_id == "web_search":
             return WebSearchTool.definition().description
+        if tool_id == "subagent_delegate":
+            return SubagentDelegateTool.definition().description
     except Exception:  # pragma: no cover - defensive
         pass
     return tool_id
@@ -390,6 +397,12 @@ TOOL_CATALOG: list[dict] = [
         "name": "联网搜索",
         "description": _tool_desc("web_search"),
         "category": "Web",
+    },
+    {
+        "id": "subagent_delegate",
+        "name": "委派子代理",
+        "description": _tool_desc("subagent_delegate"),
+        "category": "Agent",
     },
 ]
 
@@ -490,6 +503,10 @@ def build_tool_registry(enabled_ids: list[str]) -> dict[str, ToolExecutor]:
         elif tool_id == "web_search":
             out[tool_id] = _wrap_async_static_executor(
                 WebSearchTool.definition(), WebSearchTool.execute
+            )
+        elif tool_id == "subagent_delegate":
+            out[tool_id] = _wrap_async_static_executor(
+                SubagentDelegateTool.definition(), SubagentDelegateTool.execute
             )
     return out
 

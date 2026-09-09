@@ -25,6 +25,10 @@ import type {
   SkillInfo,
   SkillsList,
   StorageInfo,
+  SubagentInfo,
+  SubagentPlanResult,
+  SubagentRegistry,
+  SubagentsList,
   SystemLogs,
   WorkspaceInfo,
 } from './types'
@@ -218,6 +222,35 @@ export const api = {
 
   knowledgeContent: (kind: string, name: string) =>
     request<KnowledgeContent>(`/knowledge/content/${kind}/${encodeURIComponent(name)}`),
+
+  // -- subagents (助理 / 子代理) ---------------------------------
+  subagentsList: () => request<SubagentsList>('/subagents'),
+
+  subagentsRegistry: () => request<SubagentRegistry>('/subagents/registry'),
+
+  subagentsCreate: (payload: Partial<SubagentInfo>) =>
+    request<{ subagent: SubagentInfo }>('/subagents', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  subagentsUpdate: (id: string, payload: Partial<SubagentInfo>) =>
+    request<{ subagent: SubagentInfo }>(
+      `/subagents/${encodeURIComponent(id)}`,
+      { method: 'PUT', body: JSON.stringify(payload) },
+    ),
+
+  subagentsDelete: (id: string) =>
+    request<{ ok: boolean }>(`/subagents/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+
+  /** Hand the registry to the main agent's LLM; returns a candidate config. */
+  subagentsPlan: (req: string, autoSave = false) =>
+    request<SubagentPlanResult>('/subagents/plan', {
+      method: 'POST',
+      body: JSON.stringify({ request: req, autoSave }),
+    }),
 }
 
 /** Trigger a browser download for a backend file endpoint (GET). */

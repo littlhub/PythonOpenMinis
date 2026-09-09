@@ -37,7 +37,7 @@ class ThinkingLevelCatalog:
     def _normalized_has_prefix(id: str, prefix: str) -> bool:
         """Prefix match that treats "." and "-" interchangeably in the version
         separator so a rule matches whether the id is dotted or hyphenated."""
-        return id.replace(".", "-").startsWith(prefix)  # type: ignore[attr-defined]
+        return id.replace(".", "-").startswith(prefix)
 
     @classmethod
     def declared_max_level(cls, model_id: str) -> Optional[ThinkingLevel]:

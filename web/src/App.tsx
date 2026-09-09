@@ -9,6 +9,7 @@ import { MemoryView } from './components/MemoryView'
 import { SkillsView } from './components/SkillsView'
 import { ChannelsView } from './components/ChannelsView'
 import { SchedulerView } from './components/SchedulerView'
+import { SubagentsView } from './components/SubagentsView'
 import { api } from './api'
 import type { WorkspaceInfo } from './types'
 
@@ -140,15 +141,7 @@ export default function App() {
         )}
         {view === 'workspaces' && (
           <div className="pane">
-            <div className="pane-card">
-              <h2>助理</h2>
-              <p className="empty">
-                这里将来放置子代理身份(identities)与默认工具集的切换。
-              </p>
-              <p className="empty">
-                当前实现:在 <strong>设置</strong> tab 里已经能编辑身份和工具勾选。
-              </p>
-            </div>
+            <SubagentsView />
           </div>
         )}
         {view === 'sandbox' && (

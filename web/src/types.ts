@@ -330,3 +330,60 @@ export interface OrganizeResponse {
   rules: number
   wiki: string[]
 }
+
+// ---------------------------------------------------------------------------
+// subagents (助理 — 主 agent 可委派的子代理)
+// ---------------------------------------------------------------------------
+export interface SubagentInfo {
+  id: string
+  name: string
+  emoji: string
+  description: string
+  persona: string
+  providerType: string
+  model: string
+  tools: string[]
+  skills: string[]
+  mcpServers: string[]
+  maxRounds: number
+}
+
+/** A provider as seen by the subagent registry: may lack a key or engine. */
+export interface SubagentProviderOption {
+  type: string
+  label: string
+  engine: string | null
+  hasKey: boolean
+  ready: boolean
+  usable: boolean
+  isActive: boolean
+  model: string
+}
+
+export interface SubagentModelOption {
+  providerType: string
+  providerLabel: string
+  id: string
+  display: string
+}
+
+/** What a subagent is allowed to be built from (live snapshot). */
+export interface SubagentRegistry {
+  providers: SubagentProviderOption[]
+  models: SubagentModelOption[]
+  tools: ToolInfo[]
+  skills: { name: string; description: string }[]
+  mcpServers: string[]
+  mcpNote: string
+}
+
+export interface SubagentsList {
+  subagents: SubagentInfo[]
+  registry: SubagentRegistry
+}
+
+/** Result of POST /subagents/plan (LLM-designed candidate). */
+export interface SubagentPlanResult {
+  saved: boolean
+  subagent: SubagentInfo
+}

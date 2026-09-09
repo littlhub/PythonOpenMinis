@@ -1,0 +1,375 @@
+"""Subagent registry + LLM planner.
+
+A subagent is a reusable worker profile for the main agent: a persona, its own
+model (provider type + model id), an enabled tool set, a skill list and an MCP
+server list. Configs live in ``settings.json`` under ``subagents`` and are
+created three ways:
+
+- manually through the UI / REST,
+- by the LLM planner (:func:`plan_subagent`) which is handed the live
+  **registry** — providers with keys, catalogue models, registered tools,
+  installed skills — and a user request ("我要一个写作 subagent") and returns
+  a structured candidate config,
+- programmatically.
+
+Delegation at runtime lives in ``openminis.tools.subagent_tool``
+(``subagent_delegate``); this module only owns the configuration surface.
+
+Note: the engine has no MCP client ported yet, so ``mcpServers`` is stored for
+forward compatibility and always comes back empty in the registry.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from typing import Any
+
+from ..core.logging import get_logger
+from ..data.model import LLMMessage, LLMStreamChunk
+
+logger = get_logger(__name__)
+
+__all__ = [
+    "SubagentError",
+    "DEFAULT_FIELDS",
+    "slugify_name",
+    "list_subagents",
+    "get_subagent",
+    "upsert_subagent",
+    "delete_subagent",
+    "build_registry",
+    "plan_subagent",
+]
+
+_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
+_JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+
+DEFAULT_FIELDS: dict[str, Any] = {
+    "emoji": "🤖",
+    "description": "",
+    "persona": "",
+    "providerType": "",
+    "model": "",
+    "tools": [],
+    "skills": [],
+    "mcpServers": [],
+    "maxRounds": 6,
+}
+
+
+class SubagentError(Exception):
+    """Raised for invalid subagent payloads (surfaced as HTTP 400)."""
+
+
+# ---------------------------------------------------------------------------
+# CRUD
+# ---------------------------------------------------------------------------
+def _table(store) -> dict[str, Any]:
+    data = store.load()
+    sub = data.get("subagents")
+    if not isinstance(sub, dict):
+        sub = {}
+        data["subagents"] = sub
+    return sub
+
+
+def list_subagents(store) -> list[dict[str, Any]]:
+    return [dict(cfg) for cfg in _table(store).values()]
+
+
+def get_subagent(store, sid: str) -> dict[str, Any] | None:
+    cfg = _table(store).get(sid)
+    return dict(cfg) if cfg else None
+
+
+def slugify_name(name: str) -> str:
+    """Turn a Chinese/user-facing name into a slug id ('' when unusable)."""
+    base = re.sub(r"[^a-zA-Z0-9]+", "-", (name or "").strip().lower()).strip("-")
+    base = re.sub(r"-+", "-", base)[:40]
+    if not base:
+        base = "subagent"
+    if base[0].isdigit():
+        base = f"s-{base}"
+    return base
+
+
+def _clean_tools(tools: Any, catalog_ids: set[str], sid: str) -> list[str]:
+    if not tools:
+        return []
+    if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools):
+        raise SubagentError("tools 必须是字符串数组")
+    bad = [t for t in tools if t not in catalog_ids]
+    if bad:
+        raise SubagentError(f"subagent {sid} 包含未知工具: {', '.join(bad)}")
+    return list(dict.fromkeys(tools))
+
+
+def _clean_strings(field: str, value: Any, sid: str, label: str) -> list[str]:
+    if not value:
+        return []
+    if not isinstance(value, list) or not all(isinstance(v, str) and v.strip()
+                                              for v in value):
+        raise SubagentError(f"{label} 必须是字符串数组")
+    return list(dict.fromkeys(v.strip() for v in value))
+
+
+def _validate(store, cfg: dict[str, Any], existing: bool) -> None:
+    from ..settings.catalog import ENGINE_READY, PROVIDER_TYPES, VALID_TOOLS
+    from ..settings.store import provider_type_label
+
+    sid = str(cfg.get("id") or "").strip()
+    if not _SLUG_RE.match(sid):
+        raise SubagentError(
+            "id 需为小写字母/数字开头，可用 a-z0-9_-（≤40 字符）"
+        )
+    name = str(cfg.get("name") or "").strip()
+    if not name:
+        raise SubagentError("name 不能为空")
+    if not existing and sid in _table(store):
+        raise SubagentError(f"subagent 已存在: {sid}")
+
+    ptype = str(cfg.get("providerType") or "").strip()
+    conf = store.load()["providers"].get(ptype)
+    if not conf or not str(conf.get("apiKey") or "").strip():
+        raise SubagentError(f"模型服务未配置或未填 Key: {ptype or '(空)'}")
+    engine = next((p.engine for p in PROVIDER_TYPES if p.type == ptype), None)
+    if engine not in ENGINE_READY:
+        raise SubagentError(
+            f"{provider_type_label(ptype)} 的引擎尚未移植，还不能用于 subagent"
+        )
+    model = str(cfg.get("model") or "").strip()
+    if not model:
+        raise SubagentError("model 不能为空")
+
+    cfg["tools"] = _clean_tools(cfg.get("tools"), VALID_TOOLS, sid)
+    cfg["skills"] = _clean_strings("skills", cfg.get("skills"), sid, "skills")
+    cfg["mcpServers"] = _clean_strings("mcpServers", cfg.get("mcpServers"),
+                                       sid, "mcpServers")
+    try:
+        cfg["maxRounds"] = max(1, min(int(cfg.get("maxRounds", 6)), 12))
+    except (TypeError, ValueError) as exc:
+        raise SubagentError("maxRounds 必须是整数(1-12)") from exc
+    cfg["name"] = name
+    cfg["emoji"] = str(cfg.get("emoji") or "🤖")[:4]
+    cfg["description"] = str(cfg.get("description") or "")[:200]
+    cfg["persona"] = str(cfg.get("persona") or "").strip()
+    if not cfg["persona"]:
+        cfg["persona"] = f"你是「{name}」。基于给定的任务专注、可靠地完成工作，用中文回复。"
+
+
+def upsert_subagent(store, payload: dict[str, Any], sid: str | None = None) -> dict[str, Any]:
+    """Create (sid None or new) or replace an existing subagent config."""
+    data = store.load()
+    sub = data.setdefault("subagents", {})
+    cfg = {
+        **DEFAULT_FIELDS,
+        **(payload or {}),
+    }
+    if sid is not None:
+        if sid not in sub:
+            raise SubagentError(f"subagent 不存在: {sid}")
+        cfg["id"] = sid
+        _validate(store, cfg, existing=True)
+    else:
+        _validate(store, cfg, existing=False)
+    sub[cfg["id"]] = cfg
+    store.save(data)
+    return dict(cfg)
+
+
+def delete_subagent(store, sid: str) -> bool:
+    data = store.load()
+    sub = data.get("subagents") or {}
+    if sid not in sub:
+        return False
+    del sub[sid]
+    store.save(data)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Registry — what the planner (and the UI) can offer a subagent.
+# ---------------------------------------------------------------------------
+def build_registry(store) -> dict[str, Any]:
+    """Live snapshot: providers w/ keys, catalog models, tools, skills, MCP.
+
+    This is exactly what gets embedded in the planner prompt so the main
+    agent's LLM only ever picks from things that actually exist.
+    """
+    from ..settings.catalog import ENGINE_READY, MODEL_GROUPS, PROVIDER_TYPES, TOOL_CATALOG
+    from ..skills import SkillStore
+
+    data = store.load()
+    active_pid = data.get("activeProviderId")
+
+    providers = []
+    for meta in PROVIDER_TYPES:
+        conf = data["providers"].get(meta.type) or {}
+        has_key = bool(str(conf.get("apiKey") or "").strip())
+        usable = has_key and meta.engine in ENGINE_READY
+        providers.append({
+            "type": meta.type,
+            "label": meta.label,
+            "engine": meta.engine,
+            "hasKey": has_key,
+            "ready": bool(meta.engine in ENGINE_READY),
+            "usable": usable,
+            "isActive": meta.type == active_pid,
+            "model": str(conf.get("model") or ""),
+        })
+
+    models = []
+    for ptype, group in MODEL_GROUPS.items():
+        label = next((p.label for p in PROVIDER_TYPES if p.type == ptype), ptype)
+        for mid, display in group:
+            models.append({"providerType": ptype, "providerLabel": label,
+                           "id": mid, "display": display})
+    # providers may have fetched extra model ids — surface them too.
+    for ptype, conf in data["providers"].items():
+        for mid in (conf.get("modelHints") or []):
+            if not any(m["providerType"] == ptype and m["id"] == mid
+                       for m in models):
+                models.append({"providerType": ptype,
+                               "providerLabel": ptype, "id": mid, "display": mid})
+
+    skills = []
+    try:
+        for entry in SkillStore().list():
+            skills.append({"name": entry.name, "description": entry.description})
+    except Exception:  # pragma: no cover - never break registry over skills
+        logger.debug("skill list unavailable", exc_info=True)
+
+    return {
+        "providers": providers,
+        "models": models,
+        "tools": [dict(t) for t in TOOL_CATALOG],
+        "skills": skills,
+        "mcpServers": [],
+        # human note for the UI / planner about the MCP gap
+        "mcpNote": "本引擎暂未移植 MCP 客户端，mcpServers 字段仅作预留",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Planner — ask the main agent's LLM to design a subagent from the registry.
+# ---------------------------------------------------------------------------
+_PLAN_SYSTEM = (
+    "你是子代理规划师。根据「可用资源注册表」和用户的自然语言需求，设计一个"
+    "subagent 配置。只输出一个 JSON 对象，不要输出任何其它文字。"
+)
+
+_PLAN_INSTRUCTIONS = """需求：{request}
+
+可用资源注册表（只许从里面选，不要发明不存在的 id/名称）：
+{registry}
+
+输出 JSON（字段与取值约束）：
+{{
+  "name": "简短中文名，如 写作助手",
+  "emoji": "单个 emoji",
+  "description": "一句话职责",
+  "persona": "系统提示/人设，200 字内，中文，说明身份、工作方式、输出风格",
+  "providerType": "从注册表 providers 中选 usable=true 的一个 type",
+  "model": "从注册表 models 中选与 providerType 匹配的一个 id",
+  "tools": ["只选能帮助完成该职责的工具 id，从注册表 tools 的 id 中选，1-6 个"],
+  "skills": ["从注册表 skills 的 name 中选相关的，0-4 个"],
+  "maxRounds": 6
+}}
+
+关于工具选择：写作类不需要 shell_execute/浏览器等执行类工具；
+代码类需要 file_read/file_edit/search_files/shell_execute。按职责判断。
+"""
+
+
+def _summarize(provider: Any, text: str, max_tokens: int = 2_000) -> str:
+    messages = [LLMMessage(LLMMessage.Role.USER, text)]
+    out: list[str] = []
+    stream = provider.stream_message(messages, _PLAN_SYSTEM, max_tokens, None,
+                                     tools=None)
+    async def _collect():
+        async for chunk in stream:
+            if isinstance(chunk, LLMStreamChunk.Text):
+                out.append(chunk.text)
+        return "".join(out)
+    import asyncio
+    return asyncio.run(_collect())
+
+
+def _extract_json(raw: str) -> dict[str, Any]:
+    m = _JSON_FENCE.search(raw)
+    if m:
+        raw = m.group(1)
+    start, end = raw.find("{"), raw.rfind("}")
+    if start < 0 or end <= start:
+        raise SubagentError("规划结果不是 JSON")
+    obj = json.loads(raw[start : end + 1])
+    if not isinstance(obj, dict):
+        raise SubagentError("规划结果不是对象")
+    return obj
+
+
+async def plan_subagent(store, request: str, *, auto_save: bool = False,
+                        provider: Any = None) -> dict[str, Any]:
+    """Ask the main agent's LLM to design a subagent for ``request``.
+
+    Returns the candidate config (not yet saved unless ``auto_save``).
+    """
+    from ..settings.chat_service import build_chat_setup
+
+    request = (request or "").strip()
+    if not request:
+        raise SubagentError("请描述你想要的 subagent，例如：我要一个写作 subagent")
+
+    registry = build_registry(store)
+    if not any(p.get("usable") for p in registry["providers"]):
+        raise SubagentError(
+            "还没有可用的模型服务：请先在 设置 → 模型服务 配好 API Key"
+        )
+
+    owned = provider is None
+    if owned:
+        provider, _r, _o, _i, _c = build_chat_setup(SettingsStore_get())
+    try:
+        import asyncio
+        raw = await asyncio.to_thread(
+            _summarize, provider,
+            _PLAN_INSTRUCTIONS.format(
+                request=request,
+                registry=json.dumps(registry, ensure_ascii=False, indent=1),
+            ),
+        )
+        obj = _extract_json(raw)
+    finally:
+        if owned:
+            close = getattr(provider, "aclose", None)
+            if callable(close):
+                try:
+                    await close()
+                except Exception:  # pragma: no cover
+                    pass
+
+    # Fill required keys that the model may have omitted.
+    for k, v in DEFAULT_FIELDS.items():
+        obj.setdefault(k, v)
+    name = str(obj.get("name") or request).strip()
+    obj["name"] = name
+    obj["id"] = str(obj.get("id") or slugify_name(name)).strip()
+    obj["providerType"] = str(obj.get("providerType") or "").strip()
+    obj["model"] = str(obj.get("model") or "").strip()
+    # Drop fabricated ids: tools/skills must exist in the registry.
+    tool_ids = {t["id"] for t in registry["tools"]}
+    obj["tools"] = [t for t in (obj.get("tools") or []) if t in tool_ids]
+    skill_names = {s["name"] for s in registry["skills"]}
+    obj["skills"] = [s for s in (obj.get("skills") or []) if s in skill_names]
+    obj["mcpServers"] = []
+
+    if auto_save:
+        saved = upsert_subagent(store, obj, sid=None)
+        return {"saved": True, "subagent": saved}
+    return {"saved": False, "subagent": obj}
+
+
+def SettingsStore_get():
+    from ..settings.store import SettingsStore
+    return SettingsStore.get()

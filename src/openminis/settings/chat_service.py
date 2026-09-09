@@ -64,10 +64,14 @@ def build_provider(provider_type: str, conf: dict[str, Any]):  # noqa: ANN201
     model = _model_for(provider_type, (conf.get("model") or "").strip())
     base_url = (conf.get("baseUrl") or "").strip()
     if engine == "anthropic":
+        # DEFAULT_BASE_PATH is a module-level constant on the provider module,
+        # not a class attribute — reference it through the module.
+        from ..provider.anthropic import anthropic_provider as _anthropic_mod
+
         return AnthropicProvider(
             api_key=api_key,
             model=model,
-            base_path=base_url or AnthropicProvider.DEFAULT_BASE_PATH,
+            base_path=base_url or _anthropic_mod.DEFAULT_BASE_PATH,
         )
     if engine == "openai":
         return OpenAIProvider(

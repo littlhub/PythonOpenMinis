@@ -32,6 +32,7 @@ from .memory_tools import memory_get_definition, memory_write_definition
 from .read_image_tool import ReadImageTool
 from .search_files_tool import SearchFilesTool
 from .shell_execute_tool import ShellExecuteTool
+from .subagent_tool import SubagentDelegateTool
 from .vision_group_resolver import VisionGroupResolver
 from .web_fetch_tool import WebFetchTool
 from .web_search_tool import WebSearchTool
@@ -67,6 +68,9 @@ class AgentTools:
         out.append(BrowserUseTool.definition())
         out.append(WebFetchTool.definition())
         out.append(WebSearchTool.definition())
+        # Delegation to configured subagents — needs a subagent registry entry
+        # at call time; schema exposure is harmless.
+        out.append(SubagentDelegateTool.definition())
         # [T-memory-toggle-gates-injection-and-tools-android] memory off
         # means memory_write / memory_get are dropped from the schema so the
         # model can't even attempt them.

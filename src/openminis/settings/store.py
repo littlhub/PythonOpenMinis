@@ -49,6 +49,9 @@ def _defaults() -> dict[str, Any]:
         "identityOverrides": {},
         #: id -> full Identity dict (user-created identities)
         "customIdentities": {},
+        #: subagent id -> config dict (model / skills / tools / mcp / persona).
+        #: Subagents are delegatable worker agents the main agent can call.
+        "subagents": {},
     }
 
 
