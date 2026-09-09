@@ -203,3 +203,56 @@ async def test_runtime_max_turns_guard():
         None,
     )
     assert last_text
+
+
+@pytest.mark.asyncio
+async def test_runtime_hard_stops_after_repeated_blocks():
+    """Model keeps calling a query tool with fresh args forever: after the
+    gate starts blocking (query_tool_runaway), 2 consecutive fully-blocked
+    rounds must hard-stop the loop with a wrap-up instead of spinning until
+    MAX_AGENT_TURNS."""
+
+    class SearchForever:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def stream_message(self, messages, system_prompt=None, max_tokens=0,
+                           temperature=None, image_parts=None, tools=None,
+                           thinking_level=ThinkingLevel.OFF):
+            async def gen():
+                self.n += 1
+                last = messages[-1]
+                text = (last.content_parts[0].content
+                        if last.content_parts and hasattr(last.content_parts[0], "content")
+                        else (last.content or ""))
+                if "[loop protection]" in text:
+                    yield LLMStreamChunk.Text("根据已收集的信息总结如下。")
+                    yield LLMStreamChunk.Finished("end_turn")
+                else:
+                    yield LLMStreamChunk.ToolCallComplete(
+                        f"c{self.n}", "web_fetch",
+                        {"url": f"https://example.com/page{self.n}"},
+                    )
+                    yield LLMStreamChunk.Finished("tool_use")
+            return gen()
+
+    def _fetch_def() -> AgentToolDefinition:
+        return AgentToolDefinition(
+            name="web_fetch", description="fetch url",
+            parameters={"url": AgentToolParam("string", "url")},
+            required=["url"],
+        )
+
+    async def _fake_fetch(args_json: str, session_id: str, **kw) -> ToolExecutionResult:
+        return ToolExecutionResult("nothing useful here", True)
+
+    rt = AgentRuntime()
+    rt.register(ToolExecutor(_fetch_def(), _fake_fetch))
+    msgs = [LLMMessage(LLMMessage.Role.USER, "keep searching")]
+    out, stop = await rt.run(SearchForever(), msgs, "s", AgentRuntimeOptions())
+    assert stop == "tool_loop_blocked"
+    # the wrap-up request and the model's summary are both in history
+    assert any(m.role is LLMMessage.Role.USER
+               and "[loop protection]" in (m.content or "") for m in out)
+    assert any(m.role is LLMMessage.Role.ASSISTANT
+               and "总结" in (m.content or "") for m in out)

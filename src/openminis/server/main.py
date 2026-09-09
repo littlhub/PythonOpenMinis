@@ -45,6 +45,7 @@ from ..settings.store import SettingsError, SettingsStore
 from ..skills import SkillStore
 from . import chat_api, compaction, fs_api, workspaces, chat_store
 from .knowledge_api import router as knowledge_router
+from .marketplace_api import router as marketplace_router
 from .skills_api import router as skills_router
 from .subagents_api import router as subagents_router
 from .system_api import router as system_router
@@ -97,6 +98,7 @@ app.include_router(system_router)
 app.include_router(skills_router)
 app.include_router(knowledge_router)
 app.include_router(subagents_router)
+app.include_router(marketplace_router)
 
 
 # ---------------------------------------------------------------------------

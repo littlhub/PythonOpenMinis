@@ -3412,3 +3412,123 @@ input:checked + .toggle-slider:before {
   color: #fff;
 }
 
+
+
+/* ---- 技能激活开关（skill toggle）---- */
+.skill-card.inactive {
+  opacity: 0.62;
+}
+
+.skill-toggle {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.skill-toggle input {
+  position: absolute;
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.skill-toggle-track {
+  display: inline-block;
+  width: 40px;
+  height: 22px;
+  border-radius: 11px;
+  background: var(--border);
+  transition: background 0.18s ease;
+  position: relative;
+}
+
+.skill-toggle-track::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 3px rgb(0 0 0 / 35%);
+  transition: transform 0.18s ease;
+}
+
+.skill-toggle input:checked + .skill-toggle-track {
+  background: #22c55e;
+}
+
+.skill-toggle input:checked + .skill-toggle-track::after {
+  transform: translateX(18px);
+}
+
+.skill-toggle input:focus-visible + .skill-toggle-track {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.skill-toggle input:disabled + .skill-toggle-track {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+
+/* ---- 技能广场（marketplace）---- */
+.market-section-title {
+  margin: 18px 0 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.market-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 10px;
+}
+
+.market-card {
+  display: block;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  color: var(--text);
+  text-decoration: none;
+  background: var(--panel);
+  transition: border-color 0.15s ease, transform 0.15s ease;
+}
+
+.market-card:hover {
+  border-color: var(--accent);
+  transform: translateY(-1px);
+}
+
+.market-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.market-card-icon {
+  font-size: 18px;
+}
+
+.market-card-name {
+  font-weight: 600;
+  flex: 1;
+}
+
+.market-card-go {
+  font-size: 12px;
+  color: var(--accent);
+}
+
+.market-card-desc {
+  margin: 8px 0 6px;
+  font-size: 12.5px;
+  color: var(--muted);
+  line-height: 1.5;
+}

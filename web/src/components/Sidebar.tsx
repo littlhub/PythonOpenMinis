@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api } from '../api'
 import type { ChatSessionInfo, WorkspaceInfo } from '../types'
 
-export type ViewId = 'chat' | 'workspaces' | 'sandbox' | 'settings' | 'projects' | 'knowledge' | 'memory' | 'skills' | 'channels' | 'scheduler'
+export type ViewId = 'chat' | 'workspaces' | 'sandbox' | 'settings' | 'projects' | 'knowledge' | 'memory' | 'skills' | 'market' | 'channels' | 'scheduler'
 
 interface NavItem {
   id: ViewId
@@ -16,6 +16,7 @@ const TOP_NAV: NavItem[] = [
   { id: 'knowledge', label: '知识', icon: '📚' },
   { id: 'memory', label: '记忆', icon: '🧠' },
   { id: 'skills', label: '技能', icon: '⚡' },
+  { id: 'market', label: '广场', icon: '🛍️' },
   { id: 'channels', label: '通道', icon: '📡' },
   { id: 'scheduler', label: '定时', icon: '⏰' },
   { id: 'projects', label: '项目', icon: '◇' },

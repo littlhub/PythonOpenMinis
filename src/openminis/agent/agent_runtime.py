@@ -33,6 +33,31 @@ logger = get_logger("agent.runtime")
 
 __all__ = ["AgentRuntime", "AgentChunkSink", "AgentRuntimeOptions", "MAX_AGENT_TURNS"]
 
+
+def _skill_mistake_hint(name: str) -> str | None:
+    """When the model calls a skill name as a tool, explain the right way.
+
+    Skills are knowledge bundles, not tools — so ``visioncustom`` (a skill)
+    will never resolve as a tool and the model otherwise stalls or tells the
+    user "我没有这个工具". Returns ``None`` when ``name`` isn't a skill at all,
+    so the caller falls back to the plain "Unknown tool" message.
+    """
+    try:
+        from ..skills import SkillStore
+
+        entry = SkillStore().get(name)
+    except Exception:  # pragma: no cover - broken skill dir must not stall chat
+        logger.debug("skill lookup failed while diagnosing %s", name, exc_info=True)
+        return None
+    if entry is None:
+        return None
+    return (
+        f"「{entry.name}」是技能（skill），不是工具，所以没有这个工具。"
+        f"正确做法：调用 skill_use(name=\"{entry.name}\") 加载它的完整说明，"
+        f"再按说明用 shell_execute / file_* 执行。"
+        f"（若 skill_use 提示未激活，说明该技能当前不在允许范围内，请告知用户去 技能 页激活）"
+    )
+
 # Kotlin: ``private const val MAX_AGENT_TURNS = 200`` (ChatViewModel).
 MAX_AGENT_TURNS = 200
 
@@ -134,6 +159,11 @@ class AgentRuntime:
         stop_reason: Optional[str] = None
         used_tool_rounds = 0
         last_tool_round_emitted = False
+        #: Consecutive rounds in which EVERY tool call was blocked by the loop
+        #: gate. Blocked calls never enter the detector history, so without a
+        #: runtime counter the model can spin on "blocked → retry → blocked"
+        #: forever (only MAX_AGENT_TURNS would stop it). 2 strikes → hard stop.
+        blocked_rounds = 0
 
         for turn in range(opts.max_turns):
             turn_start = len(messages)
@@ -228,12 +258,15 @@ class AgentRuntime:
 
             # ── 4. execute each tool call ──────────────────────────────────
             tool_result_parts: list[ToolResult] = []
+            executed_any = False
+            blocked_any = False
             for tu in round_tool_uses:
                 args_json = json.dumps(tu.input, ensure_ascii=False)
                 # Loop-detector gate BEFORE execution. CRITICAL → surface the
                 # message as a tool error and do NOT run the tool.
                 gate = detector.check(tu.name, tu.input)
                 if gate.is_blocking:
+                    blocked_any = True
                     logger.warning("agent blocked tool %s: %s", tu.name, gate.message)
                     tool_result_parts.append(ToolResult(
                         id=tu.id, name=tu.name,
@@ -252,7 +285,10 @@ class AgentRuntime:
                     # Mirrors Kotlin ``else -> ToolExecutionResult("Unknown
                     # tool: $name", false)`` — the loop detector recognises this
                     # phrasing and escalates repeated hallucinations.
-                    msg = f"Unknown tool: {tu.name}"
+                    # Before giving up: the model often calls a *skill* name as
+                    # if it were a tool ("我没有名为 X 的工具" is the user-facing
+                    # symptom). Point it at skill_use instead.
+                    msg = _skill_mistake_hint(tu.name) or f"Unknown tool: {tu.name}"
                     logger.warning("agent: %s", msg)
                     detector.record(tu.name, tu.input, None, error_message=msg,
                                     tool_call_id=tu.id)
@@ -269,6 +305,7 @@ class AgentRuntime:
                         args_json, session_id,
                         **({"env": session_user_env} if session_user_env else {}),
                     )
+                    executed_any = True
                 except Exception as exc:
                     logger.warning("tool %s raised %s: %s",
                                    tu.name, type(exc).__name__, exc)
@@ -313,6 +350,45 @@ class AgentRuntime:
                     "",
                     content_parts=tool_result_parts,
                 ))
+                if blocked_any and not executed_any:
+                    blocked_rounds += 1
+                    if blocked_rounds >= 2:
+                        # Hard stop: the model kept calling the same tool even
+                        # after a CRITICAL block. Make one final no-tools call
+                        # so it wraps up with what it already has, instead of
+                        # burning rounds until MAX_AGENT_TURNS.
+                        messages.append(LLMMessage(
+                            LLMMessage.Role.USER,
+                            "[loop protection] Repeated calls to the same tool are no longer bringing new information. "
+                            "Please ignore tool calls, directly organize the information already obtained and reply to the user; "
+                            "if it is indeed impossible to proceed, please clearly state what additional input is still needed.",
+                        ))
+                        wrap_up: list[str] = []
+                        stream = provider.stream_message(
+                            messages,
+                            opts.system_prompt,
+                            opts.max_tokens,
+                            opts.temperature,
+                            tools=None,
+                            thinking_level=opts.thinking_level,
+                        )
+                        async for chunk in stream:
+                            await self._emit(chunk)
+                            if isinstance(chunk, LLMStreamChunk.Text):
+                                wrap_up.append(chunk.text)
+                        summary = "".join(wrap_up).strip() or (
+                            "Task interrupted: tool calls fell into a loop, and no new progress was made."
+                        )
+                        messages.append(LLMMessage(
+                            LLMMessage.Role.ASSISTANT, summary,
+                        ))
+                        logger.warning(
+                            "agent hard-stopped: %s consecutive fully-blocked rounds",
+                            blocked_rounds,
+                        )
+                        return messages, "tool_loop_blocked"
+                else:
+                    blocked_rounds = 0
             else:
                 # Gate blocked every tool — do not loop again with the same
                 # request; hand back what we have.

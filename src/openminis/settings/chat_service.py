@@ -19,8 +19,11 @@ from ..settings.catalog import (
     engine_for,
     lookup_model,
 )
+from ..core.logging import get_logger
 from ..settings.store import SettingsStore
 from ..soul import SystemPromptBuilder
+
+logger = get_logger(__name__)
 
 __all__ = ["ChatSetupError", "build_chat_setup", "identity_system_prompt"]
 
@@ -29,9 +32,43 @@ class ChatSetupError(Exception):
     """Raised when chat cannot start (no provider/key, engine not ported…)."""
 
 
+def active_skills_block(store: SettingsStore) -> str:
+    """已激活技能的清单（渐进披露：只给名字 + 一句话）。
+
+    全文不进 prompt —— 38 个技能的 SKILL.md 会把上下文撑爆。模型看到清单后
+    用 ``skill_use`` 按需加载需要的那一个。
+    """
+    try:
+        from pathlib import Path
+
+        from ..skills import SkillStore
+
+        active = store.active_skills()
+        if not active:
+            return ""
+        lines: list[str] = []
+        for entry in SkillStore().list():
+            if entry.name in active or Path(entry.path).name in active:
+                desc = (entry.description or "").strip().splitlines()
+                head = desc[0] if desc else ""
+                lines.append(f"- {entry.name}：{head}" if head else f"- {entry.name}")
+        if not lines:
+            return ""
+        return (
+            "\n\n## 可用技能\n"
+            "以下技能已激活。当任务匹配某个技能时，先用 skill_use 工具加载它的完整"
+            "说明（SKILL.md），再按说明用 shell_execute / file_* 去执行。"
+            "技能不是工具，不要把技能名当工具名直接调用。\n"
+            + "\n".join(lines)
+        )
+    except Exception:  # pragma: no cover - 技能目录损坏不该拖垮对话
+        logger.debug("active skills block unavailable", exc_info=True)
+        return ""
+
+
 def identity_system_prompt(store: SettingsStore) -> str:
     identity = store.active_identity()
-    return identity.persona
+    return identity.persona + active_skills_block(store)
 
 
 def _model_for(provider_type: str, model_id: str) -> LLMModel | None:
@@ -103,5 +140,6 @@ def build_chat_setup(  # noqa: ANN201
     identity = store.active_identity()
     tools = build_tool_registry(identity.effective_tools())
     runtime = AgentRuntime(tools=tools, chunk_sink=chunk_sink)
-    options = AgentRuntimeOptions(system_prompt=identity.persona)
+    options = AgentRuntimeOptions(
+        system_prompt=identity.persona + active_skills_block(store))
     return provider, runtime, options, identity, conf

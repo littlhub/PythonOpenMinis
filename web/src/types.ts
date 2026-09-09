@@ -275,6 +275,8 @@ export interface SkillInfo {
   generated: boolean
   scripts: string[]
   path: string
+  /** In the main agent's skill scope (可被调用). */
+  active: boolean
 }
 
 /** A builtin tool exposed to the agent loop. */
@@ -289,10 +291,28 @@ export interface SkillsList {
   skills: SkillInfo[]
   tools: SkillToolInfo[]
   dir: string
+  /** Skill names currently in the main agent's scope. */
+  active: string[]
 }
 
 export interface SkillDetail extends SkillInfo {
   content: string
+}
+
+/** A curated marketplace source card (skill pack site or MCP directory). */
+export interface MarketplaceSource {
+  id: string
+  /** 'skill' = 技能包市场，'mcp' = MCP 服务器目录 */
+  kind: string
+  name: string
+  description: string
+  url: string
+}
+
+export interface MarketplaceInstallResult {
+  ok: boolean
+  skill: { name: string; description: string }
+  bytes: number
 }
 
 export interface KnowledgeItem {

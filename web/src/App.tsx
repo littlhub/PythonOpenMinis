@@ -7,6 +7,7 @@ import { WorkSpacesView } from './components/WorkSpacesView'
 import { KnowledgeView } from './components/KnowledgeView'
 import { MemoryView } from './components/MemoryView'
 import { SkillsView } from './components/SkillsView'
+import { MarketplaceView } from './components/MarketplaceView'
 import { ChannelsView } from './components/ChannelsView'
 import { SchedulerView } from './components/SchedulerView'
 import { SubagentsView } from './components/SubagentsView'
@@ -122,6 +123,11 @@ export default function App() {
         {view === 'skills' && (
           <div className="pane">
             <SkillsView />
+          </div>
+        )}
+        {view === 'market' && (
+          <div className="pane">
+            <MarketplaceView />
           </div>
         )}
         {view === 'channels' && (

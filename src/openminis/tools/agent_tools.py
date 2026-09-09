@@ -33,6 +33,7 @@ from .read_image_tool import ReadImageTool
 from .search_files_tool import SearchFilesTool
 from .shell_execute_tool import ShellExecuteTool
 from .subagent_tool import SubagentDelegateTool
+from .skill_use_tool import SkillUseTool
 from .vision_group_resolver import VisionGroupResolver
 from .web_fetch_tool import WebFetchTool
 from .web_search_tool import WebSearchTool
@@ -71,6 +72,8 @@ class AgentTools:
         # Delegation to configured subagents — needs a subagent registry entry
         # at call time; schema exposure is harmless.
         out.append(SubagentDelegateTool.definition())
+        # Loading activated skills (SKILL.md) on demand — see skill_use_tool.
+        out.append(SkillUseTool.definition())
         # [T-memory-toggle-gates-injection-and-tools-android] memory off
         # means memory_write / memory_get are dropped from the schema so the
         # model can't even attempt them.

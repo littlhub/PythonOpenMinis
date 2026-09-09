@@ -31,6 +31,7 @@ from ..tools.read_image_tool import ReadImageTool
 from ..tools.search_files_tool import SearchFilesTool
 from ..tools.shell_execute_tool import ShellExecuteTool
 from ..tools.subagent_tool import SubagentDelegateTool
+from ..tools.skill_use_tool import SkillUseTool
 from ..tools.vision_group_resolver import VisionGroupResolver
 from ..tools.web_fetch_tool import WebFetchTool
 from ..tools.web_search_tool import WebSearchTool
@@ -175,6 +176,7 @@ BUILTIN_IDENTITIES: list[Identity] = [
             "web_fetch",
             "web_search",
             "subagent_delegate",
+            "skill_use",
             "memory_write",
             "memory_get",
         ],
@@ -198,6 +200,7 @@ BUILTIN_IDENTITIES: list[Identity] = [
             "web_fetch",
             "web_search",
             "subagent_delegate",
+            "skill_use",
             "memory_write",
             "memory_get",
         ],
@@ -219,6 +222,7 @@ BUILTIN_IDENTITIES: list[Identity] = [
             "ls",
             "search_files",
             "read_image",
+            "skill_use",
             "memory_write",
             "memory_get",
         ],
@@ -232,7 +236,7 @@ BUILTIN_IDENTITIES: list[Identity] = [
             "你是一名写作与编辑助手,擅长中文。行文自然、克制,避免空话套话;"
             "需要素材时可以读取文件,但不要随意执行有副作用的命令。"
         ),
-        recommended_tools=["file_read", "memory_write", "memory_get"],
+        recommended_tools=["file_read", "skill_use", "memory_write", "memory_get"],
     ),
 ]
 
@@ -249,6 +253,7 @@ IDENTITY_TOOL_MATCH: dict[str, list[str]] = {
         "web_fetch",
         "web_search",
         "subagent_delegate",
+        "skill_use",
         "memory_write",
         "memory_get",
     ],
@@ -262,6 +267,7 @@ IDENTITY_TOOL_MATCH: dict[str, list[str]] = {
         "web_fetch",
         "web_search",
         "subagent_delegate",
+        "skill_use",
         "memory_write",
         "memory_get",
     ],
@@ -273,10 +279,11 @@ IDENTITY_TOOL_MATCH: dict[str, list[str]] = {
         "ls",
         "search_files",
         "read_image",
+        "skill_use",
         "memory_write",
         "memory_get",
     ],
-    "writer": ["file_read", "memory_write", "memory_get"],
+    "writer": ["file_read", "skill_use", "memory_write", "memory_get"],
 }
 
 
@@ -316,6 +323,8 @@ def _tool_desc(tool_id: str) -> str:
             return WebSearchTool.definition().description
         if tool_id == "subagent_delegate":
             return SubagentDelegateTool.definition().description
+        if tool_id == "skill_use":
+            return SkillUseTool.definition().description
     except Exception:  # pragma: no cover - defensive
         pass
     return tool_id
@@ -403,6 +412,12 @@ TOOL_CATALOG: list[dict] = [
         "name": "委派子代理",
         "description": _tool_desc("subagent_delegate"),
         "category": "Agent",
+    },
+    {
+        "id": "skill_use",
+        "name": "加载技能",
+        "description": _tool_desc("skill_use"),
+        "category": "Skill",
     },
 ]
 
@@ -507,6 +522,10 @@ def build_tool_registry(enabled_ids: list[str]) -> dict[str, ToolExecutor]:
         elif tool_id == "subagent_delegate":
             out[tool_id] = _wrap_async_static_executor(
                 SubagentDelegateTool.definition(), SubagentDelegateTool.execute
+            )
+        elif tool_id == "skill_use":
+            out[tool_id] = _wrap_async_static_executor(
+                SkillUseTool.definition(), SkillUseTool.execute
             )
     return out
 

@@ -14,6 +14,8 @@ import type {
   HealthInfo,
   HistoryEntry,
   KnowledgeContent,
+  MarketplaceInstallResult,
+  MarketplaceSource,
   KnowledgeList,
   MemoryDoc,
   MemoryList,
@@ -213,6 +215,30 @@ export const api = {
       `/skills/${encodeURIComponent(name)}`,
       { method: 'DELETE' },
     ),
+
+  /** Put a skill in the main agent's scope (it becomes callable). */
+  skillActivate: (name: string) =>
+    request<{ ok: boolean; name: string; active: string[] }>(
+      `/skills/${encodeURIComponent(name)}/activate`,
+      { method: 'POST' },
+    ),
+
+  skillDeactivate: (name: string) =>
+    request<{ ok: boolean; name: string; active: string[] }>(
+      `/skills/${encodeURIComponent(name)}/deactivate`,
+      { method: 'POST' },
+    ),
+
+  // -- marketplace (技能广场) --------------------------------------
+
+  marketplaceSources: () =>
+    request<{ sources: MarketplaceSource[] }>('/marketplace'),
+
+  marketplaceInstallUrl: (url: string, force: boolean) =>
+    request<MarketplaceInstallResult>('/marketplace/install-url', {
+      method: 'POST',
+      body: JSON.stringify({ url, force }),
+    }),
 
   // -- knowledge (知识库搜索) -------------------------------------
   knowledgeSearch: (q = '', kind = '', limit = 80) =>

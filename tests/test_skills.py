@@ -7,8 +7,11 @@ from pathlib import Path
 import pytest
 
 from openminis.core import context
+from openminis.settings.chat_service import identity_system_prompt
+from openminis.settings.store import SettingsStore
 from openminis.skills import SkillStore
 from openminis.skills.store import BUILTIN_TOOLS_SKILL, SkillError
+from openminis.tools.skill_use_tool import SkillUseTool
 
 
 @pytest.fixture()
@@ -140,3 +143,83 @@ def test_api_roundtrip(isolated_skills, tmp_path):
 
         assert c.delete("/api/skills/demo").json()["ok"] is True
         assert c.get("/api/skills/demo").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# 技能激活 = 主 agent 的技能调用范围（skill_use 只认已激活的技能）
+# ---------------------------------------------------------------------------
+def _settings(tmp_path):
+    return SettingsStore(path=tmp_path / "settings.json")
+
+
+def test_active_skills_roundtrip(isolated_skills):
+    store = _settings(isolated_skills)
+    assert store.active_skills() == []
+    store.set_skill_active("visioncustom", True)
+    assert store.active_skills() == ["visioncustom"]
+    store.set_skill_active("visioncustom", True)  # idempotent
+    assert store.active_skills() == ["visioncustom"]
+    store.set_skill_active("visioncustom", False)
+    assert store.active_skills() == []
+    assert _settings(isolated_skills).active_skills() == []  # persisted
+
+
+@pytest.mark.asyncio
+async def test_skill_use_gated_by_activation(isolated_skills, monkeypatch):
+    _write_skill(isolated_skills / "skills", "visioncustom", "识图打标",
+                 body="流程：先切图再打标")
+    store = _settings(isolated_skills)
+    monkeypatch.setattr(SettingsStore, "get", classmethod(lambda cls: store))
+
+    res = await SkillUseTool.execute('{"tool_title":"t","name":"visioncustom"}', "s1")
+    assert res.success is False
+    assert "未激活" in res.output
+
+    store.set_skill_active("visioncustom", True)
+    res = await SkillUseTool.execute('{"tool_title":"t","name":"visioncustom"}', "s1")
+    assert res.success is True
+    assert "先切图再打标" in res.output   # SKILL.md 正文
+    assert "run.py" in res.output        # 自带脚本提示
+
+
+@pytest.mark.asyncio
+async def test_skill_use_unknown_name(isolated_skills, monkeypatch):
+    store = _settings(isolated_skills)
+    monkeypatch.setattr(SettingsStore, "get", classmethod(lambda cls: store))
+    res = await SkillUseTool.execute('{"tool_title":"t","name":"nope"}', "s1")
+    assert res.success is False
+    assert "没有名为" in res.output
+
+
+def test_active_skills_enter_system_prompt(isolated_skills, monkeypatch):
+    """已激活技能只把「名字+一句话」放进 prompt（全文由 skill_use 加载）。"""
+    _write_skill(isolated_skills / "skills", "visioncustom", "识图打标")
+    store = _settings(isolated_skills)
+    monkeypatch.setattr(SettingsStore, "get", classmethod(lambda cls: store))
+
+    assert "可用技能" not in identity_system_prompt(store)
+    store.set_skill_active("visioncustom", True)
+    prompt = identity_system_prompt(store)
+    assert "可用技能" in prompt and "visioncustom" in prompt
+
+
+def test_skills_api_activate(isolated_skills, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from openminis.server.main import app
+
+    _write_skill(isolated_skills / "skills", "visioncustom", "识图打标")
+    store = _settings(isolated_skills)
+    monkeypatch.setattr(SettingsStore, "get", classmethod(lambda cls: store))
+    with TestClient(app) as c:
+        entry = next(s for s in c.get("/api/skills").json()["skills"]
+                     if s["name"] == "visioncustom")
+        assert entry["active"] is False
+
+        r = c.post("/api/skills/visioncustom/activate")
+        assert r.status_code == 200, r.text
+        assert r.json()["active"] == ["visioncustom"]
+        assert c.get("/api/skills").json()["active"] == ["visioncustom"]
+
+        assert c.post("/api/skills/visioncustom/deactivate").json()["active"] == []
+        assert c.post("/api/skills/nope/activate").status_code == 404

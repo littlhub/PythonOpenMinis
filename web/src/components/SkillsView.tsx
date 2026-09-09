@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { api } from '../api'
 import type { SkillDetail, SkillInfo, SkillToolInfo } from '../types'
 
-type Filter = 'all' | 'builtin' | 'user' | 'tools'
+type Filter = 'all' | 'active' | 'builtin' | 'user' | 'tools'
 
 /**
  * SkillsView - 技能管理页面
@@ -78,6 +78,25 @@ export function SkillsView() {
     }
   }
 
+  const doToggle = async (skill: SkillInfo) => {
+    setBusy(true)
+    setNotice('')
+    try {
+      if (skill.active) {
+        await api.skillDeactivate(skill.name)
+        setNotice(`已停用 ${skill.name}（主 agent 不再调用它）`)
+      } else {
+        await api.skillActivate(skill.name)
+        setNotice(`已激活 ${skill.name}，主 agent 现在可以通过 skill_use 调用它`)
+      }
+      await load()
+    } catch (e) {
+      setNotice(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const doDelete = async (name: string) => {
     if (!window.confirm(`卸载技能「${name}」？这会删除它的目录。`)) return
     setBusy(true)
@@ -103,6 +122,7 @@ export function SkillsView() {
     s.description.toLowerCase().includes(search.toLowerCase())
 
   const filtered = skills.filter((s) => {
+    if (filter === 'active') return s.active && match(s)
     if (filter === 'builtin') return s.source === 'builtin' && match(s)
     if (filter === 'user') return s.source !== 'builtin' && match(s)
     return match(s)
@@ -117,6 +137,7 @@ export function SkillsView() {
 
   const categories: { id: Filter; label: string }[] = [
     { id: 'all', label: '全部' },
+    { id: 'active', label: `已激活 ${skills.filter((s) => s.active).length}` },
     { id: 'builtin', label: '内置' },
     { id: 'user', label: '自定义' },
     { id: 'tools', label: '内置工具' },
@@ -179,7 +200,10 @@ export function SkillsView() {
         ) : (
           <div className="skills-grid">
             {filtered.map((skill) => (
-              <div key={skill.name} className="skill-card enabled">
+              <div
+                key={skill.name}
+                className={`skill-card ${skill.active ? 'enabled' : 'inactive'}`}
+              >
                 <div className="skill-icon">
                   {skill.generated ? '🧰' : skill.source === 'builtin' ? '⚙️' : '📦'}
                 </div>
@@ -194,9 +218,26 @@ export function SkillsView() {
                   <div className="kb-item-footer muted">
                     {skill.source === 'builtin' ? '内置' : '自定义'}
                     {skill.scripts.length > 0 && ` · 脚本 ${skill.scripts.length}`}
+                    {!skill.active && ' · 未激活'}
                   </div>
                 </div>
                 <div className="kb-item-action">
+                  <label
+                    className="skill-toggle"
+                    title={
+                      skill.active
+                        ? '已激活：点击停用（主 agent 不再调用）'
+                        : '已停用：点击激活（主 agent 可通过 skill_use 调用）'
+                    }
+                  >
+                    <input
+                      type="checkbox"
+                      checked={skill.active}
+                      disabled={busy}
+                      onChange={() => void doToggle(skill)}
+                    />
+                    <span className="skill-toggle-track" />
+                  </label>
                   <button
                     className="memory-action-btn"
                     onClick={() => void openSkill(skill.name)}

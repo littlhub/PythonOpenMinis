@@ -52,6 +52,9 @@ def _defaults() -> dict[str, Any]:
         #: subagent id -> config dict (model / skills / tools / mcp / persona).
         #: Subagents are delegatable worker agents the main agent can call.
         "subagents": {},
+        #: skill names the main agent may load (技能调用范围,空=不启用).
+        #: Activation is per-skill and edited from the 技能 page.
+        "activeSkills": [],
     }
 
 
@@ -266,6 +269,35 @@ class SettingsStore:
             return
         conf["modelHints"] = list(dict.fromkeys(h for h in hints if isinstance(h, str)))
         self.save(data)
+
+    # -- active skills (主 agent 的技能调用范围) -------------------------
+    def active_skills(self) -> list[str]:
+        """Names of the skills the main agent is allowed to load.
+
+        Empty list = 未启用任何技能(默认)。技能本体仍在磁盘上,只是不进入
+        system prompt、也不能被 ``skill_use`` 加载 —— 这就是「技能范围」。
+        """
+        data = self.load()
+        raw = data.get("activeSkills")
+        if not isinstance(raw, list):
+            return []
+        return [str(s) for s in raw if isinstance(s, str) and s.strip()]
+
+    def set_skill_active(self, name: str, active: bool) -> list[str]:
+        """Activate / deactivate one skill; returns the new active list."""
+        name = str(name or "").strip()
+        if not name:
+            raise SettingsError("技能名不能为空")
+        data = self.load()
+        cur = self.active_skills()
+        if active:
+            if name not in cur:
+                cur.append(name)
+        else:
+            cur = [s for s in cur if s != name]
+        data["activeSkills"] = cur
+        self.save(data)
+        return cur
 
     def identity(self, identity_id: str) -> Identity | None:
         """Resolve an identity (built-in merged with its tool overrides, or a
