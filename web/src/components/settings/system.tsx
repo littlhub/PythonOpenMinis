@@ -3,8 +3,9 @@
  * Scalar config rows save immediately through /api/config (same validation the
  * CLI uses); system pages read the read-mostly /api/system endpoints.
  */
-import { useCallback, useEffect, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react'
 import { api, downloadUrl } from '../../api'
+import { PRESETS, applyBackground } from '../../theme'
 import type { ConfigFieldInfo, WorkspaceInfo } from '../../types'
 import {
   DetailShell,
@@ -45,8 +46,11 @@ function useConfigTopic(topic: string) {
     void load()
   }, [load])
 
+  // Returns whether the write landed. Callers that apply a side effect (the
+  // background picker repaints the shell) must not do so on a rejected value —
+  // the backend schema is the authority on what a legal spec looks like.
   const setField = useCallback(
-    async (path: string, value: unknown) => {
+    async (path: string, value: unknown): Promise<boolean> => {
       const prev = values[path]
       setValues((v) => ({ ...v, [path]: value }))
       setError(null)
@@ -55,9 +59,11 @@ function useConfigTopic(topic: string) {
         await api.configSet(path, value)
         setSaved(`已保存 ${path} ✓`)
         setTimeout(() => setSaved(null), 2200)
+        return true
       } catch (e) {
         setValues((v) => ({ ...v, [path]: prev }))
         setError((e as Error).message)
+        return false
       }
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -94,6 +100,42 @@ const THEME_OPTIONS = [
 // ---------------------------------------------------------------------------
 export function AppearancePage(props: { onBack: () => void }) {
   const { fields, values, error, saved, setField } = useConfigTopic('appearance')
+  // 图片 URL 输入框是本地草稿：只有点了「应用」或回车才写盘，
+  // 否则每敲一个字符都会触发一次 config 校验。
+  const [bgUrl, setBgUrl] = useState('')
+  const [bgUrlTouched, setBgUrlTouched] = useState(false)
+
+  const spec = String(values['appearance.background'] ?? 'default')
+  const currentUrl = spec.startsWith('url:') ? spec.slice(4) : ''
+
+  useEffect(() => {
+    if (!bgUrlTouched) setBgUrl(currentUrl)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentUrl, bgUrlTouched])
+
+  const pickBackground = async (v: string) => {
+    if (await setField('appearance.background', v)) applyBackground(v)
+  }
+
+  const bgFileRef = useRef<HTMLInputElement>(null)
+  const [bgUploading, setBgUploading] = useState(false)
+  const [bgUploadErr, setBgUploadErr] = useState<string | null>(null)
+
+  const uploadLocalBackground = async (file: File) => {
+    setBgUploading(true)
+    setBgUploadErr(null)
+    try {
+      // 先落盘再写 config：图片没存进去就把配置指向它，会得到一个打不开的
+      // 背景，而且用户看不出是哪一步失败了。
+      const r = await api.appearanceUploadBackground(file)
+      await pickBackground(r.spec)
+    } catch (e) {
+      setBgUploadErr(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBgUploading(false)
+    }
+  }
+
   if (!fields) return <DetailShell title="外观与主题" onBack={props.onBack}><Spinner /></DetailShell>
   return (
     <DetailShell
@@ -135,10 +177,122 @@ export function AppearancePage(props: { onBack: () => void }) {
               </Row>
             )
           }
+          if (f.path === 'appearance.background') {
+            const isCustomHex = /^#[0-9a-fA-F]{6}$/.test(spec)
+            const hex = isCustomHex ? spec : '#fbfbfa'
+            return (
+              <Row key={f.path} label="背景" desc="主区底色。选预设、自定颜色,或填一张图片 URL。">
+                <div className="bg-picker">
+                  <div className="bg-swatches">
+                    {Object.entries(PRESETS).map(([key, p]) => (
+                      <button
+                        key={key}
+                        type="button"
+                        title={p.label}
+                        className={`bg-swatch ${spec === `preset:${key}` ? 'on' : ''}`}
+                        style={{
+                          background: p.palette.bg,
+                          borderColor: p.palette.border,
+                          color: p.palette.text,
+                        }}
+                        onClick={() => void pickBackground(`preset:${key}`)}
+                      >
+                        {p.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="bg-custom">
+                    <span className="muted">自定义颜色</span>
+                    <input
+                      type="color"
+                      value={hex}
+                      onChange={(e) => void pickBackground(e.target.value)}
+                    />
+                    {isCustomHex && <code>{spec}</code>}
+                  </div>
+
+                  <div className="bg-custom">
+                    <span className="muted">本地图片</span>
+                    <input
+                      ref={bgFileRef}
+                      type="file"
+                      accept="image/png,image/jpeg,image/webp,image/gif"
+                      style={{ display: 'none' }}
+                      onChange={(e) => {
+                        const f = e.target.files?.[0]
+                        // 清空 value：否则连续选同一个文件不会再触发 change
+                        e.target.value = ''
+                        if (f) void uploadLocalBackground(f)
+                      }}
+                    />
+                    <button
+                      className="btn-create"
+                      disabled={bgUploading}
+                      onClick={() => bgFileRef.current?.click()}
+                    >
+                      {bgUploading ? '上传中…' : '选择图片'}
+                    </button>
+                    <span className="muted">png / jpg / webp / gif，≤ 8MB</span>
+                    {bgUploadErr && <span className="error">{bgUploadErr}</span>}
+                  </div>
+
+                  <div className="bg-custom">
+                    <span className="muted">图片 URL</span>
+                    <input
+                      type="text"
+                      placeholder="https://example.com/bg.jpg"
+                      value={bgUrl}
+                      onChange={(e) => {
+                        setBgUrlTouched(true)
+                        setBgUrl(e.target.value)
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && bgUrl.trim()) {
+                          void pickBackground(`url:${bgUrl.trim()}`)
+                        }
+                      }}
+                    />
+                    <button
+                      className="btn-create"
+                      disabled={!bgUrl.trim() || bgUrl.trim() === currentUrl}
+                      onClick={() => void pickBackground(`url:${bgUrl.trim()}`)}
+                    >
+                      应用
+                    </button>
+                  </div>
+
+                  <div className="bg-custom">
+                    <span className="muted">
+                      {spec === 'default'
+                        ? '当前:主题默认'
+                        : spec.startsWith('url:')
+                          ? '当前:网络图片'
+                          : spec.startsWith('file:')
+                            ? '当前:本地图片'
+                            : `当前:${spec}`}
+                    </span>
+                    {spec !== 'default' && (
+                      <button
+                        className="link"
+                        onClick={() => {
+                          setBgUrlTouched(false)
+                          void pickBackground('default')
+                        }}
+                      >
+                        恢复默认
+                      </button>
+                    )}
+                  </div>
+                </div>
+              </Row>
+            )
+          }
           return null
         })}
         <Note kind="info">
           Web 界面主题跟随浏览器/系统外观;此处的 theme 偏好主要作用于偏好持久化与后续客户端。
+          背景则立即生效,并随 config 落盘(换浏览器打开一致)。
         </Note>
       </SectionCard>
     </DetailShell>

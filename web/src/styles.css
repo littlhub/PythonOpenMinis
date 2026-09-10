@@ -24,7 +24,13 @@ body,
 }
 
 body {
-  background: var(--bg);
+  background-color: var(--bg);
+  /* --bg-image 只在「背景图」模式下由 theme.ts 写入；其余情况回落到 none，
+     所以默认外观完全不变。 */
+  background-image: var(--bg-image, none);
+  background-size: cover;
+  background-position: center;
+  background-attachment: fixed;
   color: var(--text);
 }
 
@@ -35,7 +41,9 @@ body {
   display: grid;
   grid-template-columns: 260px 1fr;
   height: 100%;
-  background: var(--bg);
+  /* --app-bg 在背景图模式下被设为 transparent，好让 body 的图透出来；
+     否则它就是 --bg。 */
+  background: var(--app-bg, var(--bg));
 }
 
 .app-main {
@@ -3225,10 +3233,44 @@ input:checked + .toggle-slider:before {
   display: flex;
   justify-content: space-between;
   align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
   padding: 12px;
   background: var(--bg);
   border-radius: 8px;
   border: 1px solid var(--border);
+}
+
+.task-prompt {
+  font-size: 11.5px;
+  margin-top: 4px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 520px;
+}
+
+.task-runs {
+  flex-basis: 100%;
+  border-top: 1px dashed var(--border);
+  padding-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11.5px;
+}
+
+.task-run-row {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.run-ok {
+  color: var(--accent);
+}
+.run-bad {
+  color: #c0392b;
 }
 
 .task-card.paused {
@@ -3561,4 +3603,133 @@ input:checked + .toggle-slider:before {
   font-size: 12.5px;
   color: var(--muted);
   line-height: 1.5;
+}
+
+/* ---------- Token 用量 (UsageStats) ---------- */
+.usage-model + .usage-model {
+  border-top: 1px solid var(--border);
+}
+
+.usage-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 4px;
+  cursor: pointer;
+}
+
+.usage-row:hover {
+  background: var(--panel);
+  border-radius: 8px;
+}
+
+.usage-name {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.usage-name > span:first-child {
+  font-size: 13.5px;
+  word-break: break-all;
+}
+
+/* 只在用户能据以行动的两态出现(会话已删除 / 模型已移除)。估算行故意留白。 */
+.usage-caveat {
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.usage-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+
+.usage-chevron {
+  color: var(--muted);
+  font-size: 14px;
+}
+
+dl.facts.usage-detail {
+  background: transparent;
+  border: none;
+  padding: 0 0 10px 12px;
+  grid-template-columns: 92px 1fr;
+  font-size: 12.5px;
+}
+
+/* ---------- 外观:背景选择 ---------- */
+.bg-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: flex-end;
+}
+
+.bg-swatches {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+}
+
+.bg-swatch {
+  min-width: 52px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: transform 0.08s ease;
+}
+
+.bg-swatch:hover {
+  transform: translateY(-1px);
+}
+
+.bg-swatch.on {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.bg-custom {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+}
+
+.bg-custom input[type='text'] {
+  width: 260px;
+}
+
+.bg-custom input[type='color'] {
+  width: 40px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: none;
+  cursor: pointer;
+}
+
+/* ---------- 定时任务:模型选择 ---------- */
+.form-group .form-hint {
+  margin-top: 4px;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+/* 多了「模型」一栏后 meta 行会变长,允许折行免得撑破卡片 */
+.task-meta {
+  flex-wrap: wrap;
+}
+
+.task-model {
+  white-space: nowrap;
 }

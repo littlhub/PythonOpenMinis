@@ -364,3 +364,215 @@ def test_apply_full_agent_partial_merge_and_clamp(store):
 
     with _pytest.raises(SettingsError):
         store.apply_full({"agent": {"maxMemoryRounds": "not-a-number"}})
+
+
+# ---------------------------------------------------------------------------
+# model override (scheduled tasks pin a model)
+# ---------------------------------------------------------------------------
+def test_chat_setup_model_override_does_not_rewrite_stored_choice(store, monkeypatch):
+    """``instance_id`` / ``model_id`` 只作用于本次调用。
+
+    定时任务靠它钉住模型,所以这条路径必须能在不碰用户配置的前提下换模型 ——
+    如果就地改了 ``conf``(它是 live settings dict 里的那个对象),用户「当前
+    模型」会在半夜被一个定时任务悄悄改掉,而且毫无痕迹。
+    """
+    store.apply_full({
+        "providers": [
+            {"id": "openAI", "type": "openAI", "apiKey": "k",
+             "model": "gpt-5.2", "baseUrl": ""},
+            {"id": "anthropic", "type": "anthropic", "apiKey": "k",
+             "model": "claude-sonnet-5", "baseUrl": ""},
+        ],
+        "activeProviderId": "openAI",
+    })
+    seen: dict = {}
+
+    def _fake_build(provider_id, conf):
+        seen["provider_id"] = provider_id
+        seen["conf"] = dict(conf)
+        return _FakeProvider()
+
+    monkeypatch.setattr(chat_service, "build_provider", _fake_build)
+
+    _, _, _, _, conf = build_chat_setup(
+        store, instance_id="anthropic", model_id="claude-opus-4-8"
+    )
+    assert seen["provider_id"] == "anthropic"
+    assert conf["model"] == "claude-opus-4-8"
+    assert conf["type"] == "anthropic"
+
+    # 存盘里的选择原封不动
+    saved = store.load()["providers"]
+    assert saved["openAI"]["model"] == "gpt-5.2"
+    assert saved["anthropic"]["model"] == "claude-sonnet-5"
+
+
+def test_chat_setup_model_override_without_instance_uses_active(store, monkeypatch):
+    """只给 model_id 时,实例仍是活动实例 —— 钉的是模型,不是厂商。"""
+    store.apply_full({
+        "providers": [
+            {"id": "openAI", "type": "openAI", "apiKey": "k",
+             "model": "gpt-5.2", "baseUrl": ""},
+        ],
+        "activeProviderId": "openAI",
+    })
+    seen: dict = {}
+
+    def _fake_build(provider_id, conf):
+        seen["provider_id"] = provider_id
+        seen["conf"] = dict(conf)
+        return _FakeProvider()
+
+    monkeypatch.setattr(chat_service, "build_provider", _fake_build)
+    build_chat_setup(store, model_id="agnes-2.5-flash")
+
+    assert seen["provider_id"] == "openAI"
+    assert seen["conf"]["model"] == "agnes-2.5-flash"
+    assert store.load()["providers"]["openAI"]["model"] == "gpt-5.2"
+
+
+def test_chat_setup_unknown_instance_raises(store):
+    store.apply_full({
+        "providers": [{"id": "openAI", "type": "openAI", "apiKey": "k",
+                       "model": "gpt-5.2", "baseUrl": ""}],
+        "activeProviderId": "openAI",
+    })
+    with pytest.raises(ChatSetupError):
+        build_chat_setup(store, instance_id="nope")
+
+
+# ---------------------------------------------------------------------------
+# attribution snapshot
+# ---------------------------------------------------------------------------
+def test_attribution_snapshot_records_the_overridden_model(store):
+    """快照必须记「这次真正服务的模型」,不是活动模型 —— 定时任务钉了模型时,
+    两者不同,而用量页要按实际发生的算。"""
+    from openminis.settings.chat_service import attribution_snapshot
+
+    conf = {"id": "openAI", "type": "openAI", "model": "agnes-2.5-flash"}
+    snap = attribution_snapshot(store, conf)
+    assert snap["model_id"] == "agnes-2.5-flash"
+    assert snap["provider_type"] == "openAI"
+    assert snap["provider_instance_id"] == "openAI"
+    # 不在目录里的自定义模型保留原始 id 作为显示名,而不是塌成 None
+    assert snap["model_display_name"] == "agnes-2.5-flash"
+
+
+def test_attribution_snapshot_falls_back_to_active_instance(store):
+    """conf 里没有 id 时退回活动实例 id —— 快照少了实例 id 就没法把用量
+    归到具体厂商,而这是「同一模型挂在两个网关上」时唯一能区分的字段。"""
+    from openminis.settings.chat_service import attribution_snapshot
+
+    store.apply_full({
+        "providers": [{"id": "openAI", "type": "openAI", "apiKey": "k",
+                       "model": "gpt-5.2", "baseUrl": ""}],
+        "activeProviderId": "openAI",
+    })
+    snap = attribution_snapshot(store, {"type": "openAI", "model": "gpt-5.2"})
+    assert snap["provider_instance_id"] == "openAI"
+
+
+# ---------------------------------------------------------------------------
+# model override (scheduled tasks pin a model)
+# ---------------------------------------------------------------------------
+def test_chat_setup_model_override_does_not_rewrite_stored_choice(store, monkeypatch):
+    """``instance_id`` / ``model_id`` 只作用于本次调用。
+
+    定时任务靠它钉住模型,所以这条路径必须能在不碰用户配置的前提下换模型 ——
+    如果就地改了 ``conf``(它是 live settings dict 里的那个对象),用户「当前
+    模型」会在半夜被一个定时任务悄悄改掉,而且毫无痕迹。
+    """
+    store.apply_full({
+        "providers": [
+            {"id": "openAI", "type": "openAI", "apiKey": "k",
+             "model": "gpt-5.2", "baseUrl": ""},
+            {"id": "anthropic", "type": "anthropic", "apiKey": "k",
+             "model": "claude-sonnet-5", "baseUrl": ""},
+        ],
+        "activeProviderId": "openAI",
+    })
+    seen: dict = {}
+
+    def _fake_build(provider_id, conf):
+        seen["provider_id"] = provider_id
+        seen["conf"] = dict(conf)
+        return _FakeProvider()
+
+    monkeypatch.setattr(chat_service, "build_provider", _fake_build)
+
+    _, _, _, _, conf = build_chat_setup(
+        store, instance_id="anthropic", model_id="claude-opus-4-8"
+    )
+    assert seen["provider_id"] == "anthropic"
+    assert conf["model"] == "claude-opus-4-8"
+    assert conf["type"] == "anthropic"
+
+    # 存盘里的选择原封不动
+    saved = store.load()["providers"]
+    assert saved["openAI"]["model"] == "gpt-5.2"
+    assert saved["anthropic"]["model"] == "claude-sonnet-5"
+
+
+def test_chat_setup_model_override_without_instance_uses_active(store, monkeypatch):
+    """只给 model_id 时,实例仍是活动实例 —— 钉的是模型,不是厂商。"""
+    store.apply_full({
+        "providers": [
+            {"id": "openAI", "type": "openAI", "apiKey": "k",
+             "model": "gpt-5.2", "baseUrl": ""},
+        ],
+        "activeProviderId": "openAI",
+    })
+    seen: dict = {}
+
+    def _fake_build(provider_id, conf):
+        seen["provider_id"] = provider_id
+        seen["conf"] = dict(conf)
+        return _FakeProvider()
+
+    monkeypatch.setattr(chat_service, "build_provider", _fake_build)
+    build_chat_setup(store, model_id="agnes-2.5-flash")
+
+    assert seen["provider_id"] == "openAI"
+    assert seen["conf"]["model"] == "agnes-2.5-flash"
+    assert store.load()["providers"]["openAI"]["model"] == "gpt-5.2"
+
+
+def test_chat_setup_unknown_instance_raises(store):
+    store.apply_full({
+        "providers": [{"id": "openAI", "type": "openAI", "apiKey": "k",
+                       "model": "gpt-5.2", "baseUrl": ""}],
+        "activeProviderId": "openAI",
+    })
+    with pytest.raises(ChatSetupError):
+        build_chat_setup(store, instance_id="nope")
+
+
+# ---------------------------------------------------------------------------
+# attribution snapshot
+# ---------------------------------------------------------------------------
+def test_attribution_snapshot_records_the_overridden_model(store):
+    """快照必须记「这次真正服务的模型」,不是活动模型 —— 定时任务钉了模型时,
+    两者不同,而用量页要按实际发生的算。"""
+    from openminis.settings.chat_service import attribution_snapshot
+
+    conf = {"id": "openAI", "type": "openAI", "model": "agnes-2.5-flash"}
+    snap = attribution_snapshot(store, conf)
+    assert snap["model_id"] == "agnes-2.5-flash"
+    assert snap["provider_type"] == "openAI"
+    assert snap["provider_instance_id"] == "openAI"
+    # 不在目录里的自定义模型保留原始 id 作为显示名,而不是塌成 None
+    assert snap["model_display_name"] == "agnes-2.5-flash"
+
+
+def test_attribution_snapshot_falls_back_to_active_instance(store):
+    """conf 里没有 id 时退回活动实例 id —— 快照少了实例 id 就没法把用量
+    归到具体厂商,而这是「同一模型挂在两个网关上」时唯一能区分的字段。"""
+    from openminis.settings.chat_service import attribution_snapshot
+
+    store.apply_full({
+        "providers": [{"id": "openAI", "type": "openAI", "apiKey": "k",
+                       "model": "gpt-5.2", "baseUrl": ""}],
+        "activeProviderId": "openAI",
+    })
+    snap = attribution_snapshot(store, {"type": "openAI", "model": "gpt-5.2"})
+    assert snap["provider_instance_id"] == "openAI"

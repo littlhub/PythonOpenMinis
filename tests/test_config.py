@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from openminis.config.config_error import ConfigError, OutOfRange, TypeMismatch
+from openminis.config.config_error import ConfigError, OutOfRange, RegexMismatch, TypeMismatch
 from openminis.config.config_registry import ConfigRegistry
 from openminis.config.config_schema import (
     BoolSchema,
@@ -126,3 +126,105 @@ class TestConfigRegistry:
         registry = ConfigRegistry.init()
         assert registry.resolve_field("nope.nope") is None
         ConfigRegistry.reset_for_tests()
+
+
+class TestAppearanceBackground:
+    """``appearance.background`` — Web 端专有的背景规格。
+
+    校验必须留在后端:写盘只有 ``PUT /api/config/<path>`` 一条路径,只在前端
+    限制的话,一个手写请求就能把任意字符串塞进样式表。格式见
+    ``web/src/theme.ts`` 的 ``resolveBackground``,两边必须保持一致。
+    """
+
+    @staticmethod
+    def _field():
+        ConfigRegistry.reset_for_tests()
+        registry = ConfigRegistry.init()
+        field = registry.resolve_field("appearance.background")
+        assert field is not None, "appearance.background 未注册"
+        return field
+
+    def test_registered_and_roundtrips(self) -> None:
+        # 不断言「当前值」:这些字段落在真实的 prefs 文件里,上一次会话改过的
+        # 值会留到下一次 —— 断言默认值等于让测试依赖用户机器状态。
+        field = self._field()
+        assert field._default == Str("default")
+        assert isinstance(field.read(), Str)
+        ConfigRegistry.reset_for_tests()
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "default",
+            "",
+            "preset:ink",
+            "preset:sky-blue",
+            "#1a2b3c",
+            "#FFFFFF",
+            "url:https://example.test/bg.jpg",
+            "file:background.png",
+            "file:background.jpeg",
+        ],
+    )
+    def test_accepts_legal_specs(self, value: str) -> None:
+        schema = self._field().value_schema
+        schema.validate(Str(value))  # 不抛异常即为通过
+        ConfigRegistry.reset_for_tests()
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "preset:",  # 空预设名
+            "#xyz",  # 非十六进制
+            "#12345",  # 位数不足
+            "url:",  # 缺 URL
+            "url:javascript:alert(1)",  # 非 http(s),会变成样式注入
+            "random",  # 既不是预设也不是颜色
+            "preset:Ink!",  # 预设名带非法字符
+            "file:../settings.json",  # 路径穿越
+            "file:background",  # 缺扩展名
+            "file:",  # 缺文件名
+        ],
+    )
+    def test_rejects_malformed_specs(self, value: str) -> None:
+        schema = self._field().value_schema
+        with pytest.raises(RegexMismatch):
+            schema.validate(Str(value))
+        ConfigRegistry.reset_for_tests()
+
+
+class TestConfigListRoute:
+    """``GET /api/config`` 与 ``/api/config/`` 必须都返回字段列表。
+
+    尾斜杠形式曾被 ``/api/config/{path:path}`` 以空 path 吃掉,返回
+    ``404 unknown_path: `` —— 前端 configList 恰好用的就是这个带斜杠的地址,
+    于是「外观」页静默读不到任何字段。这类路由遮蔽不会报错、只在页面上表现为
+    「空」,所以值得钉住。
+    """
+
+    @pytest.fixture()
+    def client(self):
+        from fastapi.testclient import TestClient
+
+        from openminis.server.main import app
+
+        ConfigRegistry.reset_for_tests()
+        with TestClient(app) as c:
+            yield c
+        ConfigRegistry.reset_for_tests()
+
+    def test_both_spellings_return_the_topic_fields(self, client) -> None:
+        for url in ("/api/config?topic=appearance", "/api/config/?topic=appearance"):
+            r = client.get(url)
+            assert r.status_code == 200, f"{url} -> {r.status_code} {r.text}"
+            paths = {f["path"] for f in r.json()}
+            assert "appearance.background" in paths, url
+
+    def test_catch_all_still_serves_a_single_path(self, client) -> None:
+        r = client.get("/api/config/appearance.background")
+        assert r.status_code == 200
+        # Bare JSON value (not a {value} wrapper — that shape belongs to PUT).
+        assert isinstance(r.json(), str)
+
+    def test_unknown_path_still_404s(self, client) -> None:
+        assert client.get("/api/config/nope.nope").status_code == 404

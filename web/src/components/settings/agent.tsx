@@ -6,12 +6,14 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../../api'
 import type {
+  Attribution,
   CustomIdentityDraft,
   MemoryFileInfo,
   ProviderInfo,
   SettingsInfo,
+  UsageModelStats,
 } from '../../types'
-import { DetailShell, Note, SectionCard, Spinner, StatusLine } from './ui'
+import { DetailShell, Note, SectionCard, Spinner, StatusLine, useAsync } from './ui'
 import type { SetPageId } from './entries'
 
 // ---------------------------------------------------------------------------
@@ -915,24 +917,161 @@ export function AgentConfigPage(props: { onBack: () => void }) {
 }
 
 // ---------------------------------------------------------------------------
-// Token 用量 (UsageStats 占位)
+// Token 用量 (UsageStats)
+//
+// 对应 Android 的 UsageStatsScreen。数据来自 /api/usage,背后是
+// ChatDao.allUsageRecords() 的 LEFT JOIN:凡是带 token_usage 的消息都计入,
+// 哪怕它的 sessions 行已经没了(那些 token 是真花掉的)。
+//
+// 这里唯一不能含糊的是「归因可信度」。原来用量是按 sessions.model_id 这个
+// 可变列 join 出来的,而它每次切换模型都会被重写、且没有时间维度 —— 于是
+// 一段历史的 token 会整体漂移到当前模型名下。所以带快照的行(实测)和不带
+// 快照的行(估算)必须分桶显示,绝不能合并。
 // ---------------------------------------------------------------------------
+function fmtCount(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`
+  if (n >= 1_000) {
+    const k = n / 1000
+    return Number.isInteger(k) ? `${k}k` : `${k.toFixed(1)}k`
+  }
+  return String(n)
+}
+
+/** 只有用户能据以行动的两态才给一句说明。
+ *
+ * ESTIMATED 故意什么都不显示:它是绝大多数行(快照列出现之前写入的全部历史),
+ * 在几乎每一行下面重复同一句话纯属噪音 —— 曾被专门提过。区分仍然存在于内部:
+ * 估算行始终留在自己的桶里,不会并进实测行,所以数字依然是诚实的。 */
+function AttributionCaveat({ a }: { a: Attribution }) {
+  if (a === 'UNKNOWN_SESSION') {
+    return <span className="usage-caveat">会话已删除,模型未知</span>
+  }
+  if (a === 'MEASURED_REMOVED') {
+    return <span className="usage-caveat">该模型已从配置中移除</span>
+  }
+  return null
+}
+
+function UsageModelRow(props: { model: UsageModelStats }) {
+  const [open, setOpen] = useState(false)
+  const m = props.model
+  const io = m.inputTokens + m.outputTokens
+  const rate =
+    m.totalInput > 0 && m.cacheReadTokens > 0
+      ? ((m.cacheReadTokens / m.totalInput) * 100).toFixed(1)
+      : null
+
+  const rows: [string, string][] = [
+    ['输入', fmtCount(m.inputTokens)],
+    ['输出', fmtCount(m.outputTokens)],
+  ]
+  if (m.cacheReadTokens > 0) rows.push(['缓存读取', fmtCount(m.cacheReadTokens)])
+  if (m.cacheCreationTokens > 0) rows.push(['缓存写入', fmtCount(m.cacheCreationTokens)])
+  if (rate) rows.push(['缓存命中率', `${rate}%`])
+  if (m.activeDays > 0) rows.push(['日均', fmtCount(Math.floor(io / m.activeDays))])
+  if (m.sessions > 0) rows.push(['会话均', fmtCount(Math.floor(io / m.sessions))])
+  rows.push(['会话数', String(m.sessions)])
+  rows.push(['活跃天数', String(m.activeDays)])
+
+  return (
+    <div className="usage-model">
+      <div className="usage-row" onClick={() => setOpen((v) => !v)}>
+        <div className="usage-name">
+          <span>{m.displayName}</span>
+          <AttributionCaveat a={m.attribution} />
+        </div>
+        <div className="usage-summary">
+          <span className="muted">
+            {m.formattedInput} / {m.formattedOutput}
+          </span>
+          <span className="usage-chevron">{open ? '⌄' : '›'}</span>
+        </div>
+      </div>
+      {open && (
+        <dl className="facts usage-detail">
+          {rows.flatMap(([k, v], i) => [
+            <dt key={`k${i}`}>{k}</dt>,
+            <dd key={`v${i}`}>{v}</dd>,
+          ])}
+        </dl>
+      )}
+    </div>
+  )
+}
+
 export function UsagePage(props: { onBack: () => void }) {
+  const { data, error, loading, reload } = useAsync(() => api.usageStats(), [])
+
+  const total = data?.grandTotal
+  const hasData = !!data && (data.bucketCount ?? 0) > 0
+
   return (
     <DetailShell
       title="Token 用量"
-      subtitle="对应 Android 的 Token 用量屏(UsageStats)。"
+      subtitle="按厂商与模型汇总的历史 token 消耗。"
       onBack={props.onBack}
+      extra={
+        <button className="link" onClick={reload}>
+          刷新
+        </button>
+      }
     >
-      <Note kind="info">
-        当前版本中,每一轮对话的 token 计数(input / output / 缓存)会实时显示在该条回复下方的
-        usage 帧里。跨会话的历史统计需要把 UsageRecord 写入数据库后才能提供——
-        该表已随 Room schema 移植(usage_record),接线完成前此页暂无汇总数据。
-      </Note>
-      <Note kind="warn">
-        在「模型服务」里可以查看当前厂商与模型;若用量异常,通常是长对话触发上下文压缩,可在 Agent
-        配置中调整 autoCompactThreshold。
-      </Note>
+      {loading && <Spinner text="读取用量…" />}
+      {error && <Note kind="warn">{error}</Note>}
+      {data?.error && <Note kind="warn">{data.error}</Note>}
+
+      {!loading && !error && total && (
+        <>
+          <SectionCard title="总计">
+            <dl className="facts">
+              <dt>总输入</dt>
+              <dd>{total.formattedInput}</dd>
+              <dt>输出</dt>
+              <dd>{total.formattedOutput}</dd>
+              {total.cacheReadTokens > 0 && (
+                <>
+                  <dt>缓存读取</dt>
+                  <dd>{total.formattedCacheRead}</dd>
+                </>
+              )}
+              {total.cacheCreationTokens > 0 && (
+                <>
+                  <dt>缓存写入</dt>
+                  <dd>{total.formattedCacheCreation}</dd>
+                </>
+              )}
+              {total.cacheHitRate !== null && (
+                <>
+                  <dt>缓存命中率</dt>
+                  <dd>{total.cacheHitRate.toFixed(1)}%</dd>
+                </>
+              )}
+            </dl>
+          </SectionCard>
+
+          {!hasData && (
+            <Note kind="info">
+              还没有可统计的用量。每次对话结束后,token 计数会连同「当时是哪个模型
+              在服务」一起写进消息记录,之后在这里按厂商汇总。
+            </Note>
+          )}
+
+          {data!.groups.map((g) => (
+            <SectionCard key={g.name} title={g.name}>
+              {g.models.map((m) => (
+                <UsageModelRow key={`${m.modelId}#${m.attribution}`} model={m} />
+              ))}
+            </SectionCard>
+          ))}
+
+          {hasData && (
+            <Note kind="info">
+              总计包含所有已计费的消息,包括会话记录已被删除的孤立行 —— 那些 token
+              确实产生了消耗,丢掉会让总额偏低且无从察觉。
+            </Note>
+          )}
+        </>
+      )}
     </DetailShell>
   )
 }

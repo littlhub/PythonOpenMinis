@@ -20,6 +20,9 @@ import type {
   MemoryDoc,
   MemoryList,
   OrganizeResponse,
+  ScheduledRunInfo,
+  ScheduledTaskDraft,
+  ScheduledTaskInfo,
   ServerFrame,
   SettingsInfo,
   SettingsPayload,
@@ -32,6 +35,7 @@ import type {
   SubagentRegistry,
   SubagentsList,
   SystemLogs,
+  UsageStats,
   WorkspaceInfo,
 } from './types'
 
@@ -55,8 +59,10 @@ export const api = {
 
   configTopics: () => request<string[]>('/config/topics'),
 
+  // No trailing slash: `/api/config/` is swallowed by the `/api/config/{path}`
+  // route (path="") and 404s, which silently broke the 外观 topic editor.
   configList: (topic?: string) =>
-    request<ConfigFieldInfo[]>(`/config${topic ? `/?topic=${encodeURIComponent(topic)}` : ''}`),
+    request<ConfigFieldInfo[]>(`/config${topic ? `?topic=${encodeURIComponent(topic)}` : ''}`),
 
   configGet: (path: string) => request<unknown>(`/config/${path}`),
 
@@ -250,6 +256,52 @@ export const api = {
     request<KnowledgeContent>(`/knowledge/content/${kind}/${encodeURIComponent(name)}`),
 
   // -- subagents (助理 / 子代理) ---------------------------------
+  scheduledList: () =>
+    request<{ tasks: ScheduledTaskInfo[]; now: number }>('/scheduled/tasks'),
+
+  scheduledCreate: (payload: ScheduledTaskDraft) =>
+    request<{ task: ScheduledTaskInfo }>('/scheduled/tasks', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
+
+  scheduledUpdate: (id: string, payload: Partial<ScheduledTaskDraft>) =>
+    request<{ task: ScheduledTaskInfo }>(`/scheduled/tasks/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    }),
+
+  scheduledDelete: (id: string) =>
+    request<{ ok: boolean; id: string }>(`/scheduled/tasks/${id}`, {
+      method: 'DELETE',
+    }),
+
+  scheduledToggle: (id: string, enabled: boolean) =>
+    request<{ task: ScheduledTaskInfo }>(`/scheduled/tasks/${id}/toggle`, {
+      method: 'POST',
+      body: JSON.stringify({ enabled }),
+    }),
+
+  scheduledRuns: (id: string) =>
+    request<{ runs: ScheduledRunInfo[] }>(`/scheduled/tasks/${id}/runs`),
+
+  usageStats: () => request<UsageStats>('/usage'),
+
+  /**
+   * 上传背景图。不能走 ``request()`` —— 它固定写 ``Content-Type: application/json``，
+   * 而 multipart 必须让浏览器自己带 boundary。
+   */
+  appearanceUploadBackground: async (file: File): Promise<{ spec: string; url: string }> => {
+    const form = new FormData()
+    form.append('file', file)
+    const res = await fetch(`${API}/appearance/background`, { method: 'POST', body: form })
+    if (!res.ok) {
+      const detail = await res.json().catch(() => ({ detail: res.statusText }))
+      throw new Error(detail?.detail ?? res.statusText)
+    }
+    return res.json() as Promise<{ spec: string; url: string }>
+  },
+
   subagentsList: () => request<SubagentsList>('/subagents'),
 
   subagentsRegistry: () => request<SubagentRegistry>('/subagents/registry'),

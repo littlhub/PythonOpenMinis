@@ -12,6 +12,7 @@ import { ChannelsView } from './components/ChannelsView'
 import { SchedulerView } from './components/SchedulerView'
 import { SubagentsView } from './components/SubagentsView'
 import { api } from './api'
+import { applyBackground, hydrateBackground } from './theme'
 import type { WorkspaceInfo } from './types'
 
 /**
@@ -29,6 +30,17 @@ export default function App() {
     const savedSession = localStorage.getItem('openminis:active-session')
     if (savedView) setView(savedView)
     if (savedSession) setActiveId(savedSession)
+  }, [])
+
+  // 背景偏好来自后端 config（不是 localStorage）—— 它跟着数据目录走，
+  // 同一份配置换个浏览器打开外观一致。设置页改完发事件即时生效，不必刷新。
+  useEffect(() => {
+    void hydrateBackground()
+    const onAppearance = (e: Event) =>
+      applyBackground((e as CustomEvent<string>).detail)
+    window.addEventListener('openminis:appearance', onAppearance as EventListener)
+    return () =>
+      window.removeEventListener('openminis:appearance', onAppearance as EventListener)
   }, [])
 
   // persist

@@ -183,6 +183,38 @@ def register_into(registry: ConfigRegistry, **dependencies: Any) -> None:
             default=Bool(False),
         )
     )
+    # Web-only: Android renders through Compose, where the background follows
+    # the Material theme. The Web shell needs an explicit choice, so the value
+    # is stored as a small "background spec" string the frontend interprets:
+    #
+    #   default              → theme default
+    #   preset:<name>        → one of the built-in palettes
+    #   #rrggbb              → a flat colour, contrast picked automatically
+    #   url:https://…        → a cover image hosted elsewhere
+    #   file:<name>          → an image uploaded to this machine, served by
+    #                          /api/appearance/background/<name>
+    #
+    # The regex is what keeps a malformed value out of the stylesheet: the
+    # frontend writes these strings into CSS, so an unvalidated value is a
+    # style-injection primitive (``url:javascript:`` and friends).
+    registry.register(
+        PrefsBackedField(
+            path="appearance.background",
+            display_name="Background",
+            description="Chat background: preset, #rrggbb colour, url:<image> or file:<upload>.",
+            schema=StrSchema(
+                max_length=300,
+                regex=(
+                    r"(default"
+                    r"|preset:[a-z0-9_-]{1,24}"
+                    r"|#[0-9a-fA-F]{6}"
+                    r"|url:https?://\S{1,250}"
+                    r"|file:[A-Za-z0-9_-]{1,64}\.[A-Za-z0-9]{2,5})?"
+                ),
+            ),
+            default=Str("default"),
+        )
+    )
 
     # --- agent -----------------------------------------------------------
     registry.register(

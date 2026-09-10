@@ -277,6 +277,117 @@ export interface StorageItem {
   fileCount: number
 }
 
+// ---------------------------------------------------------------------------
+// scheduled tasks (定时) — keep in sync with server/scheduled_api.py
+// ---------------------------------------------------------------------------
+/** 重复模式，与 Kotlin ScheduledRepeatMode 同名。 */
+export type RepeatMode = 'ONCE' | 'DAILY' | 'WEEKDAYS' | 'CUSTOM'
+
+export interface ScheduledRunInfo {
+  firedAt: number
+  sessionId?: string | null
+  preview?: string | null
+  ok: boolean
+}
+
+export interface ScheduledTaskInfo {
+  id: string
+  label: string
+  hour: number
+  minute: number
+  repeatMode: RepeatMode
+  /** Calendar.DAY_OF_WEEK: 1=周日 … 7=周六 */
+  customDays: string
+  prompt: string
+  targetMode: string
+  enabled: boolean
+  createdAt: number
+  startDateMs?: number | null
+  endDateMs?: number | null
+  lastFiredAt?: number | null
+  lastResultPreview?: string | null
+  lastResultSessionId?: string | null
+  /** 服务端计算的“下次触发时间”（epoch ms）；禁用/无有效档期为 null。 */
+  nextTriggerMs: number | null
+  runCount: number
+  /** 任务钉住的模型；null/缺省 = 跟随「当前模型」。 */
+  modelId?: string | null
+  /** 提供该模型的 provider 实例 id（同一模型可能挂在两个网关上）。 */
+  modelBinding?: string | null
+}
+
+// ---------------------------------------------------------------------------
+// Token 用量 (UsageStats)
+// ---------------------------------------------------------------------------
+
+/**
+ * 归因可信度。四态必须互相区分——把它们合并成一个，正是当初那个
+ * “整段历史被悄悄改记到当前模型名下”的 bug 能长期藏住的原因。
+ */
+export type Attribution =
+  | 'MEASURED' // 逐条快照，就是实际服务的那个模型
+  | 'ESTIMATED' // 快照列出现之前写入的旧行，按会话当前模型猜的
+  | 'UNKNOWN_SESSION' // 孤儿行：既无快照、也无会话可猜
+  | 'MEASURED_REMOVED' // 有快照，但该模型已从配置里删掉
+
+export interface UsageModelStats {
+  modelId: string
+  displayName: string
+  provider: string
+  attribution: Attribution
+  inputTokens: number
+  outputTokens: number
+  cacheCreationTokens: number
+  cacheReadTokens: number
+  /** input + cacheRead + cacheCreation，与 Android 的 ModelStats.totalInput 一致 */
+  totalInput: number
+  formattedInput: string
+  formattedOutput: string
+  sessions: number
+  activeDays: number
+}
+
+export interface UsageProviderGroup {
+  name: string
+  models: UsageModelStats[]
+}
+
+export interface UsageGrandTotal {
+  totalInput: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheCreationTokens: number
+  /** 无缓存读取时为 null，避免显示误导性的 0.0% */
+  cacheHitRate: number | null
+  formattedInput: string
+  formattedOutput: string
+  formattedCacheRead: string
+  formattedCacheCreation: string
+}
+
+export interface UsageStats {
+  grandTotal: UsageGrandTotal
+  groups: UsageProviderGroup[]
+  /** 一个 (模型, 归因态) 组合算一个 bucket */
+  bucketCount: number
+  error?: string
+}
+
+export interface ScheduledTaskDraft {
+  id?: string
+  label: string
+  hour: number
+  minute: number
+  repeatMode: RepeatMode
+  customDays?: number[]
+  prompt: string
+  targetMode?: string
+  enabled?: boolean
+  /** 钉住的模型 + 其 provider 实例；都为空 = 跟随当前模型。 */
+  modelId?: string | null
+  modelBinding?: string | null
+}
+
 export interface StorageInfo {
   root: string
   totalBytes: number

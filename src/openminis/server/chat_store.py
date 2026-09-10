@@ -364,9 +364,22 @@ async def append_turn(
     text: str,
     *,
     model_label: str | None = None,
+    token_usage: str | None = None,
+    model_id: str | None = None,
+    model_display_name: str | None = None,
+    provider_type: str | None = None,
+    provider_instance_id: str | None = None,
 ) -> None:
     """Persist one user/assistant text turn and refresh session metadata
-    (auto-title from the first user message, last-message preview, ordering)."""
+    (auto-title from the first user message, last-message preview, ordering).
+
+    [T-token-attribution-snapshot] The ``model_*`` / ``provider_*`` kwargs are
+    the per-message attribution snapshot the Usage page reads. They are
+    recorded AT WRITE TIME because ``sessions.model_id`` is a single mutable
+    column: joining on it re-attributed a session's whole history to whichever
+    model it currently pointed at. ``token_usage`` is the serialised
+    :class:`LLMUsage` JSON — only rows where it is non-NULL are billed rows.
+    """
     await ensure_db()
     text = text.strip()
     now = _now_ms()
@@ -384,6 +397,11 @@ async def append_turn(
                 parts_json=_text_parts(text),
                 created_at=now,
                 sort_order=order,
+                token_usage=token_usage,
+                model_id=model_id,
+                model_display_name=model_display_name,
+                provider_type=provider_type,
+                provider_instance_id=provider_instance_id,
             )
         )
         label = model_label or session.model_id or "unset"

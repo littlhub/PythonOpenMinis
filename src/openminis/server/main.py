@@ -31,11 +31,12 @@ from ..config.config_registry import ConfigRegistry
 from ..config.config_value import ConfigValue
 from ..core.context import app_context
 from ..core.logging import get_logger, setup_logging
+from ..scheduled.runner import ScheduledRunner
 from ..soul import SoulStore
 from ..data.model import LLMMessage, LLMStreamChunk
 from ..data.model.agent_content_part import Text
 from ..settings.catalog import MODEL_GROUPS, PROVIDER_TYPES, TOOL_CATALOG
-from ..settings.chat_service import ChatSetupError, build_chat_setup
+from ..settings.chat_service import ChatSetupError, attribution_snapshot, build_chat_setup
 from ..settings.remote_models import (
     ModelsFetchError,
     default_base_url,
@@ -43,12 +44,15 @@ from ..settings.remote_models import (
 )
 from ..settings.store import SettingsError, SettingsStore
 from ..skills import SkillStore
-from . import chat_api, compaction, fs_api, workspaces, chat_store
+from . import chat_api, compaction, fs_api, scheduled_api, workspaces, chat_store
 from .knowledge_api import router as knowledge_router
 from .marketplace_api import router as marketplace_router
+from .scheduled_api import router as scheduled_router
 from .skills_api import router as skills_router
 from .subagents_api import router as subagents_router
 from .system_api import router as system_router
+from .appearance_api import router as appearance_router
+from .usage_api import router as usage_router
 
 logger = get_logger(__name__)
 
@@ -71,8 +75,19 @@ async def lifespan(app: FastAPI):  # noqa: ANN201
             logger.info("installed builtin skills: %s", ", ".join(installed))
     except Exception:  # pragma: no cover - never fail startup over skills
         logger.exception("skill installation failed")
+    # Scheduled tasks: a poller replaces Android's AlarmManager. Without a
+    # persisted store + runner the UI rows were mock data that came back on
+    # every refresh.
+    runner = ScheduledRunner(execute_fn=scheduled_api.execute_prompt)
+    try:
+        await runner.start()
+    except Exception:  # pragma: no cover - never fail startup over scheduling
+        logger.exception("scheduled runner failed to start")
+        runner = None
     logger.info("OpenMinis server starting")
     yield
+    if runner is not None:
+        await runner.stop()
     logger.info("OpenMinis server stopping")
 
 
@@ -99,6 +114,9 @@ app.include_router(skills_router)
 app.include_router(knowledge_router)
 app.include_router(subagents_router)
 app.include_router(marketplace_router)
+app.include_router(scheduled_router)
+app.include_router(usage_router)
+app.include_router(appearance_router)
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +173,18 @@ async def config_list(topic: str | None = None) -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+@app.get("/api/config/")
+async def config_list_slash(topic: str | None = None) -> list[dict[str, Any]]:
+    """Alias for ``/api/config``.
+
+    Without this the trailing-slash form falls through to
+    ``/api/config/{path:path}`` with an empty path and 404s as
+    ``unknown_path: `` — which is exactly how the 外观 topic editor broke.
+    Registered BEFORE the catch-all below so it wins.
+    """
+    return await config_list(topic)
 
 
 @app.get("/api/config/{path:path}")
@@ -453,6 +483,18 @@ async def _handle_chat(client_id: str, msg: dict[str, Any]) -> None:
         await _safe_send(client_id, {"type": "error", "error": str(e)})
         return
 
+    # [T-token-attribution-snapshot] Freeze which model is serving THIS turn
+    # into the message row, and open a meter for the run. Without the snapshot
+    # the Usage page had to join sessions.model_id — one mutable column, so a
+    # later model switch silently re-attributed the whole history.
+    snapshot = attribution_snapshot(store, conf)
+    usage_meter: dict[str, int] = {
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "cacheCreationTokens": 0,
+        "cacheReadTokens": 0,
+    }
+
     async def sink(chunk: object) -> None:
         if isinstance(chunk, LLMStreamChunk.Text):
             await _safe_send(client_id, {"type": "delta", "text": chunk.text})
@@ -478,8 +520,18 @@ async def _handle_chat(client_id: str, msg: dict[str, Any]) -> None:
             })
         elif isinstance(chunk, LLMStreamChunk.Usage):
             # Token usage of a finished assistant turn — surfaced to the
-            # Web client so the chat can display per-step counts.
+            # Web client so the chat can display per-step counts, and summed
+            # into ``usage_meter``: one agent turn can make several LLM calls
+            # (tool rounds) and every one of them is billed.
             u = chunk.usage
+            usage_meter["inputTokens"] += int(u.input_tokens or 0)
+            usage_meter["outputTokens"] += int(u.output_tokens or 0)
+            usage_meter["cacheCreationTokens"] += int(
+                getattr(u, "cache_creation_input_tokens", 0) or 0
+            )
+            usage_meter["cacheReadTokens"] += int(
+                getattr(u, "cache_read_input_tokens", 0) or 0
+            )
             await _safe_send(client_id, {
                 "type": "usage",
                 "inputTokens": u.input_tokens,
@@ -527,7 +579,12 @@ async def _handle_chat(client_id: str, msg: dict[str, Any]) -> None:
             )
             if final_text.strip():
                 await chat_store.append_turn(
-                    sid, "assistant", final_text, model_label=model_label
+                    sid, "assistant", final_text,
+                    model_label=model_label,
+                    token_usage=(
+                        json.dumps(usage_meter) if any(usage_meter.values()) else None
+                    ),
+                    **snapshot,
                 )
         # 到达轮次(默认 30)或接近上下文预算(默认 511998 tokens)时压缩:
         # 顺带把值得长期保留的事实写进记忆日志。压缩失败不影响本轮回答,

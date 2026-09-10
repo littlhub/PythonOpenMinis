@@ -25,7 +25,40 @@ from ..soul import SystemPromptBuilder
 
 logger = get_logger(__name__)
 
-__all__ = ["ChatSetupError", "build_chat_setup", "identity_system_prompt"]
+__all__ = [
+    "ChatSetupError",
+    "attribution_snapshot",
+    "build_chat_setup",
+    "identity_system_prompt",
+]
+
+
+def attribution_snapshot(store: SettingsStore, conf: dict[str, Any]) -> dict[str, Any]:
+    """Freeze "which model produced this message" for the Usage page.
+
+    Ported from the snapshot columns in
+    ``com.openminis.app.data.db.MessageEntity`` (T-token-attribution-snapshot).
+
+    Everything is captured before the request goes out, so later edits to the
+    provider config cannot rewrite history. Lives here (not in ``server.main``)
+    because both the chat handler and the scheduled runner persist turns and
+    must write the same shape — a task that fires at 03:00 is exactly the kind
+    of unattended usage the page needs to attribute correctly.
+    """
+    model_id = str(conf.get("model") or "").strip() or None
+    known = lookup_model(model_id) if model_id else None
+    instance_id = str(conf.get("id") or "").strip()
+    if not instance_id:
+        try:
+            instance_id = str(store.load().get("activeProviderId") or "").strip()
+        except Exception:  # pragma: no cover - settings unreadable
+            instance_id = ""
+    return {
+        "model_id": model_id,
+        "model_display_name": (known.display_name if known else model_id),
+        "provider_type": str(conf.get("type") or "").strip() or None,
+        "provider_instance_id": instance_id or None,
+    }
 
 
 class ChatSetupError(Exception):
@@ -126,12 +159,22 @@ def build_provider(provider_id: str, conf: dict[str, Any]):  # noqa: ANN201
 def build_chat_setup(  # noqa: ANN201
     store: SettingsStore,
     chunk_sink: Callable[..., Awaitable[None]] | None = None,
+    *,
+    instance_id: str | None = None,
+    model_id: str | None = None,
 ):
     """Return ``(provider, runtime, options, identity, provider_conf)`` for the
     active provider + identity, or raise :class:`ChatSetupError` with a
-    user-facing message when chat is not configured yet."""
+    user-facing message when chat is not configured yet.
+
+    ``instance_id`` / ``model_id`` override the active config. Scheduled tasks
+    need this: a task that pinned a model must keep using it no matter what the
+    user later selects as active. Everything else (identity, tools, agent
+    options) still comes from the current settings, so the run behaves like a
+    normal chat with just the model swapped.
+    """
     data = store.load()
-    pid = data.get("activeProviderId")
+    pid = instance_id or data.get("activeProviderId")
     if not pid:
         raise ChatSetupError(
             "还没有配置模型服务。请打开 设置 → 模型服务,添加厂商 API Key 并设为当前。"
@@ -139,6 +182,10 @@ def build_chat_setup(  # noqa: ANN201
     conf = data["providers"].get(pid)
     if not conf:
         raise ChatSetupError(f"厂商 {pid} 配置不存在")
+    if model_id:
+        # Copy before overriding: ``conf`` is the live settings dict and a
+        # mutation here would rewrite the user's stored model choice.
+        conf = {**conf, "model": model_id}
     provider = build_provider(pid, conf)
 
     identity = store.active_identity()

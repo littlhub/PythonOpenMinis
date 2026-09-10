@@ -55,6 +55,63 @@ function ProviderCard({ p }: { p: ProviderInfo }) {
   )
 }
 
+/**
+ * 机器人通道（微信 / QQ）。
+ *
+ * 本体还没接进来 —— 它们是「插件」形态：安装对应技能包之后由插件负责登录、
+ * 收发消息，引擎这边只提供模型与会话。所以这里不做成写死的假开关，而是照技能
+ * 目录的真实内容判断状态，装上插件后状态自己就变了。
+ */
+interface BotChannel {
+  id: string
+  name: string
+  icon: string
+  desc: string
+  /** 需要安装的技能/插件名，与技能目录里的名字比对。 */
+  plugin: string
+}
+
+const BOT_CHANNELS: BotChannel[] = [
+  {
+    id: 'bot:wechat',
+    name: '微信',
+    icon: '💬',
+    desc: '个人微信 / 企业微信。装上微信插件后由它负责登录与收发消息，引擎提供模型与会话。',
+    plugin: 'wechat-bot',
+  },
+  {
+    id: 'bot:qq',
+    name: 'QQ',
+    icon: '🐧',
+    desc: 'QQ 群聊 / 私聊机器人。装上 QQ 插件后由它负责登录与收发消息，引擎提供模型与会话。',
+    plugin: 'qq-bot',
+  },
+]
+
+function BotCard({ bot, installed }: { bot: BotChannel; installed: boolean }) {
+  return (
+    <div className={`channel-card ${installed ? 'connected' : 'disconnected'}`}>
+      <div className="channel-icon">{bot.icon}</div>
+      <div className="channel-info">
+        <div className="channel-name">
+          {bot.name}
+          <span className="kb-count"> 机器人</span>
+        </div>
+        <div className="channel-desc" title={bot.desc}>
+          {bot.desc}
+        </div>
+      </div>
+      <div className="channel-status">
+        <span className={`status-dot ${installed ? 'connected' : 'disconnected'}`} />
+        <span className="status-text">{installed ? '插件已装' : '插件未接入'}</span>
+      </div>
+      <div className="channel-info" style={{ maxWidth: 180, fontSize: 11 }}>
+        <div className="muted">插件：{bot.plugin}</div>
+      </div>
+    </div>
+  )
+}
+
 function ToolCard({ t }: { t: SkillToolInfo }) {
   return (
     <div className="channel-card connected">
@@ -81,6 +138,7 @@ export function ChannelsView() {
   const [providers, setProviders] = useState<ProviderInfo[]>([])
   const [tools, setTools] = useState<SkillToolInfo[]>([])
   const [locals, setLocals] = useState<ChannelRow[]>([])
+  const [installedPlugins, setInstalledPlugins] = useState<Set<string>>(new Set())
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState('')
 
@@ -98,6 +156,7 @@ export function ChannelsView() {
         ])
         setProviders(settings.providers)
         setTools(skills.tools)
+        setInstalledPlugins(new Set(skills.skills.map((s) => s.name)))
         setLocals([
           {
             id: 'local:ws',
@@ -165,7 +224,9 @@ export function ChannelsView() {
           <span className="kb-count">
             {loading
               ? '检测中…'
-              : `${providers.filter((p) => p.hasKey).length} 个模型通道 · ${tools.length} 个工具通道`}
+              : `${providers.filter((p) => p.hasKey).length} 个模型通道 · ${
+                  BOT_CHANNELS.filter((b) => installedPlugins.has(b.plugin)).length
+                }/${BOT_CHANNELS.length} 个机器人 · ${tools.length} 个工具通道`}
           </span>
         </div>
 
@@ -184,6 +245,20 @@ export function ChannelsView() {
                 {providers.map((p) => (
                   <ProviderCard key={p.id} p={p} />
                 ))}
+              </div>
+            </div>
+
+            <div className="set-section">
+              <div className="set-title">机器人（微信 / QQ）</div>
+              <div className="channels-list">
+                {BOT_CHANNELS.map((b) => (
+                  <BotCard key={b.id} bot={b} installed={installedPlugins.has(b.plugin)} />
+                ))}
+              </div>
+              <div className="note note-info">
+                机器人走插件：插件负责登录平台、收发消息，引擎这边只提供模型与会话。
+                装上对应插件后这一项会自动变成「插件已装」——状态是照技能目录真实判断的，
+                不是写死的开关。
               </div>
             </div>
 
