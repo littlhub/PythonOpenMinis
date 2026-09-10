@@ -651,9 +651,19 @@ export function AboutPage(props: { onBack: () => void }) {
           </SectionCard>
           <SectionCard title="项目">
             <p className="muted">
-              开源仓库:{' '}
+              本仓库（Python 移植）:{' '}
+              <a href="https://github.com/littlhub/PythonOpenMinis" target="_blank" rel="noreferrer">
+                github.com/littlhub/PythonOpenMinis
+              </a>
+              <br />
+              上游原版:{' '}
               <a href="https://github.com/OpenMinis/OpenMinis" target="_blank" rel="noreferrer">
                 github.com/OpenMinis/OpenMinis
+              </a>
+              <br />
+              反馈:{' '}
+              <a href="https://github.com/littlhub/PythonOpenMinis/issues/new" target="_blank" rel="noreferrer">
+                littlhub/PythonOpenMinis Issues
               </a>
               <br />
               隐私政策:{' '}
