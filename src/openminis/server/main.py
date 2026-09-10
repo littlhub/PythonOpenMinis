@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -56,8 +57,35 @@ from .usage_api import router as usage_router
 
 logger = get_logger(__name__)
 
-# file: python/src/openminis/server/main.py -> parents[3] = python/ root
-WEB_DIST = Path(__file__).resolve().parents[3] / "web" / "dist"
+def _resolve_web_dist() -> Path:
+    """Locate the built frontend (``web/dist``).
+
+    Three possible homes, in priority order:
+
+    1. ``<exe dir>/web/dist`` — lets someone drop in a rebuilt frontend
+       without repacking the binary.
+    2. ``<_MEIPASS>/web/dist`` — the copy PyInstaller bundled.
+    3. ``<checkout>/web/dist`` — running from source.
+
+    The first one that actually holds an ``index.html`` wins. If none does we
+    return the checkout path, so the "frontend not built" page names the
+    directory the user is expected to build.
+    """
+    checkout = Path(__file__).resolve().parents[3] / "web" / "dist"
+    candidates: list[Path] = []
+    if getattr(sys, "frozen", False):
+        candidates.append(Path(sys.executable).resolve().parent / "web" / "dist")
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass) / "web" / "dist")
+    candidates.append(checkout)
+    for c in candidates:
+        if (c / "index.html").is_file():
+            return c
+    return checkout
+
+
+WEB_DIST = _resolve_web_dist()
 
 
 @asynccontextmanager
@@ -94,7 +122,7 @@ async def lifespan(app: FastAPI):  # noqa: ANN201
 app = FastAPI(
     title="OpenMinis",
     description="Python port of the OpenMinis on-device AI agent.",
-    version="0.1.0",
+    version="1.0.0",
     lifespan=lifespan,
 )
 

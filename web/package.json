@@ -1,7 +1,7 @@
 {
   "name": "openminis-web",
   "private": true,
-  "version": "0.1.0",
+  "version": "1.0.0",
   "type": "module",
   "description": "Web frontend for the OpenMinis Python port (mirrors the Android Compose UI).",
   "scripts": {

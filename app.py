@@ -27,10 +27,15 @@ import webbrowser
 from pathlib import Path
 
 # 允许未安装(editable)时直接运行：把 src 加入导入路径
-_ROOT = Path(__file__).resolve().parent
-_SRC = _ROOT / "src"
-if _SRC.is_dir() and str(_SRC) not in sys.path:
-    sys.path.insert(0, str(_SRC))
+if getattr(sys, "frozen", False):
+    # 打包后 __file__ 指向 _MEIPASS 解压目录(可能是临时目录),PID 文件必须写在
+    # exe 同级 —— 那是 stop.bat 与用户唯一能再次找到它的地方。
+    _ROOT = Path(sys.executable).resolve().parent
+else:
+    _ROOT = Path(__file__).resolve().parent
+    _SRC = _ROOT / "src"
+    if _SRC.is_dir() and str(_SRC) not in sys.path:
+        sys.path.insert(0, str(_SRC))
 
 PID_FILE = _ROOT / ".minis-server.pid"
 WEB_DIR = _ROOT / "web"
@@ -43,12 +48,43 @@ def _parse_args() -> argparse.Namespace:
         prog="app.py",
         description="OpenMinis Web 服务入口（后端 FastAPI + Web 前端）。",
     )
-    p.add_argument("--host", default=DEFAULT_HOST, help=f"监听地址（默认 {DEFAULT_HOST}）")
-    p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"后端端口（默认 {DEFAULT_PORT}）")
+    # 默认值刻意留空:先看界面里存下来的 server.host / server.port,
+    # 命令行显式给出的值再覆盖它。否则「后台运行与服务」页改了也不生效。
+    p.add_argument("--host", default=None, help=f"监听地址（默认读设置,初始 {DEFAULT_HOST}）")
+    p.add_argument("--port", type=int, default=None, help=f"后端端口（默认读设置,初始 {DEFAULT_PORT}）")
     p.add_argument("--dev", action="store_true", help="同时启动 Vite 开发服务器(5173)并打开它")
     p.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
     p.add_argument("--reload", action="store_true", help="开发模式自动重载后端（勿与 --dev 混淆）")
     return p.parse_args()
+
+
+def _configured_bind() -> tuple[str | None, int | None]:
+    """Read ``server.host`` / ``server.port`` written by the settings page.
+
+    Anything unreadable falls back to ``(None, None)`` — a corrupt or absent
+    settings file must never stop the server from booting, it just means the
+    built-in defaults apply.
+    """
+    try:
+        from openminis.config.config_registry import ConfigRegistry  # noqa: PLC0415
+
+        registry = ConfigRegistry.init()
+        host_field = registry.resolve_field("server.host")
+        port_field = registry.resolve_field("server.port")
+        host = str(host_field.read().value).strip() if host_field else ""
+        raw_port = port_field.read().value if port_field else None
+        port = int(raw_port) if raw_port is not None else None
+        return (host or None, port)
+    except Exception:  # pragma: no cover - 配置缺失/损坏时的兜底
+        return None, None
+
+
+def _resolve_bind(args: argparse.Namespace) -> tuple[str, int]:
+    """CLI flag > saved setting > built-in default."""
+    cfg_host, cfg_port = _configured_bind()
+    host = args.host or cfg_host or DEFAULT_HOST
+    port = args.port or cfg_port or DEFAULT_PORT
+    return host, port
 
 
 def _write_pid() -> None:
@@ -84,6 +120,10 @@ def _open_browser_later(url: str) -> None:
 
 def _start_vite() -> subprocess.Popen[bytes] | None:
     """后台拉起 Vite dev server（node web/node_modules/vite/bin/vite.js）。"""
+    if getattr(sys, "frozen", False):
+        print("[错误] --dev 只在源码目录下可用（打包后的 exe 不含 Node 前端）。", file=sys.stderr)
+        print("       请直接启动 exe 使用已构建的界面。", file=sys.stderr)
+        sys.exit(2)
     node = shutil.which("node")
     vite_js = WEB_DIR / "node_modules" / "vite" / "bin" / "vite.js"
     if node is None or not vite_js.exists():
@@ -96,6 +136,7 @@ def _start_vite() -> subprocess.Popen[bytes] | None:
 
 def main() -> None:
     args = _parse_args()
+    host, port = _resolve_bind(args)
 
     # 后端 app（复用 server 模块里已装配路由/静态托管的 FastAPI 实例）
     from openminis.server.main import app as fastapi_app  # noqa: PLC0415
@@ -106,9 +147,13 @@ def main() -> None:
 
     _write_pid()
     try:
-        backend_url = f"http://{args.host}:{args.port}"
+        # 0.0.0.0 表示「监听所有网卡」,它本身不是可连地址 —— 浏览器要开回环。
+        browser_host = "127.0.0.1" if host in ("0.0.0.0", "::", "") else host
+        backend_url = f"http://{browser_host}:{port}"
         frontend_url = "http://127.0.0.1:5173" if args.dev else backend_url
-        print(f"[OpenMinis] 后端     {backend_url}")
+        print(f"[OpenMinis] 后端     http://{host}:{port}")
+        if host not in ("127.0.0.1", "localhost", "::1", ""):
+            print(f"[OpenMinis] 局域网   http://<本机IP>:{port}  （同一网络的设备可访问）")
         print(f"[OpenMinis] 前端     {frontend_url}")
         print(f"[OpenMinis] PID 文件 {PID_FILE}（stop.bat 据此停止）")
         if not args.no_browser:
@@ -118,11 +163,18 @@ def main() -> None:
 
         uvicorn.run(
             fastapi_app,
-            host=args.host,
-            port=args.port,
+            host=host,
+            port=port,
             reload=args.reload,
             log_level="info",
         )
+    except OSError as e:
+        # WinError 10048 = 端口已被占用。这是双击启动时最常见的一种失败,
+        # 值得直接告诉用户去哪儿改,而不是丢一段 uvicorn 堆栈。
+        print(f"[错误] 无法绑定 {host}:{port} —— {e}", file=sys.stderr)
+        print("       端口可能已被占用（例如已有一个 OpenMinis 在运行）。", file=sys.stderr)
+        print("       可先跑 stop.bat,或换端口:python app.py --port 8899", file=sys.stderr)
+        sys.exit(1)
     finally:
         if vite_proc is not None and vite_proc.poll() is None:
             vite_proc.terminate()

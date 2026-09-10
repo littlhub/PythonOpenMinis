@@ -18,6 +18,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from .. import __version__ as _package_version
+
 __all__ = ["AppContext", "app_context", "set_app_context"]
 
 
@@ -67,8 +69,11 @@ class AppContext:
     # assets (the Alpine rootfs / MCP CLI that ship inside the APK as assets).
     project_root: Path | None = None
     package_name: str = "com.openminis.app"
-    version_name: str = "0.1.0"
-    version_code: int = 1
+    # Sourced from ``openminis.__version__`` so the About page, the FastAPI
+    # metadata and the packaged binary can never disagree. ``version_code``
+    # mirrors Android's monotonically increasing integer (major*10000 + …).
+    version_name: str = _package_version
+    version_code: int = 10000
     debug: bool = field(default_factory=lambda: bool(os.environ.get("MINIS_DEBUG")))
 
     def __post_init__(self) -> None:

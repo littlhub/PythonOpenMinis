@@ -70,6 +70,29 @@ rather than a bare 404.
 uv run pytest
 ```
 
+## Build a Windows executable
+
+```bat
+build.bat              rem onedir  -> dist\OpenMinis\OpenMinis.exe
+build.bat onefile      rem onefile -> dist\OpenMinis.exe
+build.bat clean        rem wipe build\ and dist\
+```
+
+Uses the project `.venv` (falling back to a system Python 3.10) and installs
+PyInstaller on demand. The recipe lives in `packaging/OpenMinis.spec`; the
+version stamped on the binary is read from `src/openminis/__init__.py`.
+
+The web UI is bundled as data, so run `setup.bat` first if you want the exe
+to serve a real page — otherwise it starts and shows the "frontend not
+built" hint. The running binary resolves `web/dist` from, in order: a
+`web\dist` folder next to the exe, the copy inside `_internal`, then the
+checkout. Dropping a rebuilt frontend next to the exe therefore takes effect
+without repacking.
+
+The port and bind address can be changed from the UI (设置 → 后台运行与服务)
+or with `--port` / `--host`; a command-line flag always wins over the saved
+setting.
+
 ## Port status
 
 See `PORTING_MAP.md`. Modules are marked `done`, `partial`, or `n-a`

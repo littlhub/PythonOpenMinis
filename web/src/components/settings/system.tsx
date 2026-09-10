@@ -455,24 +455,76 @@ export function PermissionsPage(props: { onBack: () => void }) {
 // 后台运行与服务
 // ---------------------------------------------------------------------------
 export function BackgroundPage(props: { onBack: () => void }) {
-  const { data: server, error, loading } = useAsync<ConfigFieldInfo[]>(() => api.configList('server'))
+  const { fields, values, error, saved, setField } = useConfigTopic('server')
+  // 端口是自由输入,不能每敲一位就写盘 —— 输 "8" 是合法端口,用户的 8765 会在
+  // 敲到第三位之前就被改成 8。所以先攒在本地,回车或失焦时才提交。
+  const [draftPort, setDraftPort] = useState<string | null>(null)
+
+  const savedHost = String(values['server.host'] ?? '127.0.0.1')
+  const savedPort = String(values['server.port'] ?? '8765')
+  const shownPort = draftPort ?? savedPort
+  // 「仅本机」= 回环地址;其余(0.0.0.0 / 局域网 IP)一律按对外监听展示。
+  const loopback = ['127.0.0.1', 'localhost', '::1', ''].includes(savedHost)
+  const dirty = draftPort !== null && draftPort !== savedPort
+
+  const commitPort = async () => {
+    if (draftPort === null) return
+    const n = Number(draftPort)
+    if (!Number.isInteger(n) || n < 1 || n > 65535) {
+      setDraftPort(null) // 非法输入直接退回已保存值,端口范围以后端 schema 为准
+      return
+    }
+    await setField('server.port', n)
+    setDraftPort(null)
+  }
+
   return (
     <DetailShell
       title="后台运行与服务"
-      subtitle="对应 Android 的 Background & Notifications(电池优化/自启动引导)——桌面进程常驻,不适用;此处为服务信息。"
+      subtitle="对应 Android 的 Background & Notifications(电池优化/自启动引导)——桌面进程常驻,不适用;此处为服务配置。"
       onBack={props.onBack}
     >
-      {loading ? <Spinner /> : error ? <p className="error">{error}</p> : (
-        <SectionCard title="本地服务">
-          {server?.map((f) => (
-            <Row key={f.path} label={f.displayName} desc={f.description}>
-              <code>{String(f.value)}</code>
-            </Row>
-          ))}
+      {!fields ? (
+        <Spinner />
+      ) : (
+        <SectionCard title="本地服务" hint={`当前访问地址 ${window.location.origin}`}>
+          <Row label="监听端口" desc="后端 FastAPI 服务端口。默认 8765,范围 1–65535。">
+            <input
+              type="number"
+              min={1}
+              max={65535}
+              value={shownPort}
+              onChange={(e) => setDraftPort(e.target.value)}
+              onBlur={() => void commitPort()}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') void commitPort()
+              }}
+              style={{ width: 96 }}
+            />
+            {dirty && <span className="muted">回车保存</span>}
+          </Row>
+          <Row
+            label="允许局域网访问"
+            desc="开启后监听 0.0.0.0,同一网络下的其他设备可用本机 IP 访问;关闭则只允许本机。"
+          >
+            <input
+              type="checkbox"
+              checked={!loopback}
+              onChange={(e) =>
+                void setField('server.host', e.target.checked ? '0.0.0.0' : '127.0.0.1')
+              }
+            />
+          </Row>
+          {error && <p className="error">{error}</p>}
+          {saved && <p className="muted">{saved}</p>}
         </SectionCard>
       )}
+      <Note kind="warn">
+        端口与监听地址改动后需 <strong>重启服务</strong> 才生效（命令行 <code>--port</code> /{' '}
+        <code>--host</code> 优先于此处设置）。换端口后请用新地址访问本页。
+      </Note>
       <Note kind="info">
-        网页由本地 FastAPI 服务(run.bat)提供,端口改动后需重启服务生效。关闭浏览器不会中断对话;
+        网页由本地 FastAPI 服务(run.bat / OpenMinis.exe)提供。关闭浏览器不会中断对话;
         保持服务运行即可在后台接收任务。
       </Note>
     </DetailShell>
