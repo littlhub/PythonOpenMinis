@@ -28,6 +28,18 @@ Managed with [uv](https://docs.astral.sh/uv/):
 uv sync                    # create .venv and install everything
 ```
 
+**The web UI has to be built once.** `web/dist` is a build artifact and is
+not committed (see `.gitignore`), so a fresh clone has no page to serve until
+you build it:
+
+```bash
+cd web && npm install && npm run build
+```
+
+On Windows, `setup.bat` does the same thing in one step (needs Node 18+).
+Skipping this is the usual cause of "the server starts but the browser shows
+`{"detail":"Not Found"}`" — the backend is fine, it just has no frontend yet.
+
 ## Run
 
 ```bash
@@ -42,11 +54,15 @@ uv run minis tui
 
 # Server + Web UI
 uv run minis serve                     # http://127.0.0.1:8765
-cd web && npm install && npm run dev   # http://localhost:5173 (proxies to :8765)
 ```
 
-Build the frontend into `web/dist` and FastAPI serves it directly from
-`http://127.0.0.1:8765` — no dev server needed.
+On Windows you can use `run.bat` (backend + built UI) and `stop.bat` instead;
+`run.bat dev` also starts Vite on http://localhost:5173 for hot reload.
+
+Once `web/dist` exists, FastAPI serves it directly from
+`http://127.0.0.1:8765` — no dev server needed. If you start the server
+before building, `/` now returns a page telling you the command to run
+rather than a bare 404.
 
 ## Tests
 

@@ -23,7 +23,7 @@ from typing import Any
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..config.config_error import ConfigError
@@ -656,28 +656,64 @@ async def _handle_shell(client_id: str, msg: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 # static frontend (mounted last so /api and /ws win)
 # ---------------------------------------------------------------------------
-if WEB_DIST.exists():
-    assets_dir = WEB_DIST / "assets"
-    if assets_dir.is_dir():
-        app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
+# 这段**不能**包在 ``if WEB_DIST.exists()`` 里。包住的话,从仓库 clone 下来
+# (web/dist 被 .gitignore 排除)启动后,``/`` 压根不会注册,访问首页只会撞上
+# FastAPI 默认的 {"detail":"Not Found"} —— 既没说是前端没构建,也没说该怎么
+# 构建,一个死胡同。现在路由总是注册,缺产物时给出能照做的指引。
+assets_dir = WEB_DIST / "assets"
+if assets_dir.is_dir():
+    app.mount("/assets", StaticFiles(directory=str(assets_dir)), name="assets")
 
-    index = WEB_DIST / "index.html"
+index = WEB_DIST / "index.html"
 
-    async def _serve_index():
-        if index.exists():
-            return FileResponse(index)
-        return JSONResponse({"detail": "frontend not built"}, status_code=404)
+_BUILD_HINT_HTML = """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<title>OpenMinis — 前端尚未构建</title><style>
+body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#f6f7f9;
+     color:#1c1f23;display:flex;align-items:center;justify-content:center;
+     min-height:100vh;margin:0}
+.card{background:#fff;border:1px solid #e3e6ea;border-radius:12px;
+      padding:28px 32px;max-width:580px;box-shadow:0 2px 12px rgba(0,0,0,.05)}
+h1{font-size:18px;margin:0 0 6px}
+p{font-size:13.5px;line-height:1.75;color:#4a5058;margin:8px 0}
+code{background:#f1f3f5;border:1px solid #e3e6ea;border-radius:5px;
+     padding:1px 6px;font-size:12.5px}
+pre{background:#1c1f23;color:#e8eaed;padding:12px 14px;border-radius:8px;
+    overflow-x:auto;font-size:12.5px;line-height:1.6}
+</style></head><body><div class="card">
+<h1>前端尚未构建</h1>
+<p>后端已经起来了,但 <code>web/dist</code> 不存在 —— 它是构建产物,
+不随仓库分发(见 <code>.gitignore</code>)。</p>
+<p>在仓库的 <code>web</code> 目录下执行:</p>
+<pre>npm install
+npm run build</pre>
+<p>完成后刷新本页即可。首次构建大约需要一分钟。</p>
+<p style="color:#8a9099;font-size:12.5px">后端 API 不受影响,
+<code>/api/health</code> 现在就是可用的。</p>
+</div></body></html>"""
 
-    @app.get("/")
-    async def spa_index():  # noqa: ANN201
-        return await _serve_index()
 
-    @app.get("/{full_path:path}")
-    async def spa_fallback(full_path: str):  # noqa: ANN201
-        # unknown /api or /ws paths -> JSON 404, everything else -> SPA index
-        if full_path.startswith(("api/", "ws")):
-            return JSONResponse({"detail": "Not Found"}, status_code=404)
-        return await _serve_index()
+def _frontend_missing() -> HTMLResponse:
+    return HTMLResponse(_BUILD_HINT_HTML, status_code=503)
+
+
+async def _serve_index():  # noqa: ANN201
+    if index.exists():
+        return FileResponse(index)
+    return _frontend_missing()
+
+
+@app.get("/")
+async def spa_index():  # noqa: ANN201
+    return await _serve_index()
+
+
+@app.get("/{full_path:path}")
+async def spa_fallback(full_path: str):  # noqa: ANN201
+    # unknown /api or /ws paths -> JSON 404, everything else -> SPA index
+    if full_path.startswith(("api/", "ws")):
+        return JSONResponse({"detail": "Not Found"}, status_code=404)
+    return await _serve_index()
 
 
 def main() -> None:
