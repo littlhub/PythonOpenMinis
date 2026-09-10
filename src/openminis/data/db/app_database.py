@@ -22,6 +22,12 @@ from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
+# The `sqlite+aiosqlite://` driver is loaded lazily by SQLAlchemy's dialect
+# layer at engine-creation time (a dynamic import_module). Importing it here
+# keeps the package reachable for static bundlers (PyInstaller) and makes the
+# runtime dependency explicit. The symbol itself is intentionally unused.
+import aiosqlite  # noqa: F401
+
 from ...core.context import app_context
 from ...core.logging import get_logger
 from .base import Base

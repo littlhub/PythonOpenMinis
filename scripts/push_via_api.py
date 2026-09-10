@@ -244,6 +244,10 @@ def main() -> None:
     remote_base = sys.argv[1]
     tip = sys.argv[2] if len(sys.argv) > 2 else git("rev-parse", "HEAD")
 
+    # GitHub 的 ``/git/commits/{sha}`` 只认完整 SHA —— 传缩写会直接 404,
+    # 看起来像是「远端没有这个提交」。本地 rev-parse 就能补全,顺手做掉。
+    remote_base = git("rev-parse", remote_base)
+
     # 远端基准必须是本地已有对象,且两侧 tree 一致 —— 否则下面的增量是错的。
     remote_commit = api("GET", f"/repos/{REPO}/git/commits/{remote_base}")
     local_tree = git("rev-parse", f"{remote_base}^{{tree}}")

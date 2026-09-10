@@ -47,6 +47,11 @@ for p in sorted(PKG.rglob("*")):
 # string name at runtime, so static analysis cannot see them. Without these
 # the binary starts and then dies with "no module named uvicorn.loops.auto".
 hiddenimports = [
+    # SQLAlchemy's `sqlite+aiosqlite://` driver is imported dynamically inside
+    # sqlalchemy/dialects/sqlite/aiosqlite.py at engine-creation time, so
+    # PyInstaller's static scan never sees it. Without this the frozen binary
+    # dies with "ModuleNotFoundError: No module named 'aiosqlite'".
+    "aiosqlite",
     "uvicorn.logging",
     "uvicorn.loops",
     "uvicorn.loops.auto",

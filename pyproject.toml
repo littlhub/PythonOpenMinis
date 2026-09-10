@@ -1,6 +1,6 @@
 [project]
 name = "openminis"
-version = "1.0.0"
+version = "1.0.1"
 description = "OpenMinis — your private, on-device AI agent. Python port of the Kotlin/Android client."
 readme = "README.md"
 requires-python = ">=3.11"
