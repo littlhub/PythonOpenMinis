@@ -99,9 +99,29 @@ def active_skills_block(store: SettingsStore) -> str:
         return ""
 
 
+#: Appended to every identity's persona. A short, locale-aware retrieval
+#: discipline so the agent reaches for real retrieval before hallucinating
+#: URLs — the "news task that fetched Google News / BBC / CNN and never
+#: searched a domestic source" regression. The order matters: search first,
+#: fetch next, guess only as a last resort, and prefer sources matching the
+#: user's language/region.
+RETRIEVAL_DISCIPLINE = (
+    "\n\n【联网检索纪律】需要联网获取信息时，按以下顺序："
+    "① 先用 web_search 检索（若它提示未配置，就跳过它继续下一步）；"
+    "② 再用 web_fetch 抓取上一步得到的链接，或你确知的、"
+    "与用户语言/地区一致的来源（中文用户优先国内权威来源）；"
+    "③ 不要凭记忆直接猜 Google News、BBC、CNN 这类国外新闻站首页；"
+    "④ 只有在确实找不到合适来源时，才退化为直接猜测 URL 去抓取。"
+)
+
+
 def identity_system_prompt(store: SettingsStore) -> str:
     identity = store.active_identity()
-    return identity.persona + active_skills_block(store)
+    return (
+        identity.persona
+        + RETRIEVAL_DISCIPLINE
+        + active_skills_block(store)
+    )
 
 
 def _model_for(provider_type: str, model_id: str) -> LLMModel | None:
@@ -195,7 +215,9 @@ def build_chat_setup(  # noqa: ANN201
     # 步数上限用设置里的值(默认 40),保证单次对话不会无限跑工具。
     agent_cfg = store.agent_config()
     options = AgentRuntimeOptions(
-        system_prompt=identity.persona + active_skills_block(store),
+        system_prompt=(
+            identity.persona + RETRIEVAL_DISCIPLINE + active_skills_block(store)
+        ),
         max_turns=int(agent_cfg.get("maxToolSteps") or MAX_AGENT_TURNS),
         thinking_level=(
             ThinkingLevel.HIGH if agent_cfg.get("deepThinking") else ThinkingLevel.OFF

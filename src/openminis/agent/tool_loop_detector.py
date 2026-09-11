@@ -93,11 +93,16 @@ class ToolLoopConfig:
     unknown_tool_threshold: int = 10
     critical_threshold: int = 20
     global_circuit_breaker_threshold: int = 30
-    #: Query-style tools (memory_get / web_search / web_fetch) get a stricter
-    #: *same-name* guard: N consecutive calls of the same query tool count even
-    #: when every call has different arguments (the classic "keep re-searching
-    #: with new keywords" spiral that identical-args detection never sees).
-    query_tools: tuple[str, ...] = ("memory_get", "web_search", "web_fetch")
+    #: Query / browse-style tools get a stricter *same-family* guard: N
+    #: consecutive calls of any query tool count even when every call has
+    #: different arguments (the classic "keep re-searching with new keywords"
+    #: spiral that identical-args detection never sees). The family also merges
+    #: so the model can't dodge the guard by alternating tools — the news
+    #: roundup pattern is exactly ``web_fetch`` a listing, ``browser_use`` an
+    #: article, ``web_fetch`` another listing…; all three count as one streak.
+    query_tools: tuple[str, ...] = (
+        "memory_get", "web_search", "web_fetch", "browser_use",
+    )
     query_warning_threshold: int = 5
     query_critical_threshold: int = 10
 
@@ -209,21 +214,22 @@ class ToolLoopDetector:
             streak = self._consecutive_same_tool_streak(tool_name)
             if streak >= self.config.query_critical_threshold:
                 msg = (
-                    f"[LOOP BLOCKED] CRITICAL: you have called {tool_name} "
-                    f"{streak} times in a row with no other tool in between. "
-                    "Re-searching does not add information. Stop now and answer "
-                    "with what you already have, or tell the user the task needs "
-                    "more input."
+                    f"[LOOP BLOCKED] CRITICAL: retrieval/browsing tools "
+                    f"({tool_name} and similar like web_fetch/browser_use) have "
+                    f"now been called {streak} times in a row with no other tool "
+                    "in between. Re-searching does not add information. Stop now "
+                    "and answer with what you already have, or tell the user the "
+                    "task needs more input."
                 )
                 logger.warning("CRITICAL query_tool_runaway tool=%s streak=%s",
                                tool_name, streak)
                 return LoopCheckResult(LoopLevel.CRITICAL, msg)
             if streak >= self.config.query_warning_threshold:
                 msg = (
-                    f"[LOOP WARNING] {tool_name} has now been called "
-                    f"{streak} times in a row. If the last calls did not find "
-                    "new information, stop searching and proceed with what you "
-                    "have."
+                    f"[LOOP WARNING] retrieval/browsing tools (incl. "
+                    f"{tool_name}) have now been called {streak} times in a row. "
+                    "If the last calls did not find new information, stop "
+                    "searching and proceed with what you have."
                 )
                 key = f"queryrun:{tool_name}"
                 if self._should_emit_warning(key, streak):
@@ -234,12 +240,29 @@ class ToolLoopDetector:
         return LoopCheckResult.none()
 
     def _consecutive_same_tool_streak(self, tool_name: str) -> int:
-        """Count trailing records that all used the *same tool* (any args)."""
+        """Count trailing records using the *same query-class* tool (any args).
+
+        For any tool in ``config.query_tools`` (the retrieval / browsing family:
+        ``web_fetch`` / ``web_search`` / ``browser_use`` / ``memory_get`` …),
+        consecutive calls to *any* tool in that family are merged into the streak
+        — so the model cannot dodge the runaway guard by alternating between
+        them (the canonical ``web_fetch`` listing → ``browser_use`` article →
+        ``web_fetch`` listing spiral). Tools outside the query family still
+        require a strict name match and act as a reset, so a coder reading files
+        between fetches keeps its fetch streak alive only until another query
+        tool intervenes.
+        """
+        is_query = tool_name in self.config.query_tools
         streak = 0
         for rec in reversed(self._history):
             if rec.unknown_tool_name is not None:
                 break
-            if rec.tool_name == tool_name:
+            if is_query:
+                if rec.tool_name in self.config.query_tools:
+                    streak += 1
+                else:
+                    break
+            elif rec.tool_name == tool_name:
                 streak += 1
             else:
                 break

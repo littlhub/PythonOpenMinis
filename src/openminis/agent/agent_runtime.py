@@ -76,6 +76,11 @@ class AgentRuntimeOptions:
     temperature: Optional[float] = None
     max_tokens: int = 16_384
     max_turns: int = MAX_AGENT_TURNS
+    #: Force a text-only wrap-up after this many *consecutive* tool rounds that
+    #: emitted no user-facing text — the "kept calling tools round after round,
+    #: never summarized" spiral (ReAct loop that never exits on its own).
+    #: ``None`` derives a safe default from ``max_turns`` (see ``run``).
+    wrap_up_rounds: Optional[int] = None
     #: Kotlin's per-tool-category timeout defaults (seconds).
     tool_timeout: float = 900.0
 
@@ -164,6 +169,18 @@ class AgentRuntime:
         #: runtime counter the model can spin on "blocked → retry → blocked"
         #: forever (only MAX_AGENT_TURNS would stop it). 2 strikes → hard stop.
         blocked_rounds = 0
+        #: Consecutive rounds that ran tools but wrote nothing to the user.
+        #: The loop's ONLY natural exit is the model declining to call a tool;
+        #: when it falls into an act-only rhythm (very common after a research
+        #: step: "fetch → fetch → fetch…") that exit is never reached and the
+        #: turn dies on the terse max_turns marker with no answer. After
+        #: ``wrap_up_after`` such rounds we force a text-only wrap-up so the
+        #: turn actually closes with a summary instead of spinning.
+        stalled_rounds = 0
+        wrap_up_after = (
+            opts.wrap_up_rounds if opts.wrap_up_rounds is not None
+            else max(6, min(12, opts.max_turns))
+        )
 
         for turn in range(opts.max_turns):
             turn_start = len(messages)
@@ -394,6 +411,57 @@ class AgentRuntime:
                 # request; hand back what we have.
                 stop_reason = "tool_blocked"
                 return messages, stop_reason
+
+            # ── 5b. wrap-up guard: act-only rounds with no user-facing text ─
+            # The loop's only natural exit is the model declining to call a
+            # tool. A round that wrote nothing means the model is still
+            # "acting", not "answering" — and a research step ("fetch →
+            # fetch → fetch…") can drop it into that rhythm forever, so the
+            # exit is never reached and the turn dies on the max_turns marker
+            # with no answer. Count consecutive silent tool rounds and, once
+            # the budget is nearly spent, force a tool-free final call whose
+            # text IS the answer — the loop then exits as an answered turn.
+            if text_joined:
+                stalled_rounds = 0
+            else:
+                stalled_rounds += 1
+
+            if stalled_rounds >= wrap_up_after:
+                messages.append(LLMMessage(
+                    LLMMessage.Role.USER,
+                    f"[auto wrap-up] 你已经连续 {stalled_rounds} 轮调用工具，"
+                    "但没有向用户输出任何内容（任务似乎已完成，但循环没能自行收尾）。"
+                    "如果所需信息或操作已经完成，请立即停止调用工具，直接用文本把"
+                    "已有结果整理总结回复给用户；如果确实还缺少关键信息或需要用户"
+                    "确认，请直接用文本说明还缺什么。本轮不要再调用任何工具。",
+                ))
+                wrap_up: list[str] = []
+                try:
+                    stream = provider.stream_message(
+                        messages,
+                        opts.system_prompt,
+                        opts.max_tokens,
+                        opts.temperature,
+                        tools=None,
+                        thinking_level=opts.thinking_level,
+                    )
+                    async for chunk in stream:
+                        await self._emit(chunk)
+                        if isinstance(chunk, LLMStreamChunk.Text):
+                            wrap_up.append(chunk.text)
+                except Exception as exc:  # a failed wrap-up must not lose the turn
+                    logger.warning("wrap-up turn failed: %s: %s",
+                                   type(exc).__name__, exc)
+                summary = "".join(wrap_up).strip() or (
+                    "任务已执行多轮工具调用，但未能自动收尾，已为你结束本轮。"
+                    "如需继续，请缩小任务范围或补充更明确的目标后再试。"
+                )
+                messages.append(LLMMessage(LLMMessage.Role.ASSISTANT, summary))
+                logger.warning(
+                    "agent auto wrap-up after %s consecutive tool-only rounds",
+                    stalled_rounds,
+                )
+                return messages, "auto_wrap_up"
 
             _ = turn_start
 

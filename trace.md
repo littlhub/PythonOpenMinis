@@ -63,3 +63,41 @@
 
 - 把整理器暴露为 agent 工具 `memory_organize`（复用 `POST /api/system/memory/organize`）需要把当前 LLM provider 注入 tool executor，改动面较大，暂缓；
 - 会话级"连续同工具无进展"的通用检测可继续收紧（当前仅 query 白名单，避免误伤）。
+
+---
+
+# trace 2 — 「新闻抓完不总结，跑满 max_turns」运行轨迹
+
+日期：2026-09-12（OpenMinis Python 移植版，Web UI 会话）
+
+## 现象
+
+主 agent 执行"抓取新闻并总结"一类任务时，新闻素材已抓够，但循环**不退出**：
+
+- 40 轮全是 `web_fetch` / `browser_use` 交替调用（`tool_call … ok=True`），
+- 全程**没有任何一次向用户输出文本**，
+- 直到顶穿 `max_turns=40` 才被 `[stopped: reached the maximum number of tool rounds]` 截断，**没有总结**。
+
+## 根因
+
+| # | 根因 | 说明 |
+|---|------|------|
+| 1 | `browser_use` 不在检索白名单 | `ToolLoopConfig.query_tools` 只有 `memory_get/web_search/web_fetch`，`browser_use` 漏网，runaway 规则根本不接管它 |
+| 2 | 连续计数按"严格同名" | `_consecutive_same_tool_streak` 要求 tool_name 完全相等。新闻场景 `web_fetch` 抓列表 → `browser_use` 开文章 → `web_fetch` 再抓，**互相打断**，单工具最长连续仅 4 次，永远够不到 `query_critical_threshold=10` |
+| 3 | 循环无"空转收尾"出口 | ReAct 循环唯一的自然出口是"模型不再调用工具"。模型陷入"只调工具、从不输出文本"的惯性时出口永远到不了 → 只有 max_turns 硬顶 |
+
+## 修复
+
+1. **同类合并（检测器层）**：`query_tools` 纳入 `browser_use`；`_consecutive_same_tool_streak`
+   改为**按检索/浏览家族合并计数**——`web_fetch`/`browser_use`/`web_search`/`memory_get`
+   互相接力不再重置 streak；非检索工具（shell/file 等）仍重置。交替抓取同样累计到 CRITICAL → 触发既有 blocked→wrap-up 硬停。
+2. **空转收尾护栏（运行时层，核心）**：`AgentRuntime` 新增 `wrap_up_rounds` 选项与
+   `stalled_rounds` 计数——连续 N 轮"只有工具、无文本产出"后，注入 `[auto wrap-up]` 指令并
+   发起一次 **tools=None** 的收尾调用，把模型文本作为最终答案，`stop_reason="auto_wrap_up"`。
+   默认阈值 `max(6, min(12, max_turns))`（40 轮预算 → 12 轮即收尾）。**任务完成却空转时主动跳出循环并总结**，不再顶穿 max_turns。
+
+## 验证
+
+- 新增 `tests/test_loop_query_guard.py` 3 例：browser_use 独立连打 10 次 → CRITICAL；web_fetch/browser_use 交替 10 次 → CRITICAL；非检索工具穿插 → streak 重置。
+- 新增 `tests/test_agent.py::test_runtime_auto_wrap_up_when_never_answering`：纯工具无文本连打 → `stop=="auto_wrap_up"` 且提前收尾。
+- 全量 **306 passed**。

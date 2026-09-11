@@ -203,6 +203,16 @@ def test_active_skills_enter_system_prompt(isolated_skills, monkeypatch):
     assert "可用技能" in prompt and "visioncustom" in prompt
 
 
+def test_retrieval_discipline_enters_system_prompt(isolated_skills, monkeypatch):
+    """联网检索纪律随 persona 注入：先检索、优先国内来源、不凭记忆猜国外站。"""
+    store = _settings(isolated_skills)
+    monkeypatch.setattr(SettingsStore, "get", classmethod(lambda cls: store))
+    prompt = identity_system_prompt(store)
+    assert "联网检索纪律" in prompt
+    assert "web_search" in prompt and "web_fetch" in prompt
+    assert "国内" in prompt
+
+
 def test_skills_api_activate(isolated_skills, monkeypatch):
     from fastapi.testclient import TestClient
 

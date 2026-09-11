@@ -256,3 +256,52 @@ async def test_runtime_hard_stops_after_repeated_blocks():
                and "[loop protection]" in (m.content or "") for m in out)
     assert any(m.role is LLMMessage.Role.ASSISTANT
                and "总结" in (m.content or "") for m in out)
+
+
+@pytest.mark.asyncio
+async def test_runtime_auto_wrap_up_when_never_answering():
+    """A ReAct loop that keeps acting but never writes to the user must not
+    burn the whole tool budget: the runtime forces a text-only wrap-up so the
+    turn closes with an answer (stop == 'auto_wrap_up') instead of dying on
+    the terse max_turns marker."""
+
+    class ActForeverNoText:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def stream_message(self, messages, system_prompt=None, max_tokens=0,
+                           temperature=None, image_parts=None, tools=None,
+                           thinking_level=ThinkingLevel.OFF):
+            async def gen():
+                self.n += 1
+                last = messages[-1]
+                txt = (last.content_parts[0].content
+                       if last.content_parts and hasattr(last.content_parts[0], "content")
+                       else (last.content or ""))
+                if "[auto wrap-up]" in txt:
+                    yield LLMStreamChunk.Text("自动总结：新闻要点一二三。")
+                    yield LLMStreamChunk.Finished("end_turn")
+                else:
+                    # Distinct args each round -> no identical-repeat blocker,
+                    # so ONLY the wrap-up guard can stop this loop.
+                    yield LLMStreamChunk.ToolCallComplete(
+                        f"c{self.n}", "shell_execute",
+                        {"command": f"step-{self.n}"},
+                    )
+                    yield LLMStreamChunk.Finished("tool_use")
+            return gen()
+
+    rt = AgentRuntime()
+    rt.register(ToolExecutor(_shell_tool_def(), _fake_shell))
+    msgs = [LLMMessage(LLMMessage.Role.USER, "长任务")]
+    out, stop = await rt.run(
+        ActForeverNoText(), msgs, "s",
+        AgentRuntimeOptions(max_turns=30),  # wrap_up_after == 12
+    )
+    assert stop == "auto_wrap_up"
+    assert any(m.role is LLMMessage.Role.USER
+               and "[auto wrap-up]" in (m.content or "") for m in out)
+    assert any(m.role is LLMMessage.Role.ASSISTANT
+               and "自动总结" in (m.content or "") for m in out)
+    # It must close early, not at the hard budget.
+    assert len(out) < 30
