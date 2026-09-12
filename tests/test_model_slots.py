@@ -245,13 +245,22 @@ def test_image_max_edge_clamped(store):
 def test_image_context_discipline_switches_with_mode(store):
     from openminis.settings.chat_service import (
         IMAGE_INLINE_DISCIPLINE,
-        IMAGE_PATH_DISCIPLINE,
+        IMAGE_SLOT_DISCIPLINE,
+        SUBAGENT_PLAN_DISCIPLINE,
         identity_system_prompt,
         image_context_discipline,
     )
 
-    assert image_context_discipline(store) == IMAGE_PATH_DISCIPLINE
-    assert IMAGE_PATH_DISCIPLINE in identity_system_prompt(store)
+    # 默认（path + 不走子代理）：read_image 走识图槽
+    assert image_context_discipline(store) == IMAGE_SLOT_DISCIPLINE
+    assert IMAGE_SLOT_DISCIPLINE in identity_system_prompt(store)
+    # 开启「识图走子代理」：纪律换成委派版
+    store.apply_full({"agent": {"imageVisionSubagent": True}})
+    from openminis.settings.chat_service import IMAGE_SUBAGENT_DISCIPLINE
+
+    assert image_context_discipline(store) == IMAGE_SUBAGENT_DISCIPLINE
+    # 子代理助理开启时，系统提示里带「先规划代办」纪律
+    assert SUBAGENT_PLAN_DISCIPLINE in identity_system_prompt(store)
     store.apply_full({"agent": {"imageContextMode": "inline"}})
     assert image_context_discipline(store) == IMAGE_INLINE_DISCIPLINE
 

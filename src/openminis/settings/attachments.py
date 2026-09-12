@@ -202,17 +202,18 @@ def _attached_files_xml(refs: list[AttachmentRef]) -> str:
 
 
 def _attachment_hint(
+    store: Any,
     images: int,
     files: int,
     inlined: int,
-    vision_subagent: str | None,
-    vision_slot: bool,
 ) -> str:
     """附件提示 —— 只负责「告诉主 agent 图在哪、该找谁看」。
 
-    关键点：**主 agent 自己看不到图**（上下文里只有路径）。看图这件事由主
-    agent 自己发起委派：交给识图子代理（子代理带着它自己的识图技能/模型），
-    或者退回 ``read_image``（走识图槽）。后端不代替它做这件事。
+    路子由「识图走子代理」开关（``agent.imageVisionSubagent``）决定：
+
+    * 关（默认）—— 与其它工具同一条路：调 ``read_image``，识图槽转文字描述；
+    * 开 —— 主 agent 先规划，再把看图这件事用 ``subagent_delegate`` 委派给
+      识图子代理（用子代理自己的模型）；没配识图子代理时退回 read_image。
     """
     parts = []
     if images:
@@ -222,24 +223,36 @@ def _attachment_hint(
     what = "、".join(parts) or "附件"
     bits = [f"（本轮 {what}：只给了你路径，图片内容不在你的上下文里。"]
 
+    via_subagent = False
+    vision_subagent: str | None = None
+    if images and not inlined:
+        try:
+            via_subagent = bool(
+                store.agent_config().get("imageVisionSubagent") or False
+            )
+        except Exception:  # pragma: no cover - settings unreadable
+            via_subagent = False
+        if via_subagent:
+            try:
+                from ..agent.subagents import find_vision_subagent
+
+                vision_subagent = find_vision_subagent(store)
+            except Exception:  # pragma: no cover
+                vision_subagent = None
+
     if images:
         if inlined:
             bits.append(f"{inlined} 张已作为多模态输入随本条消息附上。")
-        elif vision_subagent:
+        elif via_subagent and vision_subagent:
             bits.append(
-                f"要看图请用 subagent_delegate 委派给「{vision_subagent}」子代理，"
-                "task 里把这些路径原样带上，让它用 read_image 查看并回报图像内容"
-                "（它自带识图技能）。不要自己猜图里有什么。"
-            )
-        elif vision_slot:
-            bits.append(
-                "要看图请调用 read_image，path 填上面的路径"
-                "（会由识图模型转成文字描述返回）。"
+                f"要看图请先规划这一步，再用 subagent_delegate 委派给"
+                f"「{vision_subagent}」子代理（用它的模型看图），task 里把这些"
+                "路径原样带上。不要凭路径猜测图片内容。"
             )
         else:
             bits.append(
-                "当前没有可用的识图能力（未配置识图子代理或识图槽），"
-                "你无法看到图片内容；请如实告诉用户并说明如何开启识图。"
+                "要看图请调用 read_image，path 填上面的路径"
+                "（识图模型会转成文字描述返回）。不要凭路径猜测图片内容。"
             )
     if files:
         bits.append("文件内容请用 read_file 或 shell 按路径读取。")
@@ -313,13 +326,7 @@ async def build_attachment_context(
             parts = _inline_image_parts(store, images)
 
         notes.append(
-            _attachment_hint(
-                images=len(images),
-                files=len(files),
-                inlined=len(parts),
-                vision_subagent=_vision_subagent_id(store) if images and not parts else None,
-                vision_slot=_vision_slot_ready(store) if images and not parts else False,
-            )
+            _attachment_hint(store, images=len(images), files=len(files), inlined=len(parts))
         )
 
     if dropped:
@@ -332,26 +339,6 @@ async def build_attachment_context(
     return AttachmentBundle(
         text=cleaned, prompt=prompt, image_parts=parts, dropped=dropped, refs=refs
     )
-
-
-def _vision_subagent_id(store: Any) -> str | None:
-    """配置里能看图的子代理 id（内部复用 subagents.find_vision_subagent）。"""
-    try:
-        from ..agent.subagents import find_vision_subagent
-
-        return find_vision_subagent(store)
-    except Exception:  # pragma: no cover - settings unreadable
-        logger.debug("vision subagent lookup failed", exc_info=True)
-        return None
-
-
-def _vision_slot_ready(store: Any) -> bool:
-    try:
-        from .vision_service import vision_slot_ready
-
-        return bool(vision_slot_ready(store))
-    except Exception:  # pragma: no cover
-        return False
 
 
 def _inline_image_parts(store: Any, images: list[AttachmentRef]) -> list[Any]:

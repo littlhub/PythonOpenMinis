@@ -118,26 +118,40 @@ RETRIEVAL_DISCIPLINE = (
 
 def identity_system_prompt(store: SettingsStore) -> str:
     identity = store.active_identity()
+    try:
+        subagent_on = bool(store.agent_config().get("subagentEnabled") or False)
+    except Exception:  # pragma: no cover - settings unreadable
+        subagent_on = True
     return (
         identity.persona
         + RETRIEVAL_DISCIPLINE
         + image_context_discipline(store)
+        + (SUBAGENT_PLAN_DISCIPLINE if subagent_on else "")
         + active_skills_block(store)
     )
 
 
-#: 图片默认不进上下文 —— 只把**路径**记进对话，理解交给识图槽/子代理。
-#: 这段纪律让模型知道自己拿不到像素，别凭路径编内容。``inline`` 模式下换成
-#: 一句"可能直接收到图片"的说明。
-IMAGE_PATH_DISCIPLINE = (
+#: 图片进上下文只有一种方式：**只传路径**。理解走哪条路由
+#: ``agent.imageVisionSubagent`` 开关决定：
+#:
+#: * 关（默认）—— read_image → 识图槽文字描述，与其它工具同一条路；
+#: * 开 —— 第一步先规划，再用 subagent_delegate 委派识图子代理
+#:   （用子代理自己的模型看图）。
+IMAGE_SLOT_DISCIPLINE = (
     "\n\n【图片处理】图片不会直接把像素放进你的上下文，你只会拿到图片的"
-    "**路径与尺寸**。需要看懂图片时，按下面的优先级处理："
-    "① 如果消息里指名了识图子代理，用 subagent_delegate 把「看图」这件事"
-    "交给它（它自带识图技能/视觉模型），task 里原样带上图片路径，让它调用"
-    "read_image 并回报图像内容；② 否则用 read_image 工具（会把图片交给"
-    "「识图」模型，返回文字描述）。若两者都提示无法读取，就如实告诉用户去"
+    "**路径与尺寸**。需要看懂图片时，用 read_image 工具（会把图片交给"
+    "「识图」模型，返回文字描述）。若提示无法读取，就如实告诉用户去"
     " 设置 → 模型服务 → 用途分槽 配置「识图」模型，或请用户用文字描述图片，"
     "**不要凭路径猜测图片内容**。"
+)
+
+IMAGE_SUBAGENT_DISCIPLINE = (
+    "\n\n【图片处理】图片不会直接把像素放进你的上下文，你只会拿到图片的"
+    "**路径与尺寸**。需要看懂图片时，第一步先规划这一步做什么、交给谁，"
+    "再用 subagent_delegate 委派给识图子代理（用子代理自己的模型看图），"
+    "task 里原样带上图片路径，让它调用 read_image 并回报图像内容。"
+    "若委派失败或没有识图子代理，退回 read_image；两者都无法读取时如实"
+    "告诉用户，**不要凭路径猜测图片内容**。"
 )
 
 IMAGE_INLINE_DISCIPLINE = (
@@ -147,12 +161,29 @@ IMAGE_INLINE_DISCIPLINE = (
 
 
 def image_context_discipline(store: SettingsStore) -> str:
-    """按 ``agent.imageContextMode`` 选择图片纪律文案。"""
+    """按 ``agent.imageContextMode`` 与 ``agent.imageVisionSubagent`` 选图片纪律。"""
     try:
         mode = str(store.agent_config().get("imageContextMode") or "path").lower()
     except Exception:  # pragma: no cover - settings unreadable
         mode = "path"
-    return IMAGE_INLINE_DISCIPLINE if mode == "inline" else IMAGE_PATH_DISCIPLINE
+    if mode == "inline":
+        return IMAGE_INLINE_DISCIPLINE
+    try:
+        via_subagent = bool(store.agent_config().get("imageVisionSubagent") or False)
+    except Exception:  # pragma: no cover
+        via_subagent = False
+    return IMAGE_SUBAGENT_DISCIPLINE if via_subagent else IMAGE_SLOT_DISCIPLINE
+
+
+#: 子代理助理开启时的协作纪律：接手多步任务时**第一步先规划代办**，再把
+#: 合适的条目分配给子代理执行 —— 不一股脑全委派，也不全部自己扛。
+SUBAGENT_PLAN_DISCIPLINE = (
+    "\n\n【子代理协作】子代理助理已开启。接手超过一步的任务时，第一步先"
+    "**规划代办清单**：把目标拆成可验证的条目，逐一判断哪些适合委派给哪个"
+    "子代理（技能/工具对口的才派），哪些自己直接做；委派时用 subagent_delegate，"
+    "task 写清目标、边界与所需上下文。执行中按清单逐项推进并交代进展，"
+    "不要把所有事都推给子代理，也不要明明对口却全部自己扛。"
+)
 
 
 def _model_for(provider_type: str, model_id: str) -> LLMModel | None:
@@ -257,13 +288,7 @@ def build_chat_setup(  # noqa: ANN201
     runtime = AgentRuntime(tools=tools, chunk_sink=chunk_sink)
     image_mode = str(agent_cfg.get("imageContextMode") or "path")
     options = AgentRuntimeOptions(
-        system_prompt=(
-            identity.persona
-            + RETRIEVAL_DISCIPLINE
-            + (IMAGE_INLINE_DISCIPLINE if image_mode == "inline"
-               else IMAGE_PATH_DISCIPLINE)
-            + active_skills_block(store)
-        ),
+        system_prompt=identity_system_prompt(store),
         max_turns=int(agent_cfg.get("maxToolSteps") or MAX_AGENT_TURNS),
         thinking_level=(
             ThinkingLevel.HIGH if agent_cfg.get("deepThinking") else ThinkingLevel.OFF

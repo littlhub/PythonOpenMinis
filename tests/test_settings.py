@@ -747,13 +747,13 @@ def test_image_max_edge_clamped(store):
 def test_image_context_discipline_switches_with_mode(store):
     from openminis.settings.chat_service import (
         IMAGE_INLINE_DISCIPLINE,
-        IMAGE_PATH_DISCIPLINE,
+        IMAGE_SLOT_DISCIPLINE,
         image_context_discipline,
         identity_system_prompt,
     )
 
-    assert image_context_discipline(store) == IMAGE_PATH_DISCIPLINE
-    assert IMAGE_PATH_DISCIPLINE in identity_system_prompt(store)
+    assert image_context_discipline(store) == IMAGE_SLOT_DISCIPLINE
+    assert IMAGE_SLOT_DISCIPLINE in identity_system_prompt(store)
     store.apply_full({"agent": {"imageContextMode": "inline"}})
     assert image_context_discipline(store) == IMAGE_INLINE_DISCIPLINE
 

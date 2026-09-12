@@ -1297,6 +1297,7 @@ export function AgentConfigPage(props: { onBack: () => void }) {
     deepThinking: boolean
     subagentEnabled?: boolean
     imageContextMode?: 'path' | 'inline'
+    imageVisionSubagent?: boolean
     imageMaxEdge?: number
   } | null>(null)
   const [loading, setLoading] = useState(true)
@@ -1450,25 +1451,29 @@ export function AgentConfigPage(props: { onBack: () => void }) {
 
           <SectionCard
             title="图片处理"
-            hint="图片的上下文开销随像素增长：默认只把「路径」记进上下文，看懂图片交给识图槽；最大边长可调，用来压住开销。"
+            hint="图片的上下文开销随像素增长：固定只把「路径」记进上下文，看懂图片走「识图」模型；要换子代理的模型看图可打开下方开关。"
           >
             <div className="provider-fields">
-              <label className="wide">
-                <span>图片进上下文方式</span>
-                <select
-                  value={cfg.imageContextMode ?? 'path'}
-                  onChange={(e) =>
-                    setCfg({ ...cfg, imageContextMode: e.target.value as 'path' | 'inline' })
-                  }
-                >
-                  <option value="path">只传路径（默认，省上下文）</option>
-                  <option value="inline">直接传图片（多模态主模型直读）</option>
-                </select>
-                <span className="muted" style={{ fontSize: 12 }}>
-                  只传路径：上下文里只有路径+尺寸，需要看图时由「识图」模型返回文字描述，
-                  或交给子代理代办；直接传图片：多模态主模型能直接看图，但 base64 会长期占用上下文。
-                </span>
-              </label>
+              <div
+                className="cfg-row"
+                style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '4px 0' }}
+              >
+                <label className="skill-toggle" title="识图走子代理">
+                  <input
+                    type="checkbox"
+                    checked={cfg.imageVisionSubagent ?? false}
+                    onChange={(e) => setCfg({ ...cfg, imageVisionSubagent: e.target.checked })}
+                  />
+                  <span className="skill-toggle-track" />
+                </label>
+                <div>
+                  <div style={{ fontWeight: 600 }}>识图走子代理</div>
+                  <div className="muted" style={{ fontSize: 12 }}>
+                    开启后看图由主 Agent 委派给识图子代理（用子代理自己的模型）；
+                    关闭时用 read_image 走「识图」槽，跟其它工具同一条路
+                  </div>
+                </div>
+              </div>
               <label className="wide">
                 <span>图片最大边长（像素）</span>
                 <input

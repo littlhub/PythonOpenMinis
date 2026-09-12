@@ -473,9 +473,9 @@ async def run_subagent(
     runtime = AgentRuntime(tools=inner_tools)  # 内层循环静默，不往外推流
     messages: list[LLMMessage] = [LLMMessage(LLMMessage.Role.USER, task)]
     try:
-        # 子代理内部一律按 inline 处理图片：带 read_image 的子代理（识图类）
-        # 必须真的拿到像素，否则它也只是拿到一个路径、什么也说不出。它的
-        # 产出是**文字**，回到主 agent 上下文时依然只有文字，不会带图。
+        # 「识图走子代理」的语义就是**用子代理自己的模型看图**：内部一律按
+        # inline 处理。模型若声明了图片输入，像素直达；没声明则 provider 会
+        # 换成「图省略」占位，子代理会如实报告看不到 —— 不猜。
         with image_caller_scope("inline"):
             _, stop_reason = await runtime.run(
                 provider,

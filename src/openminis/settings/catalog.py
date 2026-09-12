@@ -582,18 +582,19 @@ async def _read_image_with_vision(args_json: str, session_id: str, **_kw):
 
     desc: str | None = None
     try:
-        from .vision_service import describe_image
+        from .vision_service import describe_image_with_fallback
 
         try:
             prompt = str(json.loads(args_json).get("prompt") or "")
         except Exception:  # pragma: no cover - args already validated upstream
             prompt = ""
-        desc = await describe_image(
+        desc = await describe_image_with_fallback(
             store,
             result.image_data,
             result.image_mime_type or "image/jpeg",
             prompt=prompt,
             image_path=result.image_file_path,
+            session_id=session_id,
         )
     except Exception:  # pragma: no cover - never break the loop over this
         logger.debug("read_image vision routing failed", exc_info=True)

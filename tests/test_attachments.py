@@ -123,10 +123,8 @@ def test_path_mode_keeps_only_path(store, workspace):
     assert "read_image" in bundle.prompt
 
 
-def test_path_mode_tells_main_agent_to_delegate_vision(store, workspace):
-    """path 模式：不把图交给后端，而是**指路**给识图子代理。"""
-    from openminis.agent.subagents import upsert_subagent
-
+def test_path_mode_points_to_read_image(store, workspace):
+    """path 模式（默认）：提示指向 read_image（识图槽），不提子代理。"""
     png = _png(workspace / "uploads" / "p.png")
     store.apply_full({
         "providers": [{"id": "gw", "type": "openAI", "apiKey": "k",
@@ -134,17 +132,48 @@ def test_path_mode_tells_main_agent_to_delegate_vision(store, workspace):
         "activeProviderId": "gw",
         "agent": {"imageContextMode": "path"},
     })
+    bundle = _ctx(store, workspace, f"这是啥 ![p.png]({png.as_posix()})")
+    assert bundle.image_parts == []
+    assert png.as_posix() in bundle.prompt
+    assert "read_image" in bundle.prompt
+    assert "subagent_delegate" not in bundle.prompt
+    assert "base64" not in bundle.prompt
+
+
+def test_vision_subagent_toggle_routes_hint(store, workspace):
+    """开启「识图走子代理」：提示改成委派识图子代理（带规划要求）。"""
+    from openminis.agent.subagents import upsert_subagent
+
+    png = _png(workspace / "uploads" / "p.png")
+    store.apply_full({
+        "providers": [{"id": "gw", "type": "openAI", "apiKey": "k",
+                       "model": "gpt-4o", "baseUrl": ""}],
+        "activeProviderId": "gw",
+        "agent": {"imageContextMode": "path", "imageVisionSubagent": True},
+    })
     upsert_subagent(store, {
         "id": "vision-bot", "name": "识图助手", "emoji": "👁️",
         "providerId": "gw", "providerType": "openAI", "model": "gpt-4o",
         "tools": ["read_image"], "skills": ["visioncustom"], "maxRounds": 4,
     })
     bundle = _ctx(store, workspace, f"这是啥 ![p.png]({png.as_posix()})")
-    assert bundle.image_parts == []
-    assert png.as_posix() in bundle.prompt
-    # 后端**不**抢着描述图，只让主 agent 自己委派
     assert "subagent_delegate" in bundle.prompt
     assert "vision-bot" in bundle.prompt
+    assert "先规划" in bundle.prompt
+
+
+def test_vision_subagent_toggle_falls_back_without_subagent(store, workspace):
+    """开关开了但没配识图子代理：退回 read_image 提示，不空指路。"""
+    png = _png(workspace / "uploads" / "p.png")
+    store.apply_full({
+        "providers": [{"id": "gw", "type": "openAI", "apiKey": "k",
+                       "model": "gpt-4o", "baseUrl": ""}],
+        "activeProviderId": "gw",
+        "agent": {"imageContextMode": "path", "imageVisionSubagent": True},
+    })
+    bundle = _ctx(store, workspace, f"这是啥 ![p.png]({png.as_posix()})")
+    assert "read_image" in bundle.prompt
+    assert "subagent_delegate" not in bundle.prompt
 
 
 def test_path_mode_falls_back_to_read_image_without_subagent(store, workspace):
@@ -162,7 +191,8 @@ def test_path_mode_falls_back_to_read_image_without_subagent(store, workspace):
     assert "base64" not in bundle.prompt
 
 
-def test_path_mode_says_so_when_no_vision_available(store, workspace):
+def test_hint_still_points_to_read_image_without_vision_slot(store, workspace):
+    """没配识图槽也不再替 read_image 预判 —— 工具自己会回可读的说明。"""
     png = _png(workspace / "uploads" / "p.png")
     store.apply_full({
         "providers": [{"id": "gw", "type": "openAI", "apiKey": "k",
@@ -171,7 +201,8 @@ def test_path_mode_says_so_when_no_vision_available(store, workspace):
         "agent": {"imageContextMode": "path"},
     })
     bundle = _ctx(store, workspace, f"这是啥 ![p.png]({png.as_posix()})")
-    assert "无法看到图片内容" in bundle.prompt
+    assert "read_image" in bundle.prompt
+    assert "无法看到图片内容" not in bundle.prompt
 
 
 def test_inline_mode_attaches_bytes_but_not_base64_text(store, workspace):

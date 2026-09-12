@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+import time
+
 from typing import Any
 
 from ..core.logging import get_logger
@@ -33,6 +35,26 @@ __all__ = ["describe_image", "vision_slot_ready"]
 
 #: 单次描述调用的输出上限 —— 描述用不着很长，限制它也就限制了费用。
 _MAX_OUTPUT_TOKENS = 2048
+
+#: 连续失败冷却：识图槽连续失败这么多次后进入冷却，冷却期内不再真正调用
+#: provider（多为 429 限流，重试只会火上浇油），直接回「别再试」的提示。
+_FAIL_STREAK_LIMIT = 2
+_COOLDOWN_SECONDS = 30.0
+
+_fail_state = {"streak": 0, "ts": 0.0}
+
+
+def _cooldown_active() -> bool:
+    return _fail_state["streak"] >= _FAIL_STREAK_LIMIT and (
+        time.monotonic() - _fail_state["ts"]
+    ) < _COOLDOWN_SECONDS
+
+
+def _no_retry_note() -> str:
+    return (
+        f"（识图服务已连续失败 {_fail_state['streak']} 次，通常是模型限流；"
+        "请**停止重试** read_image，先把已有信息回答给用户，并建议稍后再试。）"
+    )
 
 
 def vision_slot_ready(store: Any) -> bool:
@@ -53,6 +75,67 @@ def _build_vision_provider(store: Any, conf: dict[str, Any], model_id: str):
     from .chat_service import build_provider
 
     return build_provider(str(conf.get("id") or ""), {**conf, "model": model_id})
+
+
+#: describe_image 失败时 failure_text 里的可识别标记 —— 用来判断「这条路没走通」。
+_FAILURE_MARKERS = (
+    "调用失败",
+    "无法初始化",
+    "返回了空描述",
+    "未重试",
+    "冷却期",
+)
+
+
+async def _describe_via_subagent(
+    store: Any,
+    image_path: str | None,
+    prompt: str,
+    session_id: str,
+) -> str | None:
+    """换一条路：委派识图子代理（子代理绑定的是**另一个**识图模型）。
+
+    子代理内部按 inline 跑 ``read_image``，像素直达它自己的模型；产出是
+    文字，回到主上下文时不带图。没配识图子代理或子代理没拿到路径时返回
+    ``None``，调用方保留原 failure 文本。
+    """
+    if not image_path:
+        return None
+    try:
+        from ..agent.subagents import find_vision_subagent, run_subagent
+
+        sid = find_vision_subagent(store)
+        if not sid:
+            return None
+        ask = f"请用 read_image 查看图片 {image_path}，然后完整描述图片内容。"
+        if prompt.strip():
+            ask += f"\n用户重点关注：{prompt.strip()}"
+        out = await run_subagent(store, sid, ask, session_id or "vision-fallback")
+        return out or None
+    except Exception:
+        logger.debug("vision fallback via subagent failed", exc_info=True)
+        return None
+
+
+async def describe_image_with_fallback(
+    store: Any,
+    image_bytes: bytes,
+    mime_type: str,
+    *,
+    prompt: str = "",
+    image_path: str | None = None,
+    session_id: str = "",
+) -> str | None:
+    """识图槽失败/没配 → 自动切识图子代理（不同的识图模型）；两路都不通
+    则返回原 failure 文本。"""
+    text = await describe_image(
+        store, image_bytes, mime_type, prompt=prompt, image_path=image_path
+    )
+    failed = text is None or any(m in (text or "") for m in _FAILURE_MARKERS)
+    if not failed:
+        return text
+    sub = await _describe_via_subagent(store, image_path, prompt, session_id)
+    return sub or text
 
 
 async def describe_image(
@@ -87,6 +170,10 @@ async def describe_image(
         )
 
     ask = prompt.strip() or DESCRIBE_PROMPT
+    if _cooldown_active():
+        return VisionGroupResolver.failure_text(
+            f"{model_id} 刚刚连续失败（多为限流），冷却期内本次未重试。" + _no_retry_note()
+        )
     try:
         resp = await provider.send_message(
             [LLMMessage(LLMMessage.Role.USER, ask)],
@@ -98,11 +185,15 @@ async def describe_image(
             thinking_level=ThinkingLevel.OFF,
         )
     except Exception as exc:
+        _fail_state["streak"] += 1
+        _fail_state["ts"] = time.monotonic()
         logger.warning("vision describe failed (%s): %s", model_id, exc)
+        note = _no_retry_note() if _fail_state["streak"] >= _FAIL_STREAK_LIMIT else ""
         return VisionGroupResolver.failure_text(
-            f"{model_id} 调用失败（{type(exc).__name__}: {exc}）"
+            f"{model_id} 调用失败（{type(exc).__name__}: {exc}）{note}"
         )
 
+    _fail_state["streak"] = 0
     text = (getattr(resp, "text", "") or "").strip()
     if not text:
         return VisionGroupResolver.failure_text(f"{model_id} 返回了空描述")

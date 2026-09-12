@@ -89,6 +89,9 @@ def _defaults() -> dict[str, Any]:
             # 工具既不出现在 schema 里,也无法执行 —— 主模型直接自己干活。
             "subagentEnabled": True,
             "imageContextMode": "path",
+            # 看图走哪条路：False(默认)=read_image 走「识图」槽（与其它工具
+            # 同一条路）；True=主 Agent 委派识图子代理（用子代理自己的模型看图）。
+            "imageVisionSubagent": False,
             "imageMaxEdge": 2000,
         },
     }
@@ -503,7 +506,7 @@ class SettingsStore:
                         except (TypeError, ValueError):
                             errors.append(f"agent.{key} 必须是整数")
                 # 布尔开关(深度思考 / 子代理助理)—— 宽松解析,非布尔按真假字符串判。
-                for bkey in ("deepThinking", "subagentEnabled"):
+                for bkey in ("deepThinking", "subagentEnabled", "imageVisionSubagent"):
                     if bkey in raw:
                         bv = raw[bkey]
                         agent[bkey] = (
