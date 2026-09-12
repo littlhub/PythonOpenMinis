@@ -47,11 +47,14 @@ def test_other_tool_in_between_resets_streak():
 
 
 def test_normal_tool_not_guarded():
+    """Non-poll / non-query / non-effect tools with changing args stay
+    unguarded by the generic-repeat rule. (shell_execute is now an *effect*
+    tool with its own run-away backstop — covered in test_loop_effect_guard.)"""
     d = ToolLoopDetector()
     for i in range(15):
-        d.record("shell_execute", {"command": f"echo {i}"},
-                 result=f"out-{i}", tool_call_id=f"s{i}")
-    r = d.check("shell_execute", {"command": "echo done"})
+        d.record("memory_write", {"scope": "wiki", "topic": f"t{i}", "content": f"c{i}"},
+                 result=f"saved-{i}", tool_call_id=f"w{i}")
+    r = d.check("memory_write", {"scope": "wiki", "topic": "next", "content": "c"})
     assert r.level == LoopLevel.NONE
 
 

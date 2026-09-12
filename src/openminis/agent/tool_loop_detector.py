@@ -56,6 +56,9 @@ class ToolCallRecord:
     unknown_tool_name: Optional[str] = None
     tool_call_id: Optional[str] = None
     timestamp: int = 0
+    #: True=执行成功（无 error_message）。effect-tool 重复判定需要区分
+    #: 「成功后再跑一遍」与「失败后合理重试」。
+    ok: Optional[bool] = None
 
 
 class LoopLevel(Enum):
@@ -105,6 +108,19 @@ class ToolLoopConfig:
     )
     query_warning_threshold: int = 5
     query_critical_threshold: int = 10
+    #: 产出型（effect）工具：执行成功本身就会改变外部世界（生图/发消息/写
+    #: 命令产物）。参数完全相同的重复执行只会产出重复产物，比「查询空转」
+    #: 更浪费，因此用远低于查询工具的阈值：成功后第 2 次重复警告、第 3 次
+    #: 拦截。失败后的重试不受影响（ok=False 的记录会打断连续计数）。
+    effect_tools: tuple[str, ...] = ("shell_execute", "send")
+    effect_repeat_warning: int = 1
+    effect_repeat_critical: int = 2
+    #: effect 工具「任意参数」连续执行兜底：连发多张不同图属正常（4 张内
+    #: 不打扰）。硬拦截阈值必须高于 auto wrap-up（≤12 轮）——纯「只有工具
+    #: 没有文本」的空转优先走带总结的收尾路径，这个兜底只负责「有文本但
+    #: 仍在反复跑命令」的残余场景。
+    effect_run_warning: int = 6
+    effect_run_critical: int = 14
 
 
 class ToolLoopDetector:
@@ -204,7 +220,54 @@ class ToolLoopDetector:
                 return LoopCheckResult(LoopLevel.WARNING, msg,
                                        f"repeat:{tool_name}:{args_hash}")
 
-        # 5. query_tool_runaway — memory_get / web_search / web_fetch called
+        # 5. effect_tool_repeat — 产出型工具（shell_execute/send）同参数
+        #    且上一次已成功：重复执行只产重复产物。第 2 次警告、第 3 次拦截。
+        #    注意每次生图输出内容（文件名/时间戳）都不同，result 系规则
+        #    （no_progress）永远看不到「无进展」，必须只看参数与 ok。
+        if tool_name in self.config.effect_tools:
+            streak = self._consecutive_effect_success_streak(tool_name, args_hash)
+            if streak >= self.config.effect_repeat_critical:
+                msg = (
+                    f"[LOOP BLOCKED] CRITICAL: 同一条 {tool_name} 命令（参数完全相同）"
+                    f"已成功执行过 {streak} 次并再次被请求。任务产物已经生成，"
+                    "重复执行只会产生重复结果。不要再次执行——直接引用已有产出，"
+                    "向用户总结收尾。"
+                )
+                logger.warning("CRITICAL effect_tool_repeat tool=%s streak=%s",
+                               tool_name, streak)
+                return LoopCheckResult(LoopLevel.CRITICAL, msg)
+            if streak >= self.config.effect_repeat_warning:
+                msg = (
+                    f"[LOOP WARNING] 同一条 {tool_name} 命令（参数完全相同）刚刚已"
+                    "成功执行过，产物已生成，重复执行只会得到重复结果。若任务已"
+                    "完成请立即总结收尾；确需重跑请修改参数并说明原因。"
+                )
+                logger.debug("WARNING effect_tool_repeat tool=%s streak=%s",
+                             tool_name, streak)
+                return LoopCheckResult(LoopLevel.WARNING,
+                                       msg, f"effect:{tool_name}:{args_hash}")
+            run_streak = self._consecutive_effect_run_streak(tool_name)
+            if run_streak >= self.config.effect_run_critical:
+                msg = (
+                    f"[LOOP BLOCKED] CRITICAL: {tool_name} 已连续执行 {run_streak} 次。"
+                    "任务大概率已完成，停止执行，对照已有产出总结收尾。"
+                )
+                logger.warning("CRITICAL effect_tool_runaway tool=%s streak=%s",
+                               tool_name, run_streak)
+                return LoopCheckResult(LoopLevel.CRITICAL, msg)
+            if run_streak >= self.config.effect_run_warning:
+                msg = (
+                    f"[LOOP WARNING] {tool_name} 已连续执行 {run_streak} 次。"
+                    "先自检：目标是否已全部完成？完成就立即总结收尾，"
+                    "不要继续执行同类命令。"
+                )
+                key = "effectrun:" + tool_name
+                if self._should_emit_warning(key, run_streak):
+                    logger.debug("WARNING effect_tool_runaway tool=%s streak=%s",
+                                 tool_name, run_streak)
+                    return LoopCheckResult(LoopLevel.WARNING, msg, key)
+
+        # 6. query_tool_runaway — memory_get / web_search / web_fetch called
         #    many times in a row *regardless of arguments*. Identical-args
         #    detection (rules 2-4) never fires here because the model shuffles
         #    keywords each call, yet the survey makes no progress — exactly the
@@ -268,6 +331,40 @@ class ToolLoopDetector:
                 break
         return streak
 
+    def _consecutive_effect_success_streak(self, tool_name: str, args_hash: str) -> int:
+        """Count trailing *successful* records with identical (tool, args).
+
+        A failed run (ok=False) resets the count — retrying after failure is
+        legitimate. Records of other tools also reset it: the effect-tool rule
+        only targets back-to-back duplication.
+        """
+        streak = 0
+        for rec in reversed(self._history):
+            if rec.unknown_tool_name is not None:
+                break
+            if rec.tool_name != tool_name or rec.args_hash != args_hash:
+                break
+            if rec.ok is False:
+                break
+            streak += 1
+        return streak
+
+    def _consecutive_effect_run_streak(self, tool_name: str) -> int:
+        """Count trailing records of the same effect tool, *any* args.
+
+        Backstop for near-identical commands whose args differ by a digit
+        (e.g. a timestamp), which exact-hash matching never sees.
+        """
+        streak = 0
+        for rec in reversed(self._history):
+            if rec.unknown_tool_name is not None:
+                break
+            if rec.tool_name == tool_name:
+                streak += 1
+            else:
+                break
+        return streak
+
     # ─── after-execution hook ───────────────────────────────────────────────
     def record(
         self,
@@ -292,6 +389,7 @@ class ToolLoopDetector:
             result_hash=result_hash,
             unknown_tool_name=unknown_tool,
             tool_call_id=tool_call_id,
+            ok=error_message is None,
         ))
         while len(self._history) > self.config.history_size:
             self._history.popleft()
