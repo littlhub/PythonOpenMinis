@@ -401,31 +401,99 @@ class AgentRuntime:
                     blocked_rounds += 1
                     if blocked_rounds >= 2:
                         # Hard stop: the model kept calling the same tool even
-                        # after a CRITICAL block. Make one final no-tools call
-                        # so it wraps up with what it already has, instead of
-                        # burning rounds until MAX_AGENT_TURNS.
+                        # after a CRITICAL block. Two finishing passes:
+                        # ① send-only round — deliver an already-generated
+                        #    artefact (image/file) to the user if not yet sent;
+                        # ② no-tools round — text summary so the turn closes
+                        #    with an answer instead of a bare stop marker.
                         messages.append(LLMMessage(
                             LLMMessage.Role.USER,
-                            "[loop protection] Repeated calls to the same tool are no longer bringing new information. "
-                            "Please ignore tool calls, directly organize the information already obtained and reply to the user; "
-                            "if it is indeed impossible to proceed, please clearly state what additional input is still needed.",
+                            "[loop protection] Repeated calls to the same tool are no longer allowed. "
+                            "Do NOT repeat any generation/execution command. If the task "
+                            "artefact (image/file) has been generated but not yet sent, "
+                            "first call the send tool to deliver it; otherwise reply "
+                            "directly with a text summary of what was accomplished.",
                         ))
-                        wrap_up: list[str] = []
-                        stream = provider.stream_message(
-                            messages,
-                            opts.system_prompt,
-                            opts.max_tokens,
-                            opts.temperature,
-                            tools=None,
-                            thinking_level=opts.thinking_level,
-                        )
-                        async for chunk in stream:
-                            await self._emit(chunk)
-                            if isinstance(chunk, LLMStreamChunk.Text):
-                                wrap_up.append(chunk.text)
-                        summary = "".join(wrap_up).strip() or (
-                            "Task interrupted: tool calls fell into a loop, and no new progress was made."
-                        )
+                        summary: Optional[str] = None
+                        finish_defs = self.tool_definitions(include={"send"}) or None
+                        for pass_tools in (finish_defs, None):
+                            wrap_text: list[str] = []
+                            wrap_calls: list[ToolUse] = []
+                            stream = provider.stream_message(
+                                messages,
+                                opts.system_prompt,
+                                opts.max_tokens,
+                                opts.temperature,
+                                tools=pass_tools,
+                                thinking_level=opts.thinking_level,
+                            )
+                            async for chunk in stream:
+                                await self._emit(chunk)
+                                if isinstance(chunk, LLMStreamChunk.Text):
+                                    wrap_text.append(chunk.text)
+                                elif isinstance(chunk, LLMStreamChunk.ToolCallComplete):
+                                    wrap_calls.append(ToolUse(
+                                        id=chunk.id or f"toolu_{time.time_ns()}",
+                                        name=chunk.name,
+                                        input=chunk.args or {},
+                                    ))
+                            wrap_joined = "".join(wrap_text).strip()
+                            assistant_parts: list = []
+                            if wrap_joined:
+                                assistant_parts.append(Text(wrap_joined))
+                            assistant_parts.extend(wrap_calls)
+                            if not assistant_parts:
+                                break
+                            messages.append(LLMMessage(
+                                LLMMessage.Role.ASSISTANT,
+                                "",
+                                content_parts=assistant_parts,
+                            ))
+                            if not wrap_calls:
+                                summary = wrap_joined
+                                break
+                            # 产物投递：只执行 send，其余一律拒掉
+                            finish_results: list[ToolResult] = []
+                            for tu in wrap_calls:
+                                if tu.name == "send" and tu.name in self.tools:
+                                    try:
+                                        result = await self.tools[tu.name].executor(
+                                            json.dumps(tu.input, ensure_ascii=False),
+                                            session_id,
+                                            **({"env": session_user_env}
+                                               if session_user_env else {}),
+                                        )
+                                    except Exception as exc:
+                                        result = ToolExecutionResult(
+                                            f"[tool error: {type(exc).__name__}] {exc}",
+                                            False, tool_title=tu.name,
+                                        )
+                                    finish_results.append(ToolResult(
+                                        id=tu.id, name=tu.name,
+                                        content=result.output,
+                                        is_error=not result.success,
+                                    ))
+                                else:
+                                    finish_results.append(ToolResult(
+                                        id=tu.id, name=tu.name,
+                                        content="[loop protection] 收尾阶段只允许 send。",
+                                        is_error=True,
+                                    ))
+                                await self._emit(LLMStreamChunk.ToolResult(
+                                    id=tu.id, name=tu.name,
+                                    content=finish_results[-1].content,
+                                    is_error=finish_results[-1].is_error,
+                                ))
+                            messages.append(LLMMessage(
+                                LLMMessage.Role.USER,
+                                "",
+                                content_parts=finish_results,
+                            ))
+                        if summary is None:
+                            summary = (
+                                "任务已收尾：重复的工具调用被拦截，"
+                                "以上是已完成的产出。"
+                            )
                         messages.append(LLMMessage(
                             LLMMessage.Role.ASSISTANT, summary,
                         ))

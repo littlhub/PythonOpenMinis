@@ -109,12 +109,11 @@ class ToolLoopConfig:
     query_warning_threshold: int = 5
     query_critical_threshold: int = 10
     #: 产出型（effect）工具：执行成功本身就会改变外部世界（生图/发消息/写
-    #: 命令产物）。参数完全相同的重复执行只会产出重复产物，比「查询空转」
-    #: 更浪费，因此用远低于查询工具的阈值：成功后第 2 次重复警告、第 3 次
-    #: 拦截。失败后的重试不受影响（ok=False 的记录会打断连续计数）。
+    #: 命令产物）。参数完全相同的再次执行只会产出重复产物，用户预期是
+    #: 「一张就停」：成功后第 2 次原样重跑直接拦截。失败后的重试不受影响
+    #: （ok=False 的记录会打断连续计数）。
     effect_tools: tuple[str, ...] = ("shell_execute", "send")
-    effect_repeat_warning: int = 1
-    effect_repeat_critical: int = 2
+    effect_repeat_critical: int = 1
     #: effect 工具「任意参数」连续执行兜底：连发多张不同图属正常（4 张内
     #: 不打扰）。硬拦截阈值必须高于 auto wrap-up（≤12 轮）——纯「只有工具
     #: 没有文本」的空转优先走带总结的收尾路径，这个兜底只负责「有文本但
@@ -221,7 +220,7 @@ class ToolLoopDetector:
                                        f"repeat:{tool_name}:{args_hash}")
 
         # 5. effect_tool_repeat — 产出型工具（shell_execute/send）同参数
-        #    且上一次已成功：重复执行只产重复产物。第 2 次警告、第 3 次拦截。
+        #    且上一次已成功：重复执行只产重复产物，第 2 次原样重跑直接拦截。
         #    注意每次生图输出内容（文件名/时间戳）都不同，result 系规则
         #    （no_progress）永远看不到「无进展」，必须只看参数与 ok。
         if tool_name in self.config.effect_tools:
@@ -229,23 +228,13 @@ class ToolLoopDetector:
             if streak >= self.config.effect_repeat_critical:
                 msg = (
                     f"[LOOP BLOCKED] CRITICAL: 同一条 {tool_name} 命令（参数完全相同）"
-                    f"已成功执行过 {streak} 次并再次被请求。任务产物已经生成，"
-                    "重复执行只会产生重复结果。不要再次执行——直接引用已有产出，"
-                    "向用户总结收尾。"
+                    f"已成功执行过 {streak} 次，产物已经生成，本次调用已被拦截。"
+                    "重复执行只会产生重复结果，不要再次执行——"
+                    "直接引用已有产出，向用户总结收尾。"
                 )
                 logger.warning("CRITICAL effect_tool_repeat tool=%s streak=%s",
                                tool_name, streak)
                 return LoopCheckResult(LoopLevel.CRITICAL, msg)
-            if streak >= self.config.effect_repeat_warning:
-                msg = (
-                    f"[LOOP WARNING] 同一条 {tool_name} 命令（参数完全相同）刚刚已"
-                    "成功执行过，产物已生成，重复执行只会得到重复结果。若任务已"
-                    "完成请立即总结收尾；确需重跑请修改参数并说明原因。"
-                )
-                logger.debug("WARNING effect_tool_repeat tool=%s streak=%s",
-                             tool_name, streak)
-                return LoopCheckResult(LoopLevel.WARNING,
-                                       msg, f"effect:{tool_name}:{args_hash}")
             run_streak = self._consecutive_effect_run_streak(tool_name)
             if run_streak >= self.config.effect_run_critical:
                 msg = (

@@ -13,13 +13,14 @@ from openminis.agent.tool_loop_detector import (
 GEN_ARGS = {"command": 'python scripts/image_generation.py "queen" --size 1024x1536'}
 
 
-def test_second_identical_success_warns():
+def test_second_identical_success_blocks():
+    """「一张就停」：成功后第 2 次原样重跑直接拦截。"""
     d = ToolLoopDetector()
     d.record("shell_execute", GEN_ARGS, result="saved 20260912_x.png",
              tool_call_id="g1")
     r = d.check("shell_execute", GEN_ARGS)
-    assert r.level == LoopLevel.WARNING
-    assert "重复" in (r.message or "")
+    assert r.level == LoopLevel.CRITICAL
+    assert "LOOP BLOCKED" in (r.message or "")
 
 
 def test_third_identical_success_blocks():
@@ -92,4 +93,4 @@ def test_send_tool_guarded_too():
     d.record("send", {"path": "a.png", "text": "图"}, result="sent",
              tool_call_id="s1")
     r = d.check("send", {"path": "a.png", "text": "图"})
-    assert r.level == LoopLevel.WARNING
+    assert r.level == LoopLevel.CRITICAL
