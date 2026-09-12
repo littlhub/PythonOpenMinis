@@ -448,7 +448,13 @@ export function ChatView({
             </button>
           </div>
         )}
-        <MessageList messages={messages} />
+        <MessageList
+          messages={messages}
+          sessionId={activeSessionId}
+          onDeleted={(mid) =>
+            setMessages((prev) => prev.filter((m) => m.id !== mid))
+          }
+        />
         {socketState !== 'open' && (
           <div className={`chat-sockpill chat-sockpill--${socketState}`}>
             {socketState === 'connecting' && '连接已断开,正在重连…'}
@@ -486,7 +492,15 @@ export function ChatView({
 }
 
 // ---------------------------------------------------------------------------
-function MessageList({ messages }: { messages: UiMessage[] }) {
+function MessageList({
+  messages,
+  sessionId,
+  onDeleted,
+}: {
+  messages: UiMessage[]
+  sessionId: string | null
+  onDeleted: (messageId: string) => void
+}) {
   const scrollerRef = useRef<HTMLDivElement | null>(null)
   useEffect(() => {
     const el = scrollerRef.current
@@ -498,18 +512,68 @@ function MessageList({ messages }: { messages: UiMessage[] }) {
         <div className="chat-empty">还没有消息,从下方输入框开始对话。</div>
       )}
       {messages.map((m) => (
-        <Bubble key={m.id} msg={m} />
+        <Bubble key={m.id} msg={m} sessionId={sessionId} onDeleted={onDeleted} />
       ))}
     </div>
   )
 }
 
-function Bubble({ msg }: { msg: UiMessage }) {
+function Bubble({
+  msg,
+  sessionId,
+  onDeleted,
+}: {
+  msg: UiMessage
+  sessionId: string | null
+  onDeleted: (messageId: string) => void
+}) {
   const { text, images, files } = useMemo(() => splitAttachments(msg.text), [msg.text])
+  const [copied, setCopied] = useState(false)
+  const [deleting, setDeleting] = useState(false)
+
+  const copyText = async () => {
+    try {
+      await navigator.clipboard.writeText(msg.text)
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1200)
+    } catch {
+      /* 剪贴板不可用时静默（无痕模式等） */
+    }
+  }
+  const deleteMsg = async () => {
+    if (!sessionId || deleting) return
+    setDeleting(true)
+    try {
+      await api.chatDeleteMessage(sessionId, msg.id)
+      onDeleted(msg.id)
+    } catch (e) {
+      console.warn('delete message failed', e)
+      setDeleting(false)
+    }
+  }
   return (
     <div className={`bubble ${msg.role}`}>
-      <div className="bubble-role">
-        {msg.role === 'user' ? '你' : '助手'}
+      <div className="bubble-head">
+        <div className="bubble-role">
+          {msg.role === 'user' ? '你' : '助手'}
+        </div>
+        <div className="bubble-actions">
+          <button
+            className="bubble-act"
+            title="复制"
+            onClick={() => void copyText()}
+          >
+            {copied ? '已复制' : '复制'}
+          </button>
+          <button
+            className="bubble-act bubble-act-danger"
+            title={sessionId ? '删除（下一轮对话不再带上它）' : '删除'}
+            disabled={!sessionId || deleting}
+            onClick={() => void deleteMsg()}
+          >
+            {deleting ? '删除中…' : '删除'}
+          </button>
+        </div>
       </div>
       {text && (
         <div className="bubble-text">

@@ -43,6 +43,32 @@ _COOLDOWN_SECONDS = 30.0
 
 _fail_state = {"streak": 0, "ts": 0.0}
 
+#: 描述结果缓存 —— 同一张图+同一个问题在 TTL 内直接回缓存，不再打识图模型。
+#: 背景：主 agent 常对同一张图反复调 read_image，每次都真调 API，撞上限流
+#: 就变成「429 → 重试 → 429」的空转。缓存键含 prompt（不同问题不误伤）。
+_DESC_CACHE_TTL = 600.0
+_DESC_CACHE_MAX = 64
+_DESC_CACHE: dict[tuple[str, str], tuple[float, str]] = {}
+
+
+def _cache_get(key: tuple[str, str]) -> str | None:
+    hit = _DESC_CACHE.get(key)
+    if hit is None:
+        return None
+    ts, text = hit
+    if time.monotonic() - ts > _DESC_CACHE_TTL:
+        _DESC_CACHE.pop(key, None)
+        return None
+    return text
+
+
+def _cache_put(key: tuple[str, str], text: str) -> None:
+    if len(_DESC_CACHE) >= _DESC_CACHE_MAX:
+        # 粗暴淘汰最旧的一条，够用了。
+        oldest = min(_DESC_CACHE, key=lambda k: _DESC_CACHE[k][0])
+        _DESC_CACHE.pop(oldest, None)
+    _DESC_CACHE[key] = (time.monotonic(), text)
+
 
 def _cooldown_active() -> bool:
     return _fail_state["streak"] >= _FAIL_STREAK_LIMIT and (
@@ -128,14 +154,26 @@ async def describe_image_with_fallback(
 ) -> str | None:
     """识图槽失败/没配 → 自动切识图子代理（不同的识图模型）；两路都不通
     则返回原 failure 文本。"""
+    key = (str(image_path or ""), prompt.strip())
+    cached = _cache_get(key)
+    if cached is not None:
+        return (
+            cached
+            + "\n（识图结果缓存命中，未重复调用识图模型；"
+            "同一张图不要反复调用 read_image，直接引用已有描述回答。）"
+        )
     text = await describe_image(
         store, image_bytes, mime_type, prompt=prompt, image_path=image_path
     )
     failed = text is None or any(m in (text or "") for m in _FAILURE_MARKERS)
     if not failed:
+        _cache_put(key, text or "")
         return text
     sub = await _describe_via_subagent(store, image_path, prompt, session_id)
-    return sub or text
+    if sub:
+        _cache_put(key, sub)
+        return sub
+    return text
 
 
 async def describe_image(

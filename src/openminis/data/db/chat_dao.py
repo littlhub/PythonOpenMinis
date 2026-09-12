@@ -404,6 +404,17 @@ class ChatDao:
         )
         await self._s.commit()
 
+    async def delete_message(self, session_id: str, message_id: str) -> bool:
+        """删一条消息；返回是否真的删了（用于 404 判定）。"""
+        result = await self._s.execute(
+            delete(MessageEntity).where(
+                (MessageEntity.session_id == session_id)
+                & (MessageEntity.id == message_id)
+            )
+        )
+        await self._s.commit()
+        return bool(result.rowcount)
+
     async def total_message_count(self) -> int:
         result = await self._s.execute(
             select(func.count()).select_from(MessageEntity)

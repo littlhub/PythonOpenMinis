@@ -1468,6 +1468,42 @@ button.link.danger {
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
+.bubble-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.bubble-actions {
+  display: flex;
+  gap: 4px;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+.bubble:hover .bubble-actions {
+  opacity: 1;
+}
+.bubble-act {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 2px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.bubble-act:hover {
+  background: rgba(0, 0, 0, 0.06);
+  color: var(--text);
+}
+.bubble-act-danger:hover {
+  background: rgba(220, 60, 60, 0.1);
+  color: #c0392b;
+}
+.bubble-act:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
 .bubble-text p {
   margin: 0;
   line-height: 1.55;

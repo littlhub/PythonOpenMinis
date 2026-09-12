@@ -107,6 +107,12 @@ export const api = {
       `/chats/sessions/${encodeURIComponent(id)}/messages`,
     ),
 
+  chatDeleteMessage: (sessionId: string, messageId: string) =>
+    request<{ ok: boolean }>(
+      `/chats/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}`,
+      { method: 'DELETE' },
+    ),
+
   chatMove: (id: string, folderId: string | null) =>
     request<{ ok: boolean }>(
       `/chats/sessions/${encodeURIComponent(id)}/workspace`,

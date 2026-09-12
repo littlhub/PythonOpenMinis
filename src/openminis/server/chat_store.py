@@ -246,6 +246,18 @@ async def delete_session(session_id: str) -> bool:
     return True
 
 
+async def delete_message(session_id: str, message_id: str) -> bool:
+    """删一条消息（气泡上的「删除」按钮）。运行时缓存一并失效，下一轮
+    LLM 历史从库里重读，保证删掉的消息不再进上下文。"""
+    await ensure_db()
+    async with _get_db().session() as s:
+        dao = ChatDao(s)
+        deleted = await dao.delete_message(session_id, message_id)
+    if deleted:
+        drop_runtime(session_id)
+    return deleted
+
+
 # -- runtime transcript cache ------------------------------------------------
 def _cache_runtime(session_id: str, messages: list[LLMMessage]) -> None:
     _RUNTIME[session_id] = messages

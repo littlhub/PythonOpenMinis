@@ -61,6 +61,14 @@ async def delete_session(session_id: str) -> dict[str, Any]:
     return {"ok": True}
 
 
+@router.delete("/sessions/{session_id}/messages/{message_id}")
+async def delete_message(session_id: str, message_id: str) -> dict[str, Any]:
+    """删一条消息（用户气泡上的「删除」）。下一轮对话不再带上它。"""
+    if not await chat_store.delete_message(session_id, message_id):
+        raise HTTPException(status_code=404, detail="消息不存在")
+    return {"ok": True}
+
+
 @router.get("/sessions/{session_id}/messages")
 async def session_messages(session_id: str) -> dict[str, Any]:
     if await chat_store.get_session(session_id) is None:
