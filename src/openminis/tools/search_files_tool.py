@@ -206,11 +206,11 @@ def _search_names(root: Path, pattern: str, *, ignore_case: bool,
             if len(found) >= max_results or time.monotonic() > deadline:
                 return
             try:
-                if entry.is_dir(follow_symlinks=False):
+                if entry.is_dir() and not entry.is_symlink():
                     if not no_ignore and entry.name in SKIP_DIR_NAMES:
                         continue
                     walk(entry)
-                elif entry.is_file(follow_symlinks=False):
+                elif entry.is_file():
                     name = entry.name
                     if ignore_case:
                         name = name.lower()

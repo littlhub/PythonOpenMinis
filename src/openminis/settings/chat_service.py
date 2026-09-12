@@ -80,20 +80,32 @@ def active_skills_block(store: SettingsStore) -> str:
         active = store.active_skills()
         if not active:
             return ""
+        skill_store = SkillStore()
         lines: list[str] = []
-        for entry in SkillStore().list():
+        for entry in skill_store.list():
             if entry.name in active or Path(entry.path).name in active:
                 desc = (entry.description or "").strip().splitlines()
                 head = desc[0] if desc else ""
-                lines.append(f"- {entry.name}：{head}" if head else f"- {entry.name}")
+                lines.append(
+                    f"- {entry.name}：{head}（SKILL.md：{entry.path}）"
+                    if head
+                    else f"- {entry.name}（SKILL.md：{entry.path}）"
+                )
         if not lines:
             return ""
         return (
             "\n\n## 可用技能\n"
             "以下技能已激活。当任务匹配某个技能时，先用 skill_use 工具加载它的完整"
             "说明（SKILL.md），再按说明用 shell_execute / file_* 去执行。"
-            "技能不是工具，不要把技能名当工具名直接调用。\n"
+            "技能不是工具，不要把技能名当工具名直接调用。技能目录可读（ls / "
+            "search_files / file_read 都能访问），路径见各行标注，**不要凭空猜测"
+            "技能文件位置**。\n"
             + "\n".join(lines)
+            + "\n\n【技能失败降级】若某个技能执行失败（依赖未安装、脚本缺失、"
+            "环境未配置、外部服务不可达），**不要反复重试、也不要猜别的路径**："
+            "① 如实告诉用户该技能缺什么、需要在技能目录/配置里补什么；"
+            "② 图片生成类任务此时改用 image_gen 工具（走「生图」模型槽），"
+            "图片理解类任务改用 read_image（走「识图」模型槽），同样能完成任务。"
         )
     except Exception:  # pragma: no cover - 技能目录损坏不该拖垮对话
         logger.debug("active skills block unavailable", exc_info=True)

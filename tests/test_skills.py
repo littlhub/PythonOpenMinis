@@ -233,3 +233,93 @@ def test_skills_api_activate(isolated_skills, monkeypatch):
 
         assert c.post("/api/skills/visioncustom/deactivate").json()["active"] == []
         assert c.post("/api/skills/nope/activate").status_code == 404
+
+
+# ---------- 技能根目录 YAML 配置 + 只读放行 ----------
+
+def test_configured_skills_root_reads_yaml(isolated_skills):
+    """skills.yaml 的 root 指向哪里，技能库就在哪里（相对路径相对数据目录）。"""
+    from openminis.skills.store import configured_skills_root
+
+    custom = isolated_skills / "my-skills"
+    custom.mkdir()
+    (isolated_skills / "skills.yaml").write_text(
+        f"root: {custom.as_posix()}\n", encoding="utf-8"
+    )
+    assert configured_skills_root() == custom
+    # 相对路径也支持
+    (isolated_skills / "skills.yaml").write_text("root: alt-skills\n", encoding="utf-8")
+    assert configured_skills_root() == (isolated_skills / "alt-skills").resolve()
+    # 没配置时回默认
+    (isolated_skills / "skills.yaml").unlink()
+    assert configured_skills_root() == isolated_skills / "skills"
+
+
+def test_skill_store_uses_yaml_root(isolated_skills):
+    (isolated_skills / "skills.yaml").write_text("root: alt\n", encoding="utf-8")
+    store = SkillStore()
+    assert store.root == (isolated_skills / "alt").resolve()
+
+
+def test_readonly_roots_allows_skills_dir(isolated_skills):
+    """ls / search_files / file_read 能读技能库目录（配置在 yaml 里的根）。"""
+    from openminis.tools.path_utils import readonly_roots, resolve_workspace_path
+
+    custom = isolated_skills / "my-skills"
+    skill_dir = _write_skill(custom, "demo", "演示")
+    (isolated_skills / "skills.yaml").write_text(
+        f"root: {custom.as_posix()}\n", encoding="utf-8"
+    )
+
+    assert readonly_roots() == (custom,)
+    # 绝对路径放行
+    assert resolve_workspace_path(str(skill_dir)) == skill_dir.resolve()
+    # 相对形式（skills/demo）也放行
+    resolved = resolve_workspace_path("skills/demo")
+    assert resolved is not None and resolved.name == "demo"
+    # 白名单外依旧拒绝
+    assert resolve_workspace_path("C:/Windows") is None
+
+
+def test_file_read_can_read_skill_md(isolated_skills):
+    from openminis.tools.file_read_tool import FileReadTool
+
+    custom = isolated_skills / "my-skills"
+    skill_dir = _write_skill(custom, "demo", "演示", body="技能正文")
+    (isolated_skills / "skills.yaml").write_text(
+        f"root: {custom.as_posix()}\n", encoding="utf-8"
+    )
+    tool = FileReadTool()
+    result = tool.execute(
+        '{"path": "%s"}' % (skill_dir / "SKILL.md").as_posix(), "s1"
+    )
+    assert result.success and "技能正文" in result.output
+
+
+def test_search_files_no_type_error(isolated_skills):
+    """回归：Path.is_dir() 不接受 follow_symlinks，之前直接 TypeError。"""
+    from openminis.tools.search_files_tool import _search_names
+    import time as _time
+
+    custom = isolated_skills / "my-skills"
+    skill_dir = _write_skill(custom, "demo", "演示")
+    (custom / "sub").mkdir()
+    found, _ = _search_names(
+        custom, "SKILL.md", ignore_case=False, no_ignore=True,
+        max_results=10, deadline=_time.monotonic() + 5,
+    )
+    # 技能库在 workspace 外，_rel 只回文件名 —— 有结果就说明没再抛 TypeError
+    assert found
+
+
+def test_skills_block_lists_real_paths(isolated_skills):
+    """技能清单要带 SKILL.md 真实路径 + 失败降级提示。"""
+    from openminis.skills import SkillStore as _S
+
+    SkillStore().ensure_installed()
+    store = SettingsStore()
+    store.set_skill_active("builtin-tools", True)
+    prompt = identity_system_prompt(store)
+    assert "SKILL.md：" in prompt
+    assert "技能失败降级" in prompt
+    assert "image_gen" in prompt

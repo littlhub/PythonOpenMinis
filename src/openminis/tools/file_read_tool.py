@@ -255,6 +255,13 @@ def _resolve_session_host_path(session_id: str, path: str) -> Path | None:
     resolved = (session_root / candidate).resolve() if candidate else session_root.resolve()
     root = session_root.resolve()
     if resolved != root and root not in resolved.parents:
+        # 技能库是只读白名单根：让模型能读 SKILL.md / 技能脚本。
+        from .path_utils import readonly_roots
+
+        for extra in readonly_roots():
+            er = extra.resolve()
+            if resolved == er or er in resolved.parents:
+                return resolved
         logger.warning("file_read rejected path outside session root: %s", path)
         return None
     return resolved

@@ -27,7 +27,27 @@ from ..core.logging import get_logger
 
 logger = get_logger(__name__)
 
-__all__ = ["workspace_root", "resolve_workspace_path", "PREFIXES"]
+__all__ = [
+    "workspace_root",
+    "resolve_workspace_path",
+    "readonly_roots",
+    "PREFIXES",
+]
+
+
+def readonly_roots() -> tuple[Path, ...]:
+    """只读放行的附加根（当前只有技能库目录）。
+
+    技能目录不在 workspace 下面，默认会被路径护栏拒掉 —— 模型只能瞎猜路径。
+    放行后 ls / search_files / file_read 可以浏览技能目录（装什么技能、
+    SKILL.md 写了什么），写入类工具有自己独立的会话根校验，不受影响。
+    """
+    try:
+        from ..skills.store import configured_skills_root
+
+        return (configured_skills_root(),)
+    except Exception:  # pragma: no cover - 技能模块损坏不该拖垮路径解析
+        return ()
 
 
 #: Path prefixes that are transparently mapped onto the workspace root.
@@ -60,6 +80,11 @@ def resolve_workspace_path(path: str | None) -> Path | None:
 
     resolved = (root / candidate).resolve() if candidate else root
     if resolved != root and root not in resolved.parents:
+        # 技能库等只读根：解析结果落在里面就放行。
+        for extra in readonly_roots():
+            er = extra.resolve()
+            if resolved == er or er in resolved.parents:
+                return resolved
         logger.warning("workspace tool rejected path outside root: %s", path)
         return None
     return resolved

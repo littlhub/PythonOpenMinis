@@ -74,11 +74,33 @@ def _skill_name(meta: dict[str, Any], fallback: str) -> str:
     return name or fallback
 
 
+#: 技能根目录的配置文件（放数据目录下）。写 ``root: <路径>`` 即可把技能库
+#: 切到任意目录 —— 相对路径相对数据目录解析。SkillStore 每次实例化都重新
+#: 读取，改完文件下次调用即生效，无需重启。
+SKILLS_CONFIG_FILE = "skills.yaml"
+
+
+def configured_skills_root() -> Path:
+    """技能根目录：``skills.yaml`` 的 ``root`` 优先，缺省回到 ``data/skills``。"""
+    data = app_context().data_dir
+    cfg = data / SKILLS_CONFIG_FILE
+    if cfg.is_file():
+        try:
+            meta = yaml.safe_load(cfg.read_text(encoding="utf-8"))
+            raw = str((meta or {}).get("root") or "").strip()
+            if raw:
+                p = Path(raw).expanduser()
+                return p if p.is_absolute() else (data / p).resolve()
+        except Exception:  # pragma: no cover - 配置损坏不该拖垮技能加载
+            logger.debug("skills.yaml unreadable, using default root", exc_info=True)
+    return data / "skills"
+
+
 class SkillStore:
     """Filesystem-backed registry of installed skills."""
 
     def __init__(self, root: Path | str | None = None) -> None:
-        self.root = Path(root) if root is not None else app_context().data_dir / "skills"
+        self.root = Path(root) if root is not None else configured_skills_root()
 
     # -- install ---------------------------------------------------------
     def ensure_installed(self) -> list[str]:
