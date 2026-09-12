@@ -438,7 +438,7 @@ async def run_subagent(
     本身（否则会无限委派）。空产出时返回一句可读的说明而不是抛异常 ——
     调用方（工具 / 识图链路）都要能把「没看到东西」如实告诉用户。
     """
-    from ..settings.catalog import build_tool_registry, image_caller_scope
+    from ..settings.catalog import build_tool_registry
     from ..settings.chat_service import build_provider
     from ..tools.subagent_tool import SubagentDelegateTool
     from .agent_runtime import AgentRuntime, AgentRuntimeOptions
@@ -473,20 +473,19 @@ async def run_subagent(
     runtime = AgentRuntime(tools=inner_tools)  # 内层循环静默，不往外推流
     messages: list[LLMMessage] = [LLMMessage(LLMMessage.Role.USER, task)]
     try:
-        # 「识图走子代理」的语义就是**用子代理自己的模型看图**：内部一律按
-        # inline 处理。模型若声明了图片输入，像素直达；没声明则 provider 会
-        # 换成「图省略」占位，子代理会如实报告看不到 —— 不猜。
-        with image_caller_scope("inline"):
-            _, stop_reason = await runtime.run(
-                provider,
-                messages,
-                session_id=f"{session_id}:sub:{subagent_id}",
-                options=AgentRuntimeOptions(
-                    system_prompt=persona,
-                    max_turns=max(1, min(int(cfg.get("maxRounds", 6)), 12)),
-                    image_context_mode="inline",
-                ),
-            )
+        # 子代理里的 ``read_image`` 与主对话走**同一条路**：识图槽转文字描述。
+        # 不强推 inline —— 网关若没给模型声明图片输入，字节会被 provider 换成
+        # 「图省略」占位，子代理看到的是 177 字符的路径文本、只能反复重读
+        # （实测的死循环）。描述文本足够它推理，产出仍是文字。
+        _, stop_reason = await runtime.run(
+            provider,
+            messages,
+            session_id=f"{session_id}:sub:{subagent_id}",
+            options=AgentRuntimeOptions(
+                system_prompt=persona,
+                max_turns=max(1, min(int(cfg.get("maxRounds", 6)), 12)),
+            ),
+        )
     finally:
         close = getattr(provider, "aclose", None)
         if callable(close):

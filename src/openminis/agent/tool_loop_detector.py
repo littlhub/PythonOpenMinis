@@ -101,7 +101,7 @@ class ToolLoopConfig:
     #: roundup pattern is exactly ``web_fetch`` a listing, ``browser_use`` an
     #: article, ``web_fetch`` another listing…; all three count as one streak.
     query_tools: tuple[str, ...] = (
-        "memory_get", "web_search", "web_fetch", "browser_use",
+        "memory_get", "web_search", "web_fetch", "browser_use", "read_image",
     )
     query_warning_threshold: int = 5
     query_critical_threshold: int = 10

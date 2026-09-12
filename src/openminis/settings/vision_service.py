@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import contextvars
 import time
 
 from typing import Any
@@ -42,6 +43,12 @@ _FAIL_STREAK_LIMIT = 2
 _COOLDOWN_SECONDS = 30.0
 
 _fail_state = {"streak": 0, "ts": 0.0}
+
+#: fallback 防重入标记：>0 表示当前已在一个「识图 fallback 委派的子代理」
+#: 里，read_image 不许再委派 —— 否则子代理循环套子代理，无限递归。
+_VISION_FALLBACK_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "vision_fallback_depth", default=0
+)
 
 #: 描述结果缓存 —— 同一张图+同一个问题在 TTL 内直接回缓存，不再打识图模型。
 #: 背景：主 agent 常对同一张图反复调 read_image，每次都真调 API，撞上限流
@@ -153,7 +160,12 @@ async def describe_image_with_fallback(
     session_id: str = "",
 ) -> str | None:
     """识图槽失败/没配 → 自动切识图子代理（不同的识图模型）；两路都不通
-    则返回原 failure 文本。"""
+    则返回原 failure 文本。
+
+    防重入：fallback 会跑一个子代理循环，子代理里再调 read_image 时
+    **绝不能**再次委派（否则无限递归/循环）。用 contextvar 深度标记，
+    已在 fallback 内就直接返回 failure 文本。
+    """
     key = (str(image_path or ""), prompt.strip())
     cached = _cache_get(key)
     if cached is not None:
@@ -169,7 +181,13 @@ async def describe_image_with_fallback(
     if not failed:
         _cache_put(key, text or "")
         return text
-    sub = await _describe_via_subagent(store, image_path, prompt, session_id)
+    if _VISION_FALLBACK_DEPTH.get() > 0:
+        return text
+    token = _VISION_FALLBACK_DEPTH.set(1)
+    try:
+        sub = await _describe_via_subagent(store, image_path, prompt, session_id)
+    finally:
+        _VISION_FALLBACK_DEPTH.reset(token)
     if sub:
         _cache_put(key, sub)
         return sub

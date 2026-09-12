@@ -127,6 +127,7 @@ def identity_system_prompt(store: SettingsStore) -> str:
         + RETRIEVAL_DISCIPLINE
         + image_context_discipline(store)
         + (SUBAGENT_PLAN_DISCIPLINE if subagent_on else "")
+        + COMPLETION_JUDGMENT_DISCIPLINE
         + active_skills_block(store)
     )
 
@@ -183,6 +184,17 @@ SUBAGENT_PLAN_DISCIPLINE = (
     "子代理（技能/工具对口的才派），哪些自己直接做；委派时用 subagent_delegate，"
     "task 写清目标、边界与所需上下文。执行中按清单逐项推进并交代进展，"
     "不要把所有事都推给子代理，也不要明明对口却全部自己扛。"
+)
+
+#: 完成判断 —— 每次工具/子代理结果回来，先自检「是否已经能回答」，能答就
+#: 立即收尾。背景：实测同一张图成功识图后模型仍连打 4 次 read_image 不作答。
+COMPLETION_JUDGMENT_DISCIPLINE = (
+    "\n\n【完成判断】每拿到一次工具或子代理的结果，先停下来自检："
+    "用户的目标是否已经达成？已有信息是否足以直接回答？**足以回答就立即"
+    "作答收尾**，不要再调用任何工具。禁止：对同一路径重复调用 read_image、"
+    "重复委派同一个子代理、在结果已经完整的情况下继续加调工具。"
+    "只有发现确有缺口（缺哪张图/哪份文件/哪个数据）才发起下一次调用，"
+    "并在一句话里说明还缺什么。"
 )
 
 
