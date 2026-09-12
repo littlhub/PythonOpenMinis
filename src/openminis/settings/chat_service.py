@@ -128,6 +128,19 @@ RETRIEVAL_DISCIPLINE = (
 )
 
 
+#: 工具失败的处置纪律：失败输出就是分析素材 —— 先读懂报错、修正、再重试；
+#: 绝不许因为「不知道怎么回事」就跑去调用一堆无关工具（典型恶例：shell
+#: 失败后疯狂 read_image 看图「找线索」，跟图毫无关系）。
+TOOL_FAILURE_DISCIPLINE = (
+    "\n\n【失败处置】工具执行失败时：① 通读失败输出里的命令、退出码与报错"
+    "文本，判断原因（命令不存在/依赖缺失/路径错误/服务不可达）；"
+    "② 针对原因修正后重试，最多 2 次；③ 仍失败就把**原始报错**如实报告"
+    "用户并给出修复建议（比如需要安装什么依赖、配置什么环境）。"
+    "**禁止**：不做分析就换不相干的工具乱试，尤其禁止用 read_image / "
+    "subagent_delegate 看图来「找线索」—— 图片内容与命令失败毫无关系。"
+)
+
+
 def identity_system_prompt(store: SettingsStore) -> str:
     identity = store.active_identity()
     try:
@@ -140,6 +153,7 @@ def identity_system_prompt(store: SettingsStore) -> str:
         + image_context_discipline(store)
         + (SUBAGENT_PLAN_DISCIPLINE if subagent_on else "")
         + COMPLETION_JUDGMENT_DISCIPLINE
+        + TOOL_FAILURE_DISCIPLINE
         + active_skills_block(store)
     )
 

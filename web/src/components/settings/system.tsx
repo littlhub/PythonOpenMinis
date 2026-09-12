@@ -371,11 +371,7 @@ export function EnvVarsPage(props: { onBack: () => void }) {
     >
       <SectionCard title="沙箱环境变量" hint="留空值则忽略该行;值为字符串。">
         {rows.map(([k, v], i) => (
-          <div key={i} className="env-row">
-            <input placeholder="KEY" className="mono" value={k} onChange={(e) => patch(i, 0, e.target.value)} />
-            <input placeholder="value" className="mono" value={v} onChange={(e) => patch(i, 1, e.target.value)} />
-            <button className="link danger" onClick={() => setRows((prev) => prev.filter((_, idx) => idx !== i))}>移除</button>
-          </div>
+          <EnvRow key={i} k={k} v={v} idx={i} patch={patch} remove={() => setRows((prev) => prev.filter((_, idx) => idx !== i))} />
         ))}
         <div className="row-actions">
           <button className="btn-soft" onClick={() => setRows((prev) => [...prev, ['', '']])}>＋ 添加变量</button>
@@ -386,6 +382,32 @@ export function EnvVarsPage(props: { onBack: () => void }) {
         敏感值请勿写入并随备份导出——本地明文保存。
       </Note>
     </DetailShell>
+  )
+}
+
+// 环境变量行：值默认密文显示（API Key 等敏感值不明文），可点「显示」切换
+function EnvRow(props: {
+  k: string
+  v: string
+  idx: number
+  patch: (i: number, slot: 0 | 1, value: string) => void
+  remove: () => void
+}) {
+  const [show, setShow] = useState(false)
+  return (
+    <div className="env-row">
+      <input placeholder="KEY" className="mono" value={props.k} onChange={(e) => props.patch(props.idx, 0, e.target.value)} />
+      <input
+        placeholder="value"
+        className="mono"
+        type={show ? 'text' : 'password'}
+        autoComplete="off"
+        value={props.v}
+        onChange={(e) => props.patch(props.idx, 1, e.target.value)}
+      />
+      <button className="link" onClick={() => setShow((s) => !s)}>{show ? '隐藏' : '显示'}</button>
+      <button className="link danger" onClick={props.remove}>移除</button>
+    </div>
   )
 }
 

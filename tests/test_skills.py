@@ -339,3 +339,104 @@ def test_chat_setup_always_enables_skill_use(isolated_skills):
     })
     _provider, runtime, _opts, _identity, _conf = build_chat_setup(store)
     assert "skill_use" in runtime.tools
+
+
+def test_shell_failure_output_carries_context(monkeypatch):
+    """shell 失败必须把命令+退出码+报错完整交给模型，不能只回一句干瘪文本。"""
+    import asyncio
+    import types as _types
+
+    from openminis.tools.shell_execute_tool import ShellExecuteTool
+
+    tool = ShellExecuteTool()
+
+    def _fake_execute(*a, **k):
+        async def _inner():
+            return _types.SimpleNamespace(
+                output="python: command not found", exit_code=127
+            )
+        return _inner()
+
+    tool.coordinator = _types.SimpleNamespace(execute=_fake_execute)
+    result = asyncio.run(tool.execute('{"command": "python x.py"}', "s1"))
+    assert not result.success
+    assert "python x.py" in result.output
+    assert "exit code: 127" in result.output
+    assert "分析" in result.output
+
+
+def test_system_prompt_has_failure_discipline(isolated_skills):
+    from openminis.settings.chat_service import identity_system_prompt
+
+    store = SettingsStore()
+    assert "失败处置" in identity_system_prompt(store)
+    assert "read_image" in identity_system_prompt(store)
+
+
+def test_shell_one_shot_fallback_on_dead_persistent(monkeypatch):
+    """持久 shell exit=-1 时降级为一次性 bash -c，命令必须真的执行。"""
+    import asyncio
+    import types as _types
+
+    from openminis.tools.shell_execute_tool import ShellExecuteTool
+
+    tool = ShellExecuteTool()
+
+    def _dead_execute(*a, **k):
+        async def _inner():
+            return _types.SimpleNamespace(output="", exit_code=-1)
+        return _inner()
+    tool.coordinator = _types.SimpleNamespace(
+        execute=_dead_execute, _cwd_overrides={},
+    )
+    result = asyncio.run(tool.execute('{"command": "echo fallback_ok"}', "s1"))
+    assert result.success, result.output
+    assert "fallback_ok" in result.output
+
+
+def test_shell_one_shot_fallback_on_dead_persistent(monkeypatch):
+    """持久 shell exit=-1 时降级为一次性 bash -c，命令必须真的执行。"""
+    import asyncio
+    import types as _types
+
+    from openminis.tools.shell_execute_tool import ShellExecuteTool
+
+    tool = ShellExecuteTool()
+
+    def _dead_execute(*a, **k):
+        async def _inner():
+            return _types.SimpleNamespace(output="", exit_code=-1)
+        return _inner()
+    tool.coordinator = _types.SimpleNamespace(
+        execute=_dead_execute, _cwd_overrides={},
+    )
+    result = asyncio.run(tool.execute('{"command": "echo fallback_ok"}', "s1"))
+    assert result.success, result.output
+    assert "fallback_ok" in result.output
+
+
+def test_shell_reads_env_extra(monkeypatch, tmp_path):
+    """「环境变量」页配置的 sandbox.envExtra 必须进 shell 进程环境。"""
+    import asyncio
+    import types as _types
+
+    from openminis.core import prefs as _prefs
+    from openminis.tools import shell_execute_tool as _mod
+    from openminis.tools.shell_execute_tool import ShellExecuteTool
+
+    _prefs.get_prefs().set_now("sandbox.envExtra", '{"OPENAI_API_KEY": "sk-test"}')
+    captured = {}
+
+    tool = ShellExecuteTool()
+
+    def _fake_execute(session_id, command, *, timeout, line_callback, env_vars):
+        captured["env"] = env_vars
+
+        async def _inner():
+            return _types.SimpleNamespace(output="ok", exit_code=0)
+        return _inner()
+
+    tool.coordinator = _types.SimpleNamespace(execute=_fake_execute)
+    asyncio.run(tool.execute('{"command": "python run.py"}', "s1"))
+    assert captured["env"] and captured["env"]["OPENAI_API_KEY"] == "sk-test"
+    _prefs.get_prefs().set_now("sandbox.envExtra", "{}")

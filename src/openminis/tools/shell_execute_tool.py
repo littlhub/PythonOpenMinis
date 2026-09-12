@@ -83,6 +83,65 @@ class ShellExecuteTool:
             property_ordering=["tool_title", "command", "timeout", "delay"],
         )
 
+    async def _one_shot_fallback(
+        self, session_id: str, command: str, timeout: int,
+        env_extra: Optional[dict[str, str]] = None,
+    ) -> Optional[tuple[str, int]]:
+        """持久 shell 失效时的一次性执行兜底（同步 subprocess，线程内跑）。
+
+        返回 ``(output, exit_code)``；连兜底都失败（找不到 shell 等）返回
+        ``None``，让上层继续走持久 shell 的失败提示。
+        """
+        import subprocess as _sp
+
+        from .path_utils import workspace_root
+
+        try:
+            from ..sandbox.persistent_shell import detect_shell_spec
+            from ..core.logging import get_logger
+
+            spec = detect_shell_spec()
+        except Exception:
+            return None
+        cwd = None
+        coordinator = self.coordinator
+        overrides = getattr(coordinator, "_cwd_overrides", None)
+        if isinstance(overrides, dict):
+            cwd = overrides.get(session_id) or str(workspace_root())
+        try:
+
+            def _run() -> tuple[str, int]:
+                run_env = None
+                if env_extra:
+                    import os as _os
+
+                    run_env = {**_os.environ, **env_extra}
+                if spec.name == "cmd.exe":
+                    argv = [spec.executable, "/d", "/s", "/c", command]
+                else:
+                    argv = [spec.executable, "--noprofile", "--norc", "-c", command]
+                proc = _sp.run(
+                    argv,
+                    capture_output=True,
+                    text=True,
+                    timeout=max(float(timeout), 1.0),
+                    cwd=cwd,
+                    env=run_env,
+                    errors="replace",
+                )
+                out = (proc.stdout or "") + (proc.stderr or "")
+                return out.strip() or "(no output)", proc.returncode
+
+            result = await asyncio.to_thread(_run)
+            logger.warning(
+                "PersistentShell[%s] unusable (exit=-1); one-shot fallback ran "
+                "the command (exit=%d)", session_id, result[1],
+            )
+            return result
+        except Exception as exc:
+            logger.warning("one-shot shell fallback failed: %s", exc)
+            return None
+
     async def execute(
         self,
         args_json: str,
@@ -112,7 +171,7 @@ class ShellExecuteTool:
         if delay > 0:
             await asyncio.sleep(delay)
 
-        env = self.get_env() if self.get_env is not None else None
+        env = self.get_env() if self.get_env is not None else _load_env_extra()
         result = await self.coordinator.execute(
             session_id,
             command,
@@ -122,14 +181,66 @@ class ShellExecuteTool:
         )
 
         output = result.output or "(no output)"
+        if result.exit_code == -1 and "[Write error" not in output:
+            # 持久 shell 没跑成（app 的事件循环拓扑下偶发秒死，exit=-1）。
+            # 兜底：用一次性 ``bash -c`` 在工作线程里同步执行 —— 不依赖
+            # 持久 shell 的生命周期，命令必须真的跑起来。
+            one_shot = await self._one_shot_fallback(session_id, command, timeout, env)
+            if one_shot is not None:
+                out_text, code = one_shot
+                if code != 0:
+                    out_text = (
+                        f"$ {command}\n{out_text}\n"
+                        f"[exit code: {code}]\n"
+                        "请先分析上面的报错原因（命令不存在？依赖缺失？路径不对？），"
+                        "修正命令或环境后再重试；连续失败 2 次就把问题如实报告用户，"
+                        "不要改用无关工具（如 read_image）来回避。"
+                    )
+                return ToolExecutionResult(
+                    out_text, code == 0, tool_title=tool_title,
+                )
         if result.exit_code == 124:
             output += "\n[command timed out]"
+        if result.exit_code != 0:
+            # 失败必须把「跑的是什么、退出码、输出」完整交给模型，否则它
+            # 拿到一句干瘪报错没法分析原因，只会乱试别的工具。
+            output = (
+                f"$ {command}\n{output}\n"
+                f"[exit code: {result.exit_code}]\n"
+                "请先分析上面的报错原因（命令不存在？依赖缺失？路径不对？），"
+                "修正命令或环境后再重试；连续失败 2 次就把问题如实报告用户，"
+                "不要改用无关工具（如 read_image）来回避。"
+            )
         return ToolExecutionResult(
             output, result.exit_code == 0, tool_title=tool_title,
         )
 
 
 _shared: Optional[ExecutionCoordinator] = None
+
+
+def _load_env_extra() -> Optional[dict[str, str]]:
+    """读取「环境变量」页配置的 ``sandbox.envExtra``（JSON KV）。
+
+    ``ShellExecuteTool()`` 默认没人传 ``get_env``，导致用户在设置页配的
+    环境变量（如 ``OPENAI_API_KEY``）根本进不了 shell —— 技能脚本里
+    ``$OPENAI_API_KEY`` 永远是空。这里作为默认来源；显式注入仍优先。
+    """
+    try:
+        from ..core.prefs import get_prefs
+
+        raw = get_prefs().get_string("sandbox.envExtra") or ""
+        if not raw.strip():
+            return None
+        import json as _json
+
+        data = _json.loads(raw)
+        if isinstance(data, dict):
+            out = {str(k): str(v) for k, v in data.items() if str(v).strip()}
+            return out or None
+    except Exception:  # pragma: no cover - 配置损坏不该拖垮 shell
+        logger.debug("envExtra unreadable", exc_info=True)
+    return None
 
 
 def _default_coordinator() -> ExecutionCoordinator:

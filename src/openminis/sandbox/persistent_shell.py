@@ -108,14 +108,31 @@ def detect_shell_spec() -> ShellSpec:
                          'echo "__MINIS_DONE_{marker}_EXIT_$?__"', "/bin/sh")
 
     # Windows: prefer any bash we can find (Git Bash, MSYS2, WSL-adjacent).
+    # 注意 ``C:\Windows\System32\bash.exe`` 是 WSL 的占位程序 —— 没装 WSL 时
+    # 它只会打印「请到 Microsoft Store 安装…」然后退出（exit -1），整个持久
+    # shell 就此报废。必须排除 Windows 目录下的 bash，宁可用 cmd.exe。
+    import glob
+
+    windir = os.environ.get("WINDIR", r"C:\Windows").lower()
+    home = os.environ.get("USERPROFILE", "")
     candidates = [
         shutil.which("bash"),
         r"C:\Program Files\Git\bin\bash.exe",
         r"C:\Program Files\Git\usr\bin\bash.exe",
         r"C:\Program Files (x86)\Git\bin\bash.exe",
+        # WorkBuddy 自带的 PortableGit（应用环境里最常见的真 bash）
+        *glob.glob(os.path.join(
+            home, ".workbuddy", "binaries", "PortableGit",
+            "versions", "*", "usr", "bin", "bash.exe")),
+        *glob.glob(os.path.join(
+            home, "scoop", "apps", "git", "current", "bin", "bash.exe")),
     ]
     for cand in candidates:
-        if cand and Path(cand).exists():
+        if (
+            cand
+            and Path(cand).exists()
+            and windir not in str(Path(cand).resolve()).lower()
+        ):
             return ShellSpec(cand, ("--noprofile", "--norc", "-s"),
                              'echo "__MINIS_DONE_{marker}_EXIT_$?__"', "bash")
 
