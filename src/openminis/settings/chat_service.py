@@ -298,6 +298,11 @@ def build_chat_setup(  # noqa: ANN201
     # Agent 对话参数(模型设置):执行步数上限 + 深度思考 + 子代理助理开关。
     agent_cfg = store.agent_config()
     enabled_ids = list(identity.effective_tools())
+    # skill_use 是**能力开关**而不是身份工具：老 settings.json 里存的
+    # enabled_tools 早于 skill_use 出现，缺了它「可用技能」清单就成了一句
+    # 空话（模型按清单调 skill_use 只会收到 Unknown tool）。这里补齐。
+    if "skill_use" not in enabled_ids:
+        enabled_ids.append("skill_use")
     if agent_cfg.get("subagentEnabled", True):
         # 子代理委派是**能力开关**而不是身份工具：用户存的 enabled_tools 可能
         # 早于 subagent_delegate 出现（老 settings.json），照搬会让主 agent

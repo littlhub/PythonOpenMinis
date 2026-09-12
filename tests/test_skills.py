@@ -323,3 +323,19 @@ def test_skills_block_lists_real_paths(isolated_skills):
     assert "SKILL.md：" in prompt
     assert "技能失败降级" in prompt
     assert "image_gen" in prompt
+
+
+def test_chat_setup_always_enables_skill_use(isolated_skills):
+    """回归：老 settings.json 的 enabled_tools 没有 skill_use，聊天里调
+    skill_use 只会收到 Unknown tool —— 必须按能力开关补齐。"""
+    from openminis.settings.chat_service import build_chat_setup
+
+    store = SettingsStore()
+    store.apply_full({
+        "providers": [{"id": "gw", "type": "openAI", "apiKey": "k",
+                       "model": "gpt-4o", "baseUrl": ""}],
+        "activeProviderId": "gw",
+        "identity": {"toolOverrides": {"general": []}},
+    })
+    _provider, runtime, _opts, _identity, _conf = build_chat_setup(store)
+    assert "skill_use" in runtime.tools
