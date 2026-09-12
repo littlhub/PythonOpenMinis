@@ -302,13 +302,23 @@ _VISION_HINTS: tuple[str, ...] = (
 )
 
 #: Chat families known to accept image input natively (→ 对话 + 识图).
-#: Deliberately CONSERVATIVE: only families whose mainstream chat models
-#: genuinely take images. Vendor brand names alone (kimi / doubao / ernie /
-#: qwen-max / abab …) are mostly text-only, and marking those multimodal would
-#: silently disable the 识图 fallback — the user can always re-classify in UI.
+#: Deliberately CONSERVATIVE in *kind* (a bare vendor brand name is not enough
+#: — kimi / doubao / ernie / qwen-max are mostly text-only) but reasonably
+#: BROAD in coverage: every family whose mainstream chat models genuinely take
+#: images is listed, so users don't see multimodal models stuck on 对话.
+#: Anything still mis-guessed can be re-tagged in the UI (自动推断 + 可改).
 _MULTIMODAL_HINTS: tuple[str, ...] = (
-    "gpt-4o", "gpt-4.1", "gpt-5", "chatgpt", "o3", "o4", "gemini",
-    "claude", "grok-4", "llama-4", "llama4",
+    # OpenAI
+    "gpt-4o", "gpt-4.1", "gpt-4-turbo", "gpt-4-vision", "gpt-4.5", "gpt-5",
+    "chatgpt", "o1-", "o3-", "o4-",
+    # Google / Anthropic / xAI / Meta
+    "gemini", "claude", "grok-2-vision", "grok-4", "llama-4", "llama4",
+    # open-weight multimodal chat families
+    "gemma-3", "gemma3", "llava", "pixtral", "internvl", "minicpm-v",
+    "phi-3.5-vision", "phi-4-multimodal", "multimodal",
+    # cloud vendor VL chat models
+    "nova-pro", "nova-lite", "doubao-vision", "glm-4v", "qwen-vl",
+    "hunyuan-vision", "ernie-vl", "kimi-vl", "step-1v",
 )
 
 

@@ -71,6 +71,13 @@ from openminis.settings.model_capability import (
     ("gemini-2.5-pro", [CAP_LLM, CAP_VISION]),
     ("grok-4.6", [CAP_LLM, CAP_VISION]),
     ("llama-4-maverick", [CAP_LLM, CAP_VISION]),
+    # 扩充后的多模态家族（避免"能看图却显示成对话"）
+    ("gpt-4-turbo", [CAP_LLM, CAP_VISION]),
+    ("gpt-4.5-preview", [CAP_LLM, CAP_VISION]),
+    ("gemma-3-27b-it", [CAP_LLM, CAP_VISION]),
+    ("phi-4-multimodal-instruct", [CAP_LLM, CAP_VISION]),
+    ("amazon-nova-pro", [CAP_LLM, CAP_VISION]),
+    ("o1-preview", [CAP_LLM, CAP_VISION]),
     # 纯文本 LLM —— 厂商品牌名本身不算多模态（保守判定，可手动改）
     ("deepseek-chat", [CAP_LLM]),
     ("kimi-k2-thinking", [CAP_LLM]),

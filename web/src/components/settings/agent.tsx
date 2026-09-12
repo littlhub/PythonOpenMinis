@@ -158,6 +158,8 @@ export function ProvidersPage(props: { onBack: () => void }) {
   const [customs, setCustoms] = useState<CustomModelType[]>([])
   /** 正在编辑/新增的自定义类型(非 null 时展开表单)。 */
   const [draft, setDraft] = useState<CustomModelType | null>(null)
+  /** 表单从哪打开：卡片内联(picker) 还是独立分节(section)，避免两处同时展开。 */
+  const [draftFrom, setDraftFrom] = useState<'picker' | 'section' | null>(null)
   const [customErr, setCustomErr] = useState<string | null>(null)
   const [fetchMsg, setFetchMsg] = useState<Record<string, FetchMsg | undefined>>({})
   const [newType, setNewType] = useState('')
@@ -241,6 +243,18 @@ export function ProvidersPage(props: { onBack: () => void }) {
   const patch = (id: string, p: Partial<ProviderRow>) =>
     setRows((prev) => prev.map((r) => (r.id === id ? { ...r, ...p } : r)))
 
+  /** 打开自定义类型表单（记录来源，保证只在一处渲染）。 */
+  const openDraft = (from: 'picker' | 'section', ct?: CustomModelType) => {
+    setCustomErr(null)
+    setDraftFrom(from)
+    setDraft(ct ?? { id: '', label: '', type: '', url: '', json: '' })
+  }
+  const closeDraft = () => {
+    setDraft(null)
+    setDraftFrom(null)
+    setCustomErr(null)
+  }
+
   /** 新增/更新一个自定义类型(仅本地暂存,保存按钮才落盘)。 */
   const commitDraft = () => {
     if (!draft) return
@@ -271,7 +285,7 @@ export function ProvidersPage(props: { onBack: () => void }) {
       else next.push(item)
       return next
     })
-    setDraft(null)
+    closeDraft()
   }
 
   const removeCustom = (id: string) => {
@@ -291,6 +305,42 @@ export function ProvidersPage(props: { onBack: () => void }) {
 
   const patchSlot = (slot: string, p: Partial<ModelSlotInfo>) =>
     setSlots((prev) => prev.map((s) => (s.slot === slot ? { ...s, ...p } : s)))
+
+  /** 给某个厂商实例下的某个模型补一个用途标签(用户覆盖)。 */
+  const tagModel = (instanceId: string, model: string, cap: string) => {
+    if (!instanceId || !model || !cap) return
+    setRows((prev) =>
+      prev.map((r) => {
+        if (r.id !== instanceId) return r
+        const cur = r.modelTypes[model] ?? capabilitiesOf(r, model)
+        if (cur.includes(cap)) return r
+        return { ...r, modelTypes: { ...r.modelTypes, [model]: [...cur, cap] } }
+      }),
+    )
+    // 立刻消掉对应槽位的「能力不匹配」，不必等保存后重新拉取
+    setSlots((prev) =>
+      prev.map((s) => {
+        if (s.instanceId !== instanceId || s.model !== model) return s
+        if (!(s.accepts as string[]).includes(cap)) return s
+        const caps = Array.from(
+          new Set([...(s.capabilities ?? (s.capability ? [s.capability] : [])), cap]),
+        )
+        return { ...s, capabilities: caps, capability: s.capability ?? cap, capabilityOk: true }
+      }),
+    )
+  }
+
+  /**
+   * 在用途槽里选定模型时，顺手把该槽位要求的能力打在这个模型上 ——
+   * 用户显式选它来干这件事，本身就是声明。私有/代理模型名(如
+   * agnes-2.5-flash)推断不出来，只能靠这一步。
+   */
+  const bindSlotModel = (slot: ModelSlotInfo, model: string) => {
+    patchSlot(slot.slot, { model })
+    if (slot.instanceId && model && slot.accepts[0]) {
+      tagModel(slot.instanceId, model, slot.accepts[0])
+    }
+  }
 
   const nextId = (type: string) => {
     const used = new Set(rows.map((r) => r.id))
@@ -493,10 +543,7 @@ export function ProvidersPage(props: { onBack: () => void }) {
                       type="button"
                       className="chip cap-chip cap-add"
                       title="新增自定义用途类型"
-                      onClick={() => {
-                        setCustomErr(null)
-                        setDraft({ id: '', label: '', type: '', url: '', json: '' })
-                      }}
+                      onClick={() => openDraft('picker')}
                     >
                       ＋ 自定义
                     </button>
@@ -514,7 +561,7 @@ export function ProvidersPage(props: { onBack: () => void }) {
                       自动（{capabilitiesOf(r, r.model).map((c) => capLabel(c, extraLabels)).join('+') || '未知'}）
                     </button>
                   </div>
-                  {draft && (
+                  {draftFrom === 'picker' && draft && (
                     <div className="custom-type-form">
                       <div className="ctf-row">
                         <input
@@ -554,7 +601,7 @@ export function ProvidersPage(props: { onBack: () => void }) {
                       {customErr && <Note kind="warn">{customErr}</Note>}
                       <div className="ctf-actions">
                         <button type="button" onClick={commitDraft}>加入类型</button>
-                        <button type="button" className="link" onClick={() => { setDraft(null); setCustomErr(null) }}>
+                        <button type="button" className="link" onClick={closeDraft}>
                           取消
                         </button>
                       </div>
@@ -594,13 +641,7 @@ export function ProvidersPage(props: { onBack: () => void }) {
         title="自定义模型类型"
         hint="八类内置用途之外，可自建类型（自带 JSON 配置与 URL）。加好后会出现在每个模型的「模型用途」按钮里，勾选即生效。"
         extra={
-          <button
-            type="button"
-            onClick={() => {
-              setCustomErr(null)
-              setDraft({ id: '', label: '', type: '', url: '', json: '' })
-            }}
-          >
+          <button type="button" onClick={() => openDraft('section')}>
             ＋ 添加类型
           </button>
         }
@@ -700,7 +741,12 @@ export function ProvidersPage(props: { onBack: () => void }) {
                     labels={extraLabels}
                   />
                   {s.configured && !s.capabilityOk && (
-                    <span className="pill warn">能力不匹配</span>
+                    <span
+                      className="pill warn"
+                      title={`该模型当前标签不含「${s.acceptsLabel}」。点下方「标记为…」一键补上（私有/代理模型名推断不出能力时常用）。`}
+                    >
+                      能力不匹配
+                    </span>
                   )}
                   {!s.configured && <span className="pill warn">未配置</span>}
                 </div>
@@ -725,7 +771,7 @@ export function ProvidersPage(props: { onBack: () => void }) {
                     <select
                       value={s.model}
                       disabled={!s.instanceId}
-                      onChange={(e) => patchSlot(s.slot, { model: e.target.value })}
+                      onChange={(e) => bindSlotModel(s, e.target.value)}
                     >
                       <option value="">— 选模型 —</option>
                       {modelOpts.map((mid) => (
@@ -737,19 +783,36 @@ export function ProvidersPage(props: { onBack: () => void }) {
                       placeholder="或手填模型 ID"
                       value={s.model}
                       onChange={(e) => patchSlot(s.slot, { model: e.target.value })}
+                      onBlur={(e) => bindSlotModel(s, e.target.value)}
                     />
                     <button
                       type="button"
                       className="link"
                       disabled={!s.suggested}
                       title={s.suggested ? `自动选：${s.suggested.model}` : '没有合适能力的模型'}
-                      onClick={() =>
-                        s.suggested &&
-                        patchSlot(s.slot, { instanceId: s.suggested.instanceId, model: s.suggested.model })
-                      }
+                      onClick={() => {
+                        if (!s.suggested) return
+                        patchSlot(s.slot, {
+                          instanceId: s.suggested.instanceId,
+                          model: s.suggested.model,
+                        })
+                        if (s.accepts[0]) {
+                          tagModel(s.suggested.instanceId, s.suggested.model, s.accepts[0])
+                        }
+                      }}
                     >
                       自动选择
                     </button>
+                    {s.configured && !s.capabilityOk && s.instanceId && (
+                      <button
+                        type="button"
+                        className="link warn"
+                        title={`把「${s.acceptsLabel}」标记到这个模型上（私有/代理模型名推断不出来时用）`}
+                        onClick={() => tagModel(s.instanceId as string, s.model, s.accepts[0])}
+                      >
+                        标记为「{s.acceptsLabel}」
+                      </button>
+                    )}
                     <button
                       type="button"
                       className="link danger"

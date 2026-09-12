@@ -1096,6 +1096,10 @@ details summary {
 .settings-section header.has-extra .section-head-text { flex: 1 1 auto; min-width: 0; }
 .settings-section header .section-extra { flex: 0 0 auto; }
 
+/* 提醒性质的文字按钮(用 != 危险操作) */
+button.link.warn { color: #b06a12; }
+button.link.warn:hover { text-decoration: underline; }
+
 /* 用途分槽 (对话 / 识图 / 生图) */
 .slot-list { display: flex; flex-direction: column; gap: 10px; }
 .slot-row {
