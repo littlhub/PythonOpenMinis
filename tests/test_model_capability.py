@@ -78,6 +78,12 @@ from openminis.settings.model_capability import (
     ("phi-4-multimodal-instruct", [CAP_LLM, CAP_VISION]),
     ("amazon-nova-pro", [CAP_LLM, CAP_VISION]),
     ("o1-preview", [CAP_LLM, CAP_VISION]),
+    # 私有网关（AGNES API Hub）：不带 modality 提示词的对话模型默认多模态，
+    # 但 agnes-image-* / agnes-video-* 仍由更靠前的生成规则截获
+    ("agnes-2.5-flash", [CAP_LLM, CAP_VISION]),
+    ("agnes-3.0-flash", [CAP_LLM, CAP_VISION]),
+    ("agnes-image-2.5-flash", [CAP_IMAGE]),
+    ("agnes-video-2.5-flash", [CAP_VIDEO]),
     # 纯文本 LLM —— 厂商品牌名本身不算多模态（保守判定，可手动改）
     ("deepseek-chat", [CAP_LLM]),
     ("kimi-k2-thinking", [CAP_LLM]),

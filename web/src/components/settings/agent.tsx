@@ -516,7 +516,10 @@ export function ProvidersPage(props: { onBack: () => void }) {
                   </span>
                   <div className="cap-picker">
                     {capOptions.map((c) => {
-                      const on = (r.modelTypes[r.model] ?? []).includes(c.id)
+                      // 以「当前生效的标签」为基准：没有手动覆盖时用服务端推断值，
+                      // 这样点一个按钮 = 在推断结果上增删，不会把推断出的能力丢掉。
+                      const active = capabilitiesOf(r, r.model)
+                      const on = active.includes(c.id)
                       const cls = CAP_CLASS[c.id] ?? 'cap-custom'
                       return (
                         <button
@@ -526,9 +529,10 @@ export function ProvidersPage(props: { onBack: () => void }) {
                           disabled={!r.model}
                           title={c.custom ? '自定义类型' : undefined}
                           onClick={() => {
-                            const cur = r.modelTypes[r.model] ?? []
                             const next = { ...r.modelTypes }
-                            const after = on ? cur.filter((x) => x !== c.id) : [...cur, c.id]
+                            const after = on
+                              ? active.filter((x) => x !== c.id)
+                              : [...active, c.id]
                             if (after.length) next[r.model] = after
                             else delete next[r.model]
                             patch(r.id, { modelTypes: next })

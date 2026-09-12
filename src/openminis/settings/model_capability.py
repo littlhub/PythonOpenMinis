@@ -319,6 +319,10 @@ _MULTIMODAL_HINTS: tuple[str, ...] = (
     # cloud vendor VL chat models
     "nova-pro", "nova-lite", "doubao-vision", "glm-4v", "qwen-vl",
     "hunyuan-vision", "ernie-vl", "kimi-vl", "step-1v",
+    # 私有/自建网关：模型名不带 modality 提示词，但命名里带网关前缀
+    # （AGNES API Hub 的 agnes-*-flash / agnes-*-pro 均为多模态对话模型；
+    #  其 agnes-image-* / agnes-video-* 命中更靠前的生成类规则，不受影响）
+    "agnes",
 )
 
 
