@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import types
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 
 from ..agent.agent_runtime import ToolExecutor
@@ -510,6 +512,31 @@ def _image_mode(store) -> str:  # noqa: ANN001
     return mode if mode in ("path", "inline") else "path"
 
 
+#: 调用方（谁在跑 agent loop）覆盖的图片模式。
+#:
+#: 主对话按用户设置走（默认 path：只给路径）；但**子代理**不一样 —— 一个
+#: 带 ``read_image`` 的识图子代理，职责就是「看图」，必须真的拿到像素，否则
+#: 它也只是拿到一个路径、什么也说不出来。用 contextvar 而不是给执行器加参数，
+#: 是为了不惊动其它工具的签名（运行时目前只额外传 env）。
+CALLER_IMAGE_MODE: ContextVar[str | None] = ContextVar(
+    "caller_image_mode", default=None
+)
+
+
+@contextmanager
+def image_caller_scope(mode: str):
+    """在这个作用域内，``read_image`` 按 ``mode`` 决定图片怎么进上下文。"""
+    token = CALLER_IMAGE_MODE.set(mode)
+    try:
+        yield
+    finally:
+        CALLER_IMAGE_MODE.reset(token)
+
+
+def _caller_image_mode(store) -> str:  # noqa: ANN001
+    return CALLER_IMAGE_MODE.get() or _image_mode(store)
+
+
 _NO_VISION_SLOT_HINT = (
     "当前未配置「识图」模型，图片内容无法读取（只拿到路径与尺寸）。"
     "如需理解图片，请在 设置 → 模型服务 → 用途分槽 把「识图」槽指向一个"
@@ -537,13 +564,15 @@ async def _read_image_with_vision(args_json: str, session_id: str, **_kw):
         from .store import SettingsStore
 
         store = SettingsStore.get()
-        mode = _image_mode(store)
+        mode = _caller_image_mode(store)
         has_vision = _chat_model_has_native_vision(store)
     except Exception:  # pragma: no cover - settings unreadable
         return result
 
-    # inline 且主模型自带视觉 → 原样返回字节（运行时附到下一轮请求）
-    if mode == "inline" and has_vision:
+    # inline：字节原样返回，由运行时附到下一轮请求 —— 调用方（主模型，或带
+    # read_image 的子代理）自己就能看图。子代理走的就是这条：它的职责就是
+    # 「看图」，所以哪怕全局是 path 模式，也要把像素给它。
+    if mode == "inline":
         return result
     if not result.image_data:
         return result

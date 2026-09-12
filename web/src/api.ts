@@ -302,8 +302,33 @@ export const api = {
     return res.json() as Promise<{ spec: string; url: string }>
   },
 
-  subagentsList: () => request<SubagentsList>('/subagents'),
+  /**
+   * 上传聊天附件（图片/文件）。同样不能用 ``request()`` —— multipart 需要浏览器
+   * 自己带 boundary。返回里最关键的是 ``path``：消息里只存这个路径，字节留在
+   * 工作区（path-only，见 agent.imageContextMode）。
+   */
+  uploadFile: async (
+    file: File,
+  ): Promise<{
+    name: string
+    storedName: string
+    path: string
+    url: string
+    mime: string
+    size: number
+    kind: 'image' | 'file'
+  }> => {
+    const form = new FormData()
+    form.append('file', file)
+    const res = await fetch(`${API}/upload`, { method: 'POST', body: form })
+    if (!res.ok) {
+      const detail = await res.json().catch(() => ({ detail: res.statusText }))
+      throw new Error(detail?.detail ?? res.statusText)
+    }
+    return res.json()
+  },
 
+  subagentsList: () => request<SubagentsList>('/subagents'),
   subagentsRegistry: () => request<SubagentRegistry>('/subagents/registry'),
 
   subagentsCreate: (payload: Partial<SubagentInfo>) =>

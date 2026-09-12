@@ -48,6 +48,7 @@ from ..settings.model_capability import (
     pick_slot_model,
 )
 from ..settings.chat_service import ChatSetupError, attribution_snapshot, build_chat_setup
+from ..settings.attachments import build_attachment_context
 from ..settings.remote_models import (
     ModelsFetchError,
     default_base_url,
@@ -63,6 +64,7 @@ from .skills_api import router as skills_router
 from .subagents_api import router as subagents_router
 from .system_api import router as system_router
 from .appearance_api import router as appearance_router
+from .upload_api import router as upload_router
 from .usage_api import router as usage_router
 
 logger = get_logger(__name__)
@@ -155,6 +157,7 @@ app.include_router(marketplace_router)
 app.include_router(scheduled_router)
 app.include_router(usage_router)
 app.include_router(appearance_router)
+app.include_router(upload_router)
 
 
 # ---------------------------------------------------------------------------
@@ -698,9 +701,15 @@ async def _handle_chat(client_id: str, msg: dict[str, Any]) -> None:
     model_label = (conf.get("model") or "").strip() or None
 
     messages = await chat_store.load_runtime_history(sid)
-    messages.append(LLMMessage(LLMMessage.Role.USER, text))
+    # 附件（图片）：默认只把**路径**带进上下文，真正的「看懂」交给 read_image /
+    # 识图槽；inline 模式才会把字节附上。顺带剥掉历史遗留的内联 base64 —— 它
+    # 既会拖死前端输入框排版，也会按图片体积烧 token。
+    bundle = await build_attachment_context(store, text)
+    messages.append(
+        LLMMessage(LLMMessage.Role.USER, bundle.prompt, image_parts=bundle.image_parts or None)
+    )
     # persist the user turn before streaming so a crash never loses it
-    await chat_store.append_turn(sid, "user", text, model_label=model_label)
+    await chat_store.append_turn(sid, "user", bundle.text, model_label=model_label)
 
     # Root this session's shell inside its workspace sandbox (filed sessions
     # only; ungrouped sessions keep the global default directory).

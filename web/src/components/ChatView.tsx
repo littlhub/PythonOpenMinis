@@ -40,6 +40,83 @@ interface ToolCallCard {
   output?: string
 }
 
+// ---------------------------------------------------------------------------
+// 附件 / 超长文本保护
+//
+// 背景：旧版「上传图片」是把文件读成 base64 直接塞进输入框的。一张手机照片
+// 5MB → base64 约 6.8MB，一个几百万字符的**单行**放进受控 <textarea>，浏览器
+// 排版直接把主线程占满 —— 用户看到的就是「页面无响应」。同理，消息气泡里若有
+// 这种单行，也会卡死。
+//
+// 现在改成：图片先上传到工作区，消息里只留路径（几十个字符），字节永不进
+// 上下文；同时下面的兜底会剥掉/截断任何残留的超长内容。
+// ---------------------------------------------------------------------------
+
+/** 输入框内容上限（字符）。超过必然异常，直接截断。 */
+const MAX_DRAFT_CHARS = 200_000
+/** 单行渲染上限 —— 超过就当二进制垃圾处理。 */
+const MAX_RENDER_LINE = 4_000
+
+/** 剥掉内联 base64 图片/数据，只留一句说明。避免拖死输入框排版。 */
+function stripInlineData(text: string): string {
+  if (!text.includes('data:')) return text
+  return text.replace(
+    /data:[\w.+-]+\/[\w.+-]+;base64,[A-Za-z0-9+/=\s]+/g,
+    (m) => `[已丢弃内联 base64 数据 · ${Math.round(m.length / 1024)}KB]`,
+  )
+}
+
+/** 单行截断：模型/历史里可能已经躺着几 MB 的乱码，渲染时保护一下。 */
+function clampLine(line: string): string {
+  if (line.length <= MAX_RENDER_LINE) return line
+  return `${line.slice(0, MAX_RENDER_LINE)}…（本行共 ${line.length} 字符，已截断）`
+}
+
+/** ``![alt](src)`` —— 用户消息里的图片附件引用。 */
+const IMAGE_REF_RE = /!\[([^\]]*)\]\(([^)\s]+)\)/g
+/** ``[附件: name](src)`` —— 非图片附件引用。 */
+const FILE_REF_RE = /\[附件[:：]\s*([^\]]*)\]\(([^)\s]+)\)/g
+
+interface ImageRef {
+  alt: string
+  src: string
+  /** 可直接预览的 URL（附件走 /api/upload/raw；远程 http 地址原样用）。 */
+  url?: string
+}
+
+interface FileRef {
+  name: string
+  src: string
+}
+
+/** 把附件引用从正文里摘出来，正文只留用户真正打的字。 */
+function splitAttachments(text: string): {
+  text: string
+  images: ImageRef[]
+  files: FileRef[]
+} {
+  const images: ImageRef[] = []
+  const toRef = (alt: string, src: string): ImageRef => {
+    const ref: ImageRef = { alt: alt || '图片', src }
+    if (/^https?:\/\//.test(src)) ref.url = src
+    else if (!src.startsWith('data:')) {
+      const base = src.split(/[\\/]/).pop()
+      if (base) ref.url = `/api/upload/raw?name=${encodeURIComponent(base)}`
+    }
+    return ref
+  }
+  let out = text.replace(IMAGE_REF_RE, (_m, alt: string, src: string) => {
+    images.push(toRef(alt, src))
+    return ''
+  })
+  const files: FileRef[] = []
+  out = out.replace(FILE_REF_RE, (_m, name: string, src: string) => {
+    files.push({ name: name || '附件', src })
+    return ''
+  })
+  return { text: out.replace(/\n{3,}/g, '\n\n').trim(), images, files }
+}
+
 /**
  * ChatView is now JUST the main chat area (topbar + scroll + composer +
  * collapsible right panel). Session / workspace management lives in the
@@ -428,15 +505,46 @@ function MessageList({ messages }: { messages: UiMessage[] }) {
 }
 
 function Bubble({ msg }: { msg: UiMessage }) {
+  const { text, images, files } = useMemo(() => splitAttachments(msg.text), [msg.text])
   return (
     <div className={`bubble ${msg.role}`}>
       <div className="bubble-role">
         {msg.role === 'user' ? '你' : '助手'}
       </div>
-      {msg.text && (
+      {text && (
         <div className="bubble-text">
-          {msg.text.split('\n').map((line, i) => (
-            <p key={i}>{line || '\u00a0'}</p>
+          {text.split('\n').map((line, i) => (
+            <p key={i}>{clampLine(line) || '\u00a0'}</p>
+          ))}
+        </div>
+      )}
+      {files.length > 0 && (
+        <div className="bubble-attachments">
+          {files.map((f, i) => (
+            <span key={`${f.src}-${i}`} className="bubble-file-chip" title={f.src}>
+              📎 {f.name}
+            </span>
+          ))}
+        </div>
+      )}
+      {images.length > 0 && (
+        <div className="bubble-attachments">
+          {images.map((img, i) => (
+            <figure key={`${img.src}-${i}`} className="bubble-attachment">
+              {img.url ? (
+                <img
+                  src={img.url}
+                  alt={img.alt}
+                  loading="lazy"
+                  title={img.src}
+                  onError={(e) => {
+                    // 文件被清理 / 不在 uploads（例如老会话里的绝对路径）
+                    ;(e.currentTarget as HTMLImageElement).style.display = 'none'
+                  }}
+                />
+              ) : null}
+              <figcaption title={img.src}>🖼️ {img.alt}</figcaption>
+            </figure>
           ))}
         </div>
       )}
@@ -505,6 +613,8 @@ function Composer({
 }) {
   const [draft, setDraft] = useState('')
   const [recording, setRecording] = useState(false)
+  const [attachBusy, setAttachBusy] = useState(false)
+  const [attachError, setAttachError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const imageInputRef = useRef<HTMLInputElement | null>(null)
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
@@ -527,22 +637,48 @@ function Composer({
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
-    if (file.type.startsWith('text/') || file.name.match(/\.(json|md|py|js|ts|css|html|txt|csv|xml|yaml|yml)$/i)) {
-      const text = await file.text()
-      insertTool(`[文件: ${file.name}]\n${text.slice(0, 800)}${text.length > 800 ? '\n...(已截断)' : ''}`)
-    } else {
-      insertTool(`[附件: ${file.name}]`)
+    setAttachBusy(true)
+    setAttachError(null)
+    try {
+      // 先落盘拿到路径再插引用 —— 消息里只留路径，字节留在工作区。
+      // 与 Kotlin 原版一致：非图片附件只进 <user-attached-files> 清单，
+      // 内容不内联（文本附件的预览是给「人」看的，不影响模型侧开销）。
+      const up = await api.uploadFile(file)
+      const isText =
+        file.type.startsWith('text/') ||
+        /\.(json|md|py|js|ts|tsx|css|html|txt|csv|xml|yaml|yml|log|ini|cfg)$/i.test(file.name)
+      if (isText) {
+        const text = await file.text()
+        insertTool(
+          `[附件: ${file.name}](${up.path})\n${text.slice(0, 800)}${text.length > 800 ? '\n...(已截断)' : ''}`,
+        )
+      } else {
+        insertTool(`[附件: ${file.name}](${up.path})`)
+      }
+    } catch (err) {
+      setAttachError((err as Error).message)
+    } finally {
+      setAttachBusy(false)
+      if (fileInputRef.current) fileInputRef.current.value = ''
     }
   }
 
   const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
-    const reader = new FileReader()
-    reader.onload = () => {
-      insertTool(`![${file.name}](${reader.result})`)
+    setAttachBusy(true)
+    setAttachError(null)
+    try {
+      // 旧实现是 FileReader.readAsDataURL → 把几 MB 的 base64 塞进输入框，
+      // 受控 <textarea> 排版直接把页面拖死（「页面无响应」）。现在只传路径。
+      const up = await api.uploadFile(file)
+      insertTool(`![${file.name}](${up.path})`)
+    } catch (err) {
+      setAttachError((err as Error).message)
+    } finally {
+      setAttachBusy(false)
+      if (imageInputRef.current) imageInputRef.current.value = ''
     }
-    reader.readAsDataURL(file)
   }
 
   const startRecording = async () => {
@@ -593,9 +729,9 @@ function Composer({
         <button
           type="button"
           className="composer-tool-btn"
-          disabled={disabled}
+          disabled={disabled || attachBusy}
           onClick={() => fileInputRef.current?.click()}
-          title="上传文件"
+          title="上传文件（只把路径发给模型）"
         >
           📎
         </button>
@@ -603,11 +739,11 @@ function Composer({
         <button
           type="button"
           className="composer-tool-btn"
-          disabled={disabled}
+          disabled={disabled || attachBusy}
           onClick={() => imageInputRef.current?.click()}
-          title="上传图片"
+          title="上传图片（默认只把路径发给模型，省上下文）"
         >
-          🖼️
+          {attachBusy ? '⏳' : '🖼️'}
         </button>
         <button
           type="button"
@@ -624,10 +760,24 @@ function Composer({
       <div className="composer-input-wrap">
         <textarea
           rows={1}
-          placeholder={disabled ? '先选择一个会话…' : '输入消息…'}
+          placeholder={
+            disabled
+              ? '先选择一个会话…'
+              : attachBusy
+                ? '上传中…'
+                : '输入消息…'
+          }
           value={draft}
           disabled={disabled}
-          onChange={(e) => setDraft(e.target.value)}
+          onChange={(e) => {
+            // 双重保险：粘贴超大内容时先剥掉内联 base64，再限长 ——
+            // 一个几百万字符的单行足以让整个页面无响应。
+            let v = stripInlineData(e.target.value)
+            if (v.length > MAX_DRAFT_CHARS) {
+              v = `${v.slice(0, MAX_DRAFT_CHARS)}\n…（内容过长已截断，请改用 📎 上传文件）`
+            }
+            setDraft(v)
+          }}
           onKeyDown={(e) => {
             if (e.key === 'Enter' && !e.shiftKey) {
               // NOTE: keep the semicolon — without it ASI glues this line onto
@@ -638,6 +788,9 @@ function Composer({
             }
           }}
         />
+        {attachError && (
+          <div className="composer-note err">附件上传失败：{attachError}</div>
+        )}
       </div>
 
       {/* Right actions */}

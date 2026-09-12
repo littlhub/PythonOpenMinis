@@ -1592,6 +1592,60 @@ button.link.danger {
   min-width: 0;
 }
 
+/* 附件上传失败的行内提示 */
+.composer-note {
+  font-size: 12px;
+  line-height: 1.5;
+  padding: 3px 6px 0;
+}
+.composer-note.err { color: #b42318; }
+
+/* 用户气泡里的附件（图片缩略图 + 文件芯片） */
+.bubble-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+.bubble-attachment {
+  margin: 0;
+  max-width: 220px;
+}
+.bubble-attachment img {
+  display: block;
+  max-width: 220px;
+  max-height: 220px;
+  width: auto;
+  height: auto;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  object-fit: cover;
+  background: var(--bg);
+}
+.bubble-attachment figcaption {
+  font-size: 11px;
+  color: var(--muted);
+  margin-top: 3px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bubble-file-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .composer-input-wrap textarea {
   width: 100%;
   border: 1.5px solid var(--border);

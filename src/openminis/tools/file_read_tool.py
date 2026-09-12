@@ -238,6 +238,17 @@ def _resolve_session_host_path(session_id: str, path: str) -> Path | None:
         if candidate.startswith(prefix):
             candidate = candidate[len(prefix) :]
             break
+
+    # 绝对路径：只要落在工作区内就原样接受。上传的附件用的是绝对路径
+    # （``<workspace>/uploads/...``），不认这一段的话 read_image 就拿不到图。
+    # 工作区外的绝对路径不走这条捷径，仍按下面的相对规则处理。
+    raw_path = Path(candidate)
+    if raw_path.is_absolute():
+        ws_resolved = workspace.resolve()
+        resolved_abs = raw_path.resolve()
+        if resolved_abs == ws_resolved or ws_resolved in resolved_abs.parents:
+            return resolved_abs
+
     candidate = candidate.lstrip("/") or ""
 
     # Reject escape attempts before touching the filesystem.

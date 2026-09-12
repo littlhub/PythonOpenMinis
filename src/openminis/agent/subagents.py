@@ -40,6 +40,8 @@ __all__ = [
     "delete_subagent",
     "build_registry",
     "plan_subagent",
+    "run_subagent",
+    "find_vision_subagent",
 ]
 
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
@@ -422,3 +424,149 @@ async def plan_subagent(store, request: str, *, auto_save: bool = False,
 def SettingsStore_get():
     from ..settings.store import SettingsStore
     return SettingsStore.get()
+
+
+# ---------------------------------------------------------------------------
+# 运行子代理 —— 主 agent 的 subagent_delegate 工具与后端「识图」都走这里。
+# ---------------------------------------------------------------------------
+async def run_subagent(
+    store, subagent_id: str, task: str, session_id: str
+) -> str:
+    """跑一个子代理直到它给出最终答复，返回它的文本。
+
+    子代理有自己的模型、人设、工具集，且永远拿不到 ``subagent_delegate``
+    本身（否则会无限委派）。空产出时返回一句可读的说明而不是抛异常 ——
+    调用方（工具 / 识图链路）都要能把「没看到东西」如实告诉用户。
+    """
+    from ..settings.catalog import build_tool_registry, image_caller_scope
+    from ..settings.chat_service import build_provider
+    from ..tools.subagent_tool import SubagentDelegateTool
+    from .agent_runtime import AgentRuntime, AgentRuntimeOptions
+
+    cfg = get_subagent(store, subagent_id)
+    if cfg is None:
+        raise SubagentError(f"subagent 不存在: {subagent_id}")
+
+    # cfg.providerId 指的是模型服务**实例**；老配置只有 providerType（协议），
+    # 那就退回该协议下的第一个实例。
+    pid = str(cfg.get("providerId") or cfg.get("providerType") or "")
+    data = store.load()
+    conf = dict(data["providers"].get(pid) or {})
+    if not conf:
+        conf = next(
+            (dict(c) for c in store.provider_instances() if c.get("type") == pid),
+            {},
+        )
+    if not conf:
+        raise SubagentError(f"subagent {subagent_id} 的模型服务实例不存在: {pid or '(空)'}")
+
+    conf["model"] = cfg.get("model") or conf.get("model", "")
+    provider = build_provider(pid, conf)
+
+    inner_tools = {
+        name: t
+        for name, t in build_tool_registry(cfg.get("tools") or []).items()
+        if name != SubagentDelegateTool.NAME
+    }
+    persona = cfg.get("persona") or f"你是「{cfg.get('name', subagent_id)}」。用中文回复。"
+
+    runtime = AgentRuntime(tools=inner_tools)  # 内层循环静默，不往外推流
+    messages: list[LLMMessage] = [LLMMessage(LLMMessage.Role.USER, task)]
+    try:
+        # 子代理内部一律按 inline 处理图片：带 read_image 的子代理（识图类）
+        # 必须真的拿到像素，否则它也只是拿到一个路径、什么也说不出。它的
+        # 产出是**文字**，回到主 agent 上下文时依然只有文字，不会带图。
+        with image_caller_scope("inline"):
+            _, stop_reason = await runtime.run(
+                provider,
+                messages,
+                session_id=f"{session_id}:sub:{subagent_id}",
+                options=AgentRuntimeOptions(
+                    system_prompt=persona,
+                    max_turns=max(1, min(int(cfg.get("maxRounds", 6)), 12)),
+                    image_context_mode="inline",
+                ),
+            )
+    finally:
+        close = getattr(provider, "aclose", None)
+        if callable(close):
+            try:
+                await close()
+            except Exception:  # pragma: no cover
+                pass
+
+    parts: list[str] = []
+    for msg in messages[1:]:
+        if msg.role != LLMMessage.Role.ASSISTANT:
+            continue
+        for part in msg.content_parts:
+            text = getattr(part, "text", None)
+            if isinstance(text, str) and text.strip():
+                parts.append(text)
+    body = "\n\n".join(parts).strip()
+    return body or f"(subagent 未产出文字，stop_reason={stop_reason})"
+
+
+#: 技能名里带这些词 → 明确是「识图」技能，优先级最高。
+_VISION_SKILL_HINTS = ("vision", "识图", "看图", "视觉", "ocr")
+#: 弱信号：名字里有 image。注意 ``agnes-image`` 之类是**生图**技能，不是识图，
+#: 所以只能当备选，不能抢在明确的识图技能前面。
+_IMAGE_SKILL_HINTS = ("image", "图像", "图片")
+
+
+def find_vision_subagent(store) -> str | None:
+    """挑一个能「看图」的子代理 id，没有就返回 ``None``。
+
+    判据（从严到宽）：
+    1. 带 ``read_image`` 且技能名明确是识图类（vision / 识图 / 看图 / OCR）；
+    2. 带 ``read_image`` 且技能名里有 image，或它绑的模型自带视觉能力。
+
+    注意必须带 ``read_image`` —— 没有它，子代理也只是拿到一个路径，看不到像素。
+    """
+    try:
+        from ..settings.model_capability import CAP_VISION
+    except Exception:  # pragma: no cover
+        CAP_VISION = "vision"
+
+    strong: str | None = None
+    weak: str | None = None
+    for cfg in list_subagents(store):
+        if "read_image" not in (cfg.get("tools") or []):
+            continue
+        sid = str(cfg.get("id") or "")
+        if not sid:
+            continue
+        skills = [str(s).lower() for s in (cfg.get("skills") or [])]
+        if any(h in s for s in skills for h in _VISION_SKILL_HINTS):
+            if strong is None:
+                strong = sid
+            continue
+        if weak is not None:
+            continue
+        if any(h in s for s in skills for h in _IMAGE_SKILL_HINTS):
+            weak = sid
+        elif _subagent_model_sees(store, cfg, CAP_VISION):
+            weak = sid
+    return strong or weak
+
+
+def _subagent_model_sees(store, cfg: dict[str, Any], cap_vision: str) -> bool:
+    """子代理绑定的模型是否自带视觉能力。"""
+    pid = str(cfg.get("providerId") or cfg.get("providerType") or "")
+    conf = dict(store.load()["providers"].get(pid) or {})
+    if not conf:
+        conf = next(
+            (dict(c) for c in store.provider_instances() if c.get("type") == pid),
+            {},
+        )
+    if not conf:
+        return False
+    model = str(cfg.get("model") or conf.get("model") or "")
+    if not model:
+        return False
+    try:
+        return cap_vision in store.resolve_model_capabilities(
+            str(conf.get("id") or pid), model
+        )
+    except Exception:  # pragma: no cover - settings unreadable
+        return False

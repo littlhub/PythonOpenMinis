@@ -83,87 +83,22 @@ class SubagentDelegateTool:
                 "Error: 'task' is required", False, tool_title=tool_title)
 
         from ..settings.store import SettingsStore
-        from ..agent.subagents import get_subagent
+        from ..agent.subagents import SubagentError, run_subagent
 
         store = SettingsStore.get()
-        cfg = get_subagent(store, sid)
-        if cfg is None:
-            return ToolExecutionResult(
-                f"Error: subagent 不存在: {sid}（先在 助理 页创建，或看可用 id）",
-                False, tool_title=tool_title,
-            )
-
-        # -- build the subagent's own provider ------------------------------
-        # cfg.providerId names a provider *instance*; legacy configs only have
-        # providerType (protocol) → fall back to the first instance of it.
-        from ..settings.chat_service import build_provider
-
-        pid = str(cfg.get("providerId") or cfg.get("providerType") or "")
-        data = store.load()
-        conf = dict(data["providers"].get(pid) or {})
-        if not conf:
-            conf = next(
-                (dict(c) for c in store.provider_instances()
-                 if c.get("type") == pid),
-                {},
-            )
-        if not conf:
-            return ToolExecutionResult(
-                f"Error: subagent {sid} 的模型服务实例不存在: {pid or '(空)'}",
-                False, tool_title=tool_title,
-            )
-        conf["model"] = cfg.get("model") or conf.get("model", "")
         try:
-            provider = build_provider(pid, conf)
-        except Exception as exc:  # missing key / unported engine
+            body = await run_subagent(store, sid, task, session_id)
+        except SubagentError as exc:
+            # 配置层面的问题（id 不存在 / 实例缺失 / 引擎不可用）——
+            # 这些是模型能自己纠正的（换个 id 或告诉用户），所以只回错误文本。
             return ToolExecutionResult(
-                f"Error: subagent {sid} 的模型服务不可用: {exc}",
-                False, tool_title=tool_title,
-            )
-
-        # -- its own tool registry (never the delegate itself) --------------
-        from ..settings.catalog import build_tool_registry
-
-        inner_tools = {
-            name: t for name, t in build_tool_registry(cfg.get("tools") or []).items()
-            if name != SubagentDelegateTool.NAME
-        }
-        persona = cfg.get("persona") or f"你是「{cfg.get('name', sid)}」。用中文回复。"
-
-        from ..agent.agent_runtime import AgentRuntime, AgentRuntimeOptions
-
-        runtime = AgentRuntime(tools=inner_tools)  # silent inner loop
-        messages: list[LLMMessage] = [LLMMessage(LLMMessage.Role.USER, task)]
-        try:
-            _, stop_reason = await runtime.run(
-                provider, messages, session_id=f"{session_id}:sub:{sid}",
-                options=AgentRuntimeOptions(
-                    system_prompt=persona,
-                    max_turns=max(1, min(int(cfg.get("maxRounds", 6)), 12)),
-                ),
+                f"Error: {exc}（先在 助理 页创建，或看可用 id）", False,
+                tool_title=tool_title,
             )
         except Exception as exc:
             logger.warning("subagent %s run failed: %s", sid, exc)
             return ToolExecutionResult(
                 f"Error: subagent {sid} 执行失败: {exc}", False, tool_title=tool_title)
-        finally:
-            close = getattr(provider, "aclose", None)
-            if callable(close):
-                try:
-                    await close()
-                except Exception:  # pragma: no cover
-                    pass
 
-        # collect the assistant text produced after the user message
-        parts: list[str] = []
-        for msg in messages[1:]:
-            if msg.role != LLMMessage.Role.ASSISTANT:
-                continue
-            for part in msg.content_parts:
-                if isinstance(part, Text) and part.text.strip():
-                    parts.append(part.text)
-        body = "\n\n".join(parts).strip()
-        if not body:
-            body = f"(subagent 未产出文字，stop_reason={stop_reason})"
         return ToolExecutionResult(
             f"<subagent:{sid}>\n{body}\n</subagent>", True, tool_title=tool_title)

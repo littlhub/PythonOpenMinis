@@ -131,8 +131,11 @@ def identity_system_prompt(store: SettingsStore) -> str:
 #: 一句"可能直接收到图片"的说明。
 IMAGE_PATH_DISCIPLINE = (
     "\n\n【图片处理】图片不会直接把像素放进你的上下文，你只会拿到图片的"
-    "**路径与尺寸**。需要看懂图片时，用 read_image 工具（它会把图片交给"
-    "「识图」模型，返回文字描述）；若它提示无法读取，就如实告诉用户去"
+    "**路径与尺寸**。需要看懂图片时，按下面的优先级处理："
+    "① 如果消息里指名了识图子代理，用 subagent_delegate 把「看图」这件事"
+    "交给它（它自带识图技能/视觉模型），task 里原样带上图片路径，让它调用"
+    "read_image 并回报图像内容；② 否则用 read_image 工具（会把图片交给"
+    "「识图」模型，返回文字描述）。若两者都提示无法读取，就如实告诉用户去"
     " 设置 → 模型服务 → 用途分槽 配置「识图」模型，或请用户用文字描述图片，"
     "**不要凭路径猜测图片内容**。"
 )
@@ -240,9 +243,15 @@ def build_chat_setup(  # noqa: ANN201
     # Agent 对话参数(模型设置):执行步数上限 + 深度思考 + 子代理助理开关。
     agent_cfg = store.agent_config()
     enabled_ids = list(identity.effective_tools())
-    if not agent_cfg.get("subagentEnabled", True):
-        # 关闭子代理助理:subagent_delegate 从 schema 与执行器里一并移除,
-        # 主模型连尝试的机会都没有(与 memory 开关同一思路)。
+    if agent_cfg.get("subagentEnabled", True):
+        # 子代理委派是**能力开关**而不是身份工具：用户存的 enabled_tools 可能
+        # 早于 subagent_delegate 出现（老 settings.json），照搬会让主 agent
+        # 根本没有委派工具，而「识图交给子代理」这条链就断了。这里补齐。
+        if "subagent_delegate" not in enabled_ids:
+            enabled_ids.append("subagent_delegate")
+    else:
+        # 关闭子代理助理：subagent_delegate 从 schema 与执行器里一并移除，
+        # 主模型连尝试的机会都没有（与 memory 开关同一思路）。
         enabled_ids = [t for t in enabled_ids if t != "subagent_delegate"]
     tools = build_tool_registry(enabled_ids)
     runtime = AgentRuntime(tools=tools, chunk_sink=chunk_sink)
