@@ -134,6 +134,64 @@ export interface HistoryEntry {
 export interface ModelOption {
   id: string
   name: string
+  /** 用途标签(多选,含自定义类型 id):llm=对话 / vision=识图 / image=生图 /
+   *  model3d=3D / audio=音频 / video=视频 / audio_gen=生音频 / video_gen=生视频. */
+  capabilities?: string[]
+  /** 主标签(列表里的第一个),便于旧逻辑兼容展示. */
+  capability?: string
+  /** 标签的中文展示串,例如「对话+识图」. */
+  capabilityLabels?: string
+  /** auto=按模型名推断;user=用户在界面上手动改过. */
+  capabilitySource?: 'auto' | 'user'
+}
+
+/** 模型用途标签(多选)—— 八类。 */
+export type ModelCapability =
+  | 'llm'
+  | 'vision'
+  | 'image'
+  | 'model3d'
+  | 'audio'
+  | 'video'
+  | 'audio_gen'
+  | 'video_gen'
+
+/** 用途槽位 id —— 与八类标签一一对应。 */
+export type SlotId =
+  | 'chat'
+  | 'vision'
+  | 'image'
+  | 'model3d'
+  | 'audio'
+  | 'video'
+  | 'audio_gen'
+  | 'video_gen'
+
+export interface CapabilityInfo {
+  id: ModelCapability | string
+  label: string
+  /** '1' 表示这是用户自定义类型(不是八类内置). */
+  custom?: string
+}
+
+/** 用途槽位:每种用途各绑一个 (实例, 模型). */
+export interface ModelSlotInfo {
+  slot: SlotId
+  label: string
+  /** 该槽位接受的能力(按优先顺序)。 */
+  accepts: ModelCapability[]
+  acceptsLabel: string
+  configured: boolean
+  instanceId: string | null
+  instanceLabel: string
+  model: string
+  /** 当前绑定模型的能力标签;未配置时为 null. */
+  capabilities?: string[]
+  capability: string | null
+  /** 当前绑定模型的能力是否落在这个槽位接受的范围内. */
+  capabilityOk: boolean
+  /** 从已配模型里自动挑出的最佳候选;没有合适的就是 null. */
+  suggested: { instanceId: string; model: string } | null
 }
 
 /** 一个已配置的厂商实例。同 type 可有多条(例如两个 OpenAI 兼容网关)。 */
@@ -149,6 +207,14 @@ export interface ProviderInfo {
   model: string
   defaultModel: string
   models: ModelOption[]
+  /** {modelId: [标签…]} 用户对模型用途标签的手动覆盖(可含自定义类型 id). */
+  modelTypes?: Record<string, string[]>
+  /** 当前所选模型的标签(覆盖优先,否则按 id 推断). */
+  modelCapabilities?: string[]
+  /** 当前所选模型的主标签. */
+  modelCapability?: string | null
+  modelCapabilityLabels?: string
+  modelCapabilitySource?: 'auto' | 'user' | null
   isActive: boolean
 }
 
@@ -188,6 +254,22 @@ export interface SettingsInfo {
   toolCatalog: ToolInfo[]
   /** Agent 对话参数(模型设置):上下文预算/记忆轮次/工具步数/深度思考. */
   agent: AgentConfig
+  /** 模型用途目录(八类 + 自定义类型),供选择按钮使用. */
+  capabilities?: CapabilityInfo[]
+  /** 用户自定义的模型用途类型. */
+  customModelTypes?: CustomModelType[]
+  /** 用途分槽:八种用途当前绑定的模型. */
+  modelSlots?: ModelSlotInfo[]
+}
+
+/** 用户自定义的模型用途类型 —— 自带 JSON 配置与 URL。 */
+export interface CustomModelType {
+  id: string
+  label: string
+  type: string
+  url: string
+  /** 自由 JSON 配置(以字符串保存,便于原样回显). */
+  json: string
 }
 
 /** Agent 对话运行参数 — 对应「模型设置」里的那几项。 */
@@ -196,6 +278,12 @@ export interface AgentConfig {
   maxMemoryRounds: number
   maxToolSteps: number
   deepThinking: boolean
+  /** 是否允许主 Agent 委派子代理助理(subagent_delegate)。 */
+  subagentEnabled?: boolean
+  /** 图片如何进上下文:path=只记路径(默认,省上下文) / inline=多模态直读. */
+  imageContextMode?: 'path' | 'inline'
+  /** 读图/送图前缩放的最大边长(px),用来压住图片的上下文开销. */
+  imageMaxEdge?: number
 }
 
 export interface FetchModelsRequest {
@@ -233,9 +321,17 @@ export interface SettingsPayload {
     apiKey: string
     baseUrl: string
     model: string
+    /** {modelId: [标签…]} — 用户对模型用途标签的手动覆盖(可含自定义 id). */
+    modelTypes?: Record<string, string[]>
   }[]
+  /** 用途槽位:{slot: {instanceId, model} | null}. 传 null 表示清空该槽. */
+  modelSlots?: Partial<
+    Record<SlotId, { instanceId: string; model: string } | null>
+  >
   identityEdits?: { id: string; enabledTools: string[] }[]
   customIdentities?: CustomIdentityDraft[]
+  /** 用户自定义的模型用途类型列表(整体替换). */
+  customModelTypes?: CustomModelType[]
   /** Partial Agent 对话参数 — 只合并传入的键,其余保持默认. */
   agent?: Partial<AgentConfig>
 }

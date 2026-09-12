@@ -37,6 +37,16 @@ from ..soul import SoulStore
 from ..data.model import LLMMessage, LLMStreamChunk
 from ..data.model.agent_content_part import Text
 from ..settings.catalog import MODEL_GROUPS, PROVIDER_TYPES, TOOL_CATALOG
+from ..settings.model_capability import (
+    SLOT_CAPABILITIES,
+    SLOT_LABELS,
+    SLOT_ORDER,
+    capabilities_catalog,
+    capability_label,
+    capability_labels,
+    label_map,
+    pick_slot_model,
+)
 from ..settings.chat_service import ChatSetupError, attribution_snapshot, build_chat_setup
 from ..settings.remote_models import (
     ModelsFetchError,
@@ -252,19 +262,117 @@ async def config_set(path: str, payload: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # settings — model providers + role identities (Web 设置 → 模型服务/身份)
 # ---------------------------------------------------------------------------
+def _extra_labels(store: SettingsStore) -> dict[str, str]:
+    """Label map of built-ins + user custom types (for display strings)."""
+    return label_map(store.custom_model_types())
+
+
 def _provider_models(
-    provider_type: str, conf_dict: dict[str, Any] | None
-) -> list[dict[str, str]]:
+    store: SettingsStore, provider_type: str, conf_dict: dict[str, Any] | None
+) -> list[dict[str, Any]]:
     """Static catalogued models, extended with remote hints fetched from the
     provider's Base URL (``modelHints``), tagged so the UI can tell them
-    apart from the built-in list."""
+    apart from the built-in list.
+
+    Each entry also carries ``capabilities`` (a list of purpose tags: 对话 /
+    识图 / 生图 / 3D / 音频 / 视频 / 生音频 / 生视频, plus any user-defined
+    custom types) and ``capabilitySource`` (``auto`` = id 推断, ``user`` =
+    用户覆盖) so the settings UI can badge each model and let the user re-tag it.
+    """
+    conf_dict = conf_dict or {}
+    pid = str(conf_dict.get("id") or "")
+
+    def entry(mid: str, name: str) -> dict[str, Any]:
+        caps = store.resolve_model_capabilities(pid, mid)
+        src = "user" if pid and mid in store.model_types(pid) else "auto"
+        return {
+            "id": mid,
+            "name": name,
+            "capabilities": caps,
+            "capability": caps[0] if caps else None,
+            "capabilityLabels": capability_labels(caps, _extra_labels(store)),
+            "capabilitySource": src,
+        }
+
     builtin = MODEL_GROUPS.get(provider_type, [])
-    models = [{"id": mid, "name": name} for mid, name in builtin]
+    models = [entry(mid, name) for mid, name in builtin]
     known = {mid for mid, _ in builtin}
-    for hint in (conf_dict or {}).get("modelHints") or []:
+    for hint in conf_dict.get("modelHints") or []:
         if isinstance(hint, str) and hint and hint not in known:
-            models.append({"id": hint, "name": f"{hint}(远程)"})
+            models.append(entry(hint, f"{hint}(远程)"))
+            known.add(hint)
+    # the instance's currently-selected model might be a fully custom id that
+    # is neither catalogued nor fetched — surface it so it can be classified
+    current = str(conf_dict.get("model") or "").strip()
+    if current and current not in known:
+        models.append(entry(current, current))
     return models
+
+
+def _capability_candidates(
+    store: SettingsStore,
+) -> list[tuple[str, str, list[str]]]:
+    """``[(instance_id, model_id, capabilities), …]`` across every configured
+    instance — the pool used to auto-suggest a model per purpose slot."""
+    out: list[tuple[str, str, list[str]]] = []
+    for conf in store.provider_instances():
+        iid = str(conf.get("id") or "")
+        seen: set[str] = set()
+        for mid, _ in MODEL_GROUPS.get(str(conf.get("type") or ""), []):
+            if mid in seen:
+                continue
+            seen.add(mid)
+            out.append((iid, mid, store.resolve_model_capabilities(iid, mid)))
+        for hint in conf.get("modelHints") or []:
+            if isinstance(hint, str) and hint and hint not in seen:
+                seen.add(hint)
+                out.append((iid, hint, store.resolve_model_capabilities(iid, hint)))
+        cur = str(conf.get("model") or "").strip()
+        if cur and cur not in seen:
+            out.append((iid, cur, store.resolve_model_capabilities(iid, cur)))
+    return out
+
+
+def _slots_view(
+    store: SettingsStore, labels: dict[str, str]
+) -> list[dict[str, Any]]:
+    """Purpose-slot view: what is bound + whether it fits + an auto suggestion."""
+    cands = _capability_candidates(store)
+    slots: list[dict[str, Any]] = []
+    for slot in SLOT_ORDER:
+        accepts = list(SLOT_CAPABILITIES[slot])
+        entry: dict[str, Any] = {
+            "slot": slot,
+            "label": SLOT_LABELS[slot],
+            "accepts": accepts,
+            "acceptsLabel": " 或 ".join(capability_label(c) for c in accepts),
+        }
+        binding = store.slot_binding(slot)
+        if binding is None:
+            entry.update({
+                "configured": False, "instanceId": None, "instanceLabel": "",
+                "model": "", "capabilities": [], "capability": None,
+                "capabilityOk": False,
+            })
+        else:
+            conf, model = binding
+            iid = str(conf.get("id") or "")
+            caps = store.resolve_model_capabilities(iid, model)
+            entry.update({
+                "configured": True,
+                "instanceId": iid,
+                "instanceLabel": labels.get(iid, iid),
+                "model": model,
+                "capabilities": caps,
+                "capability": caps[0] if caps else None,
+                "capabilityOk": any(c in accepts for c in caps),
+            })
+        pick = pick_slot_model(cands, slot)
+        entry["suggested"] = (
+            {"instanceId": pick[0], "model": pick[1]} if pick else None
+        )
+        slots.append(entry)
+    return slots
 
 
 def _settings_view(store: SettingsStore | None = None) -> dict[str, Any]:
@@ -275,6 +383,11 @@ def _settings_view(store: SettingsStore | None = None) -> dict[str, Any]:
         ptype = str(conf.get("type") or "")
         meta = next((m for m in PROVIDER_TYPES if m.type == ptype), None)
         label = str(conf.get("label") or "").strip()
+        models = _provider_models(store, ptype, conf)
+        current = str(conf.get("model") or "").strip()
+        pid = str(conf.get("id") or "")
+        current_caps = store.resolve_model_capabilities(pid, current) if current else []
+        current_src = "user" if (current and current in store.model_types(pid)) else "auto"
         providers.append(
             {
                 "id": str(conf.get("id") or ""),
@@ -285,12 +398,21 @@ def _settings_view(store: SettingsStore | None = None) -> dict[str, Any]:
                 "note": meta.note if meta else "",
                 "hasKey": bool(conf.get("apiKey")),
                 "baseUrl": conf.get("baseUrl", ""),
-                "model": (conf.get("model") or (meta.default_model if meta else "")),
+                "model": current or (meta.default_model if meta else ""),
                 "defaultModel": meta.default_model if meta else "",
-                "models": _provider_models(ptype, conf),
+                "models": models,
+                "modelTypes": store.model_types(str(conf.get("id") or "")),
+                "modelCapabilities": current_caps if current else [],
+                "modelCapability": (current_caps[0] if current_caps and current else None),
+                "modelCapabilityLabels": (
+                    capability_labels(current_caps, _extra_labels(store))
+                    if current else ""
+                ),
+                "modelCapabilitySource": current_src if current else None,
                 "isActive": data.get("activeProviderId") == conf.get("id"),
             }
         )
+    labels = {str(p["id"]): str(p["label"]) for p in providers}
     provider_types = [
         {
             "type": m.type,
@@ -322,6 +444,9 @@ def _settings_view(store: SettingsStore | None = None) -> dict[str, Any]:
         "identities": identities,
         "toolCatalog": TOOL_CATALOG,
         "agent": store.agent_config(),
+        "capabilities": capabilities_catalog(store.custom_model_types()),
+        "customModelTypes": store.custom_model_types(),
+        "modelSlots": _slots_view(store, labels),
     }
 
 

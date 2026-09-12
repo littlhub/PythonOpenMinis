@@ -89,23 +89,51 @@ class VisionGroupResolver:
 
     @staticmethod
     def is_configured() -> bool:
-        """T-android mirror — would query the ProviderRepository for a Vision
-        Group. Python has no such notion today, so this returns False and
-        ``read_image`` falls through to "image bytes returned directly". A
-        future port can wire this to settings.identity.vision_group_id.
+        """True when a 识图槽（vision slot）is bound to (实例, 模型)。
+
+        Python 端把 Kotlin 的 Vision Group 落成设置里的「用途分槽 → 识图」：
+        只要用户在界面把识图槽指到一个模型，``read_image`` 就会被暴露，主模型
+        没有原生视觉时也能通过描述"看懂"图片（见 ``settings/vision_service``）。
+
+        懒加载 store 以避免 ``tools`` → ``settings`` 的模块级循环依赖；存储
+        不可读时返回 False（安全默认：不假装有条件）。
         """
-        return False
+        try:
+            from ..settings.store import SettingsStore
+
+            return SettingsStore.get().slot_binding("vision") is not None
+        except Exception:  # pragma: no cover - settings unreadable
+            return False
 
     @staticmethod
     def candidates() -> list:
-        """Empty list — see ``is_configured``. Returning [] is the only safe
-        default for a no-vision-group configuration.
-        """
-        return []
+        """The vision slot binding as a one-element list, or [] when unset."""
+        try:
+            from ..settings.store import SettingsStore
+
+            hit = SettingsStore.get().slot_binding("vision")
+        except Exception:  # pragma: no cover
+            return []
+        if hit is None:
+            return []
+        conf, model = hit
+        return [{"instanceId": str(conf.get("id") or ""), "model": model}]
 
     @staticmethod
     def group_name() -> Optional[str]:
-        return None
+        """Label of the instance backing the 识图槽 (``None`` when unset)."""
+        try:
+            from ..settings.store import SettingsStore, provider_type_label
+
+            store = SettingsStore.get()
+            hit = store.slot_binding("vision")
+            if hit is None:
+                return None
+            conf, _model = hit
+            label = str(conf.get("label") or "").strip()
+            return label or provider_type_label(str(conf.get("type") or "")) or None
+        except Exception:  # pragma: no cover
+            return None
 
     @staticmethod
     def no_vision_image_placeholder(path: Optional[str]) -> str:

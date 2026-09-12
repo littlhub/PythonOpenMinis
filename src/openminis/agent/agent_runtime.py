@@ -81,6 +81,12 @@ class AgentRuntimeOptions:
     #: never summarized" spiral (ReAct loop that never exits on its own).
     #: ``None`` derives a safe default from ``max_turns`` (see ``run``).
     wrap_up_rounds: Optional[int] = None
+    #: 图片如何进上下文。
+    #: ``"path"``（默认）—— 图片**字节不进上下文**，工具结果里只留路径与元数据；
+    #: 真正"看图"交给识图槽（返回文本描述）或子代理，上下文只承担文本开销。
+    #: ``"inline"`` —— 把工具产出的图片字节作为 image_parts 附到下一次请求，
+    #: 多模态主模型能直接看图，代价是 base64 长期吃上下文（原项目行为）。
+    image_context_mode: str = "path"
     #: Kotlin's per-tool-category timeout defaults (seconds).
     tool_timeout: float = 900.0
 
@@ -181,6 +187,12 @@ class AgentRuntime:
             opts.wrap_up_rounds if opts.wrap_up_rounds is not None
             else max(6, min(12, opts.max_turns))
         )
+        #: 上一轮工具返回的图片（read_image / 截图…）。工具输出里的图片字节
+        #: 原先被 loop 直接丢弃，模型永远看不到图 —— 这里收集起来，在**下一次**
+        #: 请求时作为 image_parts 附到末尾 user 消息上。有原生视觉的多模态模型
+        #: 直接看图；没有视觉的模型由 provider 自动换成文本占位（不报错）。
+        #: 只在紧接着的那一次请求里带一帧，避免把 base64 常驻进历史反复计费。
+        pending_image_parts: list[LLMMessage.ImagePart] = []
 
         for turn in range(opts.max_turns):
             turn_start = len(messages)
@@ -196,9 +208,13 @@ class AgentRuntime:
                     opts.system_prompt,
                     opts.max_tokens,
                     opts.temperature,
+                    image_parts=pending_image_parts or None,
                     tools=tool_defs,
                     thinking_level=opts.thinking_level,
                 )
+                # 这一帧已交给本次请求（provider 在迭代时才组装请求体，所以
+                # 是重新绑定而非原地清空，旧列表仍被引用）。
+                pending_image_parts = []
                 async for chunk in stream:
                     await self._emit(chunk)
                     if chunk is LLMStreamChunk.Started:  # singleton instance
@@ -350,15 +366,29 @@ class AgentRuntime:
                 if not result.success and not result.output.startswith("[command timed out"):
                     out_text = out_text or "(failed with no output)"
 
+                # 图片进上下文的方式由 ``image_context_mode`` 决定:
+                #   path(默认) —— 只留路径/元数据,图片字节既不进历史也不进请求,
+                #                 "看图"交给识图槽/子代理,上下文只承担文本;
+                #   inline      —— 附到下一轮请求,prompt 多模态主模型直接读图。
+                _inline_images = (opts.image_context_mode or "path").lower() == "inline"
                 tool_result_parts.append(ToolResult(
                     id=tu.id, name=tu.name, content=out_text,
                     is_error=not result.success,
+                    image_data=result.image_data if _inline_images else None,
+                    image_mime_type=result.image_mime_type if _inline_images else None,
+                    image_linux_path=result.image_linux_path if _inline_images else None,
                 ))
                 # Notify the UI chunk sink that this tool call has finished.
                 await self._emit(LLMStreamChunk.ToolResult(
                     id=tu.id, name=tu.name, content=out_text,
                     is_error=not result.success,
                 ))
+                if _inline_images and result.success and result.image_data:
+                    pending_image_parts.append(LLMMessage.ImagePart(
+                        data=result.image_data,
+                        mime_type=result.image_mime_type or "image/png",
+                        linux_path=result.image_linux_path,
+                    ))
 
             # ── 5. append the tool-result turn and continue ────────────────
             if tool_result_parts:

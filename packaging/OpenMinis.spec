@@ -52,6 +52,14 @@ hiddenimports = [
     # PyInstaller's static scan never sees it. Without this the frozen binary
     # dies with "ModuleNotFoundError: No module named 'aiosqlite'".
     "aiosqlite",
+    # read_image 用 Pillow 做 2000px 缩放 + JPEG 重编码。PIL.Image 是函数内
+    # 延迟导入、且图片插件（JpegImagePlugin 等）按需加载 —— 显式列出来，
+    # 免得冻结版 read_image 一调用就 "requires Pillow"。
+    "PIL",
+    "PIL.Image",
+    "PIL.ImageFile",
+    "PIL.JpegImagePlugin",
+    "PIL.PngImagePlugin",
     "uvicorn.logging",
     "uvicorn.loops",
     "uvicorn.loops.auto",
@@ -75,7 +83,6 @@ excludes = [
     "numpy",
     "pandas",
     "scipy",
-    "PIL",
     "IPython",
     "pytest",
     "_pytest",

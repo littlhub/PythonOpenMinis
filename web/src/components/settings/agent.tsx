@@ -3,18 +3,76 @@
  * Shared edits stage locally and commit with one Save — the store accepts
  * partial payloads so each page only sends what it changed.
  */
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api } from '../../api'
 import type {
   Attribution,
   CustomIdentityDraft,
+  CustomModelType,
   MemoryFileInfo,
+  ModelSlotInfo,
   ProviderInfo,
   SettingsInfo,
   UsageModelStats,
 } from '../../types'
 import { DetailShell, Note, SectionCard, Spinner, StatusLine, useAsync } from './ui'
 import type { SetPageId } from './entries'
+
+// ---------------------------------------------------------------------------
+// 模型用途标签 (对话 / 识图 / 生图 / 3D / 音频 / 视频 / 生音频 / 生视频 + 自定义)
+// ---------------------------------------------------------------------------
+const CAP_LABEL: Record<string, string> = {
+  llm: '对话',
+  vision: '识图',
+  image: '生图',
+  model3d: '3D',
+  audio: '音频',
+  video: '视频',
+  audio_gen: '生音频',
+  video_gen: '生视频',
+}
+
+const CAP_CLASS: Record<string, string> = {
+  llm: 'cap-llm',
+  vision: 'cap-vision',
+  image: 'cap-image',
+  model3d: 'cap-3d',
+  audio: 'cap-audio',
+  video: 'cap-video',
+  audio_gen: 'cap-audio-gen',
+  video_gen: 'cap-video-gen',
+}
+
+/** 标签展示名：内置优先 → 自定义类型 → 回退 id。 */
+const capLabel = (id: string, extra?: Record<string, string>) =>
+  extra?.[id] ?? CAP_LABEL[id] ?? id
+
+/** 用途徽标(可多个) —— 颜色区分,一眼看出这个模型能干什么。 */
+function CapBadge(props: {
+  caps?: string[] | null
+  cap?: string | null
+  source?: string | null
+  labels?: Record<string, string>
+}) {
+  const caps = props.caps ?? (props.cap ? [props.cap] : [])
+  if (caps.length === 0) return null
+  return (
+    <span className="cap-badges">
+      {caps.map((c) => (
+        <span
+          key={c}
+          className={`cap-badge ${CAP_CLASS[c] ?? 'cap-custom'}`}
+          title={props.source === 'user' ? '手动指定' : '按模型名自动推断'}
+        >
+          {capLabel(c, props.labels)}
+        </span>
+      ))}
+      {props.source === 'user' && (
+        <span className="cap-badge cap-user" title="用户手动指定">自定</span>
+      )}
+    </span>
+  )
+}
 
 // ---------------------------------------------------------------------------
 // shared bits
@@ -55,7 +113,16 @@ interface ProviderRow {
   engine: string | null
   note: string
   defaultModel: string
-  models: { id: string; name: string }[]
+  models: {
+    id: string
+    name: string
+    capabilities?: string[]
+    capability?: string
+    capabilityLabels?: string
+    capabilitySource?: string
+  }[]
+  /** {modelId: [标签…]} 用户手动指定的模型用途(可含自定义类型 id)。 */
+  modelTypes: Record<string, string[]>
   saved: boolean // false = 本次新增,还没 POST 过
 }
 
@@ -63,8 +130,20 @@ const rowFrom = (p: ProviderInfo): ProviderRow => ({
   id: p.id, type: p.type, label: p.label, typeLabel: p.typeLabel,
   apiKey: '', baseUrl: p.baseUrl, model: p.model, hasKey: p.hasKey,
   engine: p.engine, note: p.note, defaultModel: p.defaultModel,
-  models: [...p.models], saved: true,
+  models: [...p.models], modelTypes: { ...(p.modelTypes ?? {}) }, saved: true,
 })
+
+/** 当前所选模型的用途标签：手动覆盖优先，否则用服务端推断值。 */
+const capabilitiesOf = (r: ProviderRow, modelId: string): string[] => {
+  const ov = r.modelTypes[modelId]
+  if (ov && ov.length) return ov
+  const m = r.models.find((x) => x.id === modelId)
+  return m?.capabilities ?? (m?.capability ? [m.capability] : [])
+}
+const capabilitySourceOf = (r: ProviderRow, modelId: string): 'auto' | 'user' =>
+  (r.modelTypes[modelId]?.length ?? 0) > 0
+    ? 'user'
+    : (r.models.find((x) => x.id === modelId)?.capabilitySource === 'user' ? 'user' : 'auto')
 
 export function ProvidersPage(props: { onBack: () => void }) {
   const [settings, setSettings] = useState<SettingsInfo | null>(null)
@@ -74,9 +153,28 @@ export function ProvidersPage(props: { onBack: () => void }) {
   const [saving, setSaving] = useState(false)
   const [activeProvider, setActiveProvider] = useState<string | null>(null)
   const [rows, setRows] = useState<ProviderRow[]>([])
+  const [slots, setSlots] = useState<ModelSlotInfo[]>([])
   const [fetchBusy, setFetchBusy] = useState<Record<string, boolean>>({})
+  const [customs, setCustoms] = useState<CustomModelType[]>([])
+  /** 正在编辑/新增的自定义类型(非 null 时展开表单)。 */
+  const [draft, setDraft] = useState<CustomModelType | null>(null)
+  const [customErr, setCustomErr] = useState<string | null>(null)
   const [fetchMsg, setFetchMsg] = useState<Record<string, FetchMsg | undefined>>({})
   const [newType, setNewType] = useState('')
+
+  /** 自定义类型 id → 显示名，供徽标渲染。 */
+  const extraLabels = useMemo(
+    () => Object.fromEntries(customs.map((ct) => [ct.id, ct.label])) as Record<string, string>,
+    [customs],
+  )
+  /** 选择按钮用的用途清单：八类内置 + 本地自定义(即时可见)。 */
+  const capOptions = useMemo(
+    () => [
+      ...((settings?.capabilities ?? []).filter((c) => !c.custom)),
+      ...customs.map((ct) => ({ id: ct.id, label: ct.label, custom: '1' as const })),
+    ],
+    [settings, customs],
+  )
 
   const load = useCallback(async () => {
     setLoading(true)
@@ -86,6 +184,8 @@ export function ProvidersPage(props: { onBack: () => void }) {
       setSettings(s)
       setActiveProvider(s.activeProviderId)
       setRows(s.providers.map(rowFrom))
+      setSlots(s.modelSlots ?? [])
+      setCustoms(s.customModelTypes ?? [])
       setNewType(s.providerTypes[0]?.type ?? '')
     } catch (e) {
       setError((e as Error).message)
@@ -110,10 +210,25 @@ export function ProvidersPage(props: { onBack: () => void }) {
         apiKey: r.apiKey,
         baseUrl: r.baseUrl,
         model: r.model,
+        modelTypes: r.modelTypes,
       }))
-      const s = await api.settingsPut({ activeProviderId: activeProvider, providers })
-      setSettings(s)
-      setRows(s.providers.map(rowFrom))
+      // 只提交识图/生图两个可编辑槽。对话槽由 activeProviderId + 该实例的
+      // model 派生（单一事实来源），不用在这里重复提交，免得跟厂商卡片打架。
+      const modelSlots: Record<string, { instanceId: string; model: string } | null> = {}
+      for (const s of slots) {
+        if (s.slot === 'chat') continue
+        modelSlots[s.slot] = s.instanceId && s.model ? { instanceId: s.instanceId, model: s.model } : null
+      }
+      const res = await api.settingsPut({
+        activeProviderId: activeProvider,
+        providers,
+        modelSlots,
+        customModelTypes: customs,
+      })
+      setSettings(res)
+      setRows(res.providers.map(rowFrom))
+      setSlots(res.modelSlots ?? [])
+      setCustoms(res.customModelTypes ?? [])
       setSaved('已保存 ✓')
       setTimeout(() => setSaved(null), 2500)
     } catch (e) {
@@ -121,10 +236,61 @@ export function ProvidersPage(props: { onBack: () => void }) {
     } finally {
       setSaving(false)
     }
-  }, [rows, activeProvider])
+  }, [rows, activeProvider, slots, customs])
 
   const patch = (id: string, p: Partial<ProviderRow>) =>
     setRows((prev) => prev.map((r) => (r.id === id ? { ...r, ...p } : r)))
+
+  /** 新增/更新一个自定义类型(仅本地暂存,保存按钮才落盘)。 */
+  const commitDraft = () => {
+    if (!draft) return
+    const id = (draft.id || '').trim()
+    const label = (draft.label || '').trim()
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,47}$/.test(id)) {
+      setCustomErr('类型 id 需字母数字开头，可含 . _ -，不超过 48 字')
+      return
+    }
+    if (!label) {
+      setCustomErr('请填写显示名')
+      return
+    }
+    if (draft.json.trim()) {
+      try {
+        JSON.parse(draft.json)
+      } catch {
+        setCustomErr('JSON 配置不是合法的 JSON')
+        return
+      }
+    }
+    setCustomErr(null)
+    setCustoms((prev) => {
+      const i = prev.findIndex((x) => x.id === id)
+      const next = [...prev]
+      const item: CustomModelType = { id, label, type: draft.type.trim(), url: draft.url.trim(), json: draft.json }
+      if (i >= 0) next[i] = item
+      else next.push(item)
+      return next
+    })
+    setDraft(null)
+  }
+
+  const removeCustom = (id: string) => {
+    setCustoms((prev) => prev.filter((x) => x.id !== id))
+    // 同时把各模型上已勾选该类型的标签清掉，避免留下悬空 id
+    setRows((prev) =>
+      prev.map((r) => {
+        const next: Record<string, string[]> = {}
+        for (const [mid, caps] of Object.entries(r.modelTypes)) {
+          const after = caps.filter((c) => c !== id)
+          if (after.length) next[mid] = after
+        }
+        return { ...r, modelTypes: next }
+      }),
+    )
+  }
+
+  const patchSlot = (slot: string, p: Partial<ModelSlotInfo>) =>
+    setSlots((prev) => prev.map((s) => (s.slot === slot ? { ...s, ...p } : s)))
 
   const nextId = (type: string) => {
     const used = new Set(rows.map((r) => r.id))
@@ -143,7 +309,7 @@ export function ProvidersPage(props: { onBack: () => void }) {
         id: nextId(t.type), type: t.type, label: t.label, typeLabel: t.label,
         apiKey: '', baseUrl: '', model: t.defaultModel, hasKey: false,
         engine: t.engine, note: t.note, defaultModel: t.defaultModel,
-        models: [], saved: false,
+        models: [], modelTypes: {}, saved: false,
       },
     ])
     setError(null)
@@ -212,6 +378,11 @@ export function ProvidersPage(props: { onBack: () => void }) {
           <strong>
             {current.label || current.typeLabel} · {current.model || '未设模型'}
           </strong>
+          <CapBadge
+            caps={capabilitiesOf(current, current.model)}
+            source={capabilitySourceOf(current, current.model)}
+            labels={extraLabels}
+          />
           <span className="muted"> ({current.id})</span>
         </p>
       )}
@@ -278,9 +449,117 @@ export function ProvidersPage(props: { onBack: () => void }) {
                   />
                   <datalist id={`models-${r.id}`} key={`${r.id}-${r.models.length}`}>
                     {r.models.map((m) => (
-                      <option key={m.id} value={m.id}>{m.name}</option>
+                      <option key={m.id} value={m.id}>
+                        {m.name} · {m.capabilityLabels ?? CAP_LABEL[m.capability ?? 'llm']}
+                      </option>
                     ))}
                   </datalist>
+                </label>
+                <label className="wide">
+                  <span className="field-row">
+                    模型用途（可多选）
+                    <CapBadge
+                      caps={capabilitiesOf(r, r.model)}
+                      source={capabilitySourceOf(r, r.model)}
+                      labels={extraLabels}
+                    />
+                  </span>
+                  <div className="cap-picker">
+                    {capOptions.map((c) => {
+                      const on = (r.modelTypes[r.model] ?? []).includes(c.id)
+                      const cls = CAP_CLASS[c.id] ?? 'cap-custom'
+                      return (
+                        <button
+                          type="button"
+                          key={c.id}
+                          className={`chip cap-chip ${cls} ${on ? 'on' : ''}`}
+                          disabled={!r.model}
+                          title={c.custom ? '自定义类型' : undefined}
+                          onClick={() => {
+                            const cur = r.modelTypes[r.model] ?? []
+                            const next = { ...r.modelTypes }
+                            const after = on ? cur.filter((x) => x !== c.id) : [...cur, c.id]
+                            if (after.length) next[r.model] = after
+                            else delete next[r.model]
+                            patch(r.id, { modelTypes: next })
+                          }}
+                        >
+                          {on ? '✓ ' : ''}
+                          {c.label}
+                        </button>
+                      )
+                    })}
+                    <button
+                      type="button"
+                      className="chip cap-chip cap-add"
+                      title="新增自定义用途类型"
+                      onClick={() => {
+                        setCustomErr(null)
+                        setDraft({ id: '', label: '', type: '', url: '', json: '' })
+                      }}
+                    >
+                      ＋ 自定义
+                    </button>
+                    <button
+                      type="button"
+                      className="link"
+                      disabled={!r.model || !(r.modelTypes[r.model]?.length)}
+                      title="清除手动指定，回到按模型名自动推断"
+                      onClick={() => {
+                        const next = { ...r.modelTypes }
+                        delete next[r.model]
+                        patch(r.id, { modelTypes: next })
+                      }}
+                    >
+                      自动（{capabilitiesOf(r, r.model).map((c) => capLabel(c, extraLabels)).join('+') || '未知'}）
+                    </button>
+                  </div>
+                  {draft && (
+                    <div className="custom-type-form">
+                      <div className="ctf-row">
+                        <input
+                          className="ctf-id"
+                          placeholder="类型 id（英文/数字，如 my-tts）"
+                          value={draft.id}
+                          onChange={(e) => setDraft({ ...draft, id: e.target.value })}
+                        />
+                        <input
+                          className="ctf-label"
+                          placeholder="显示名（如 我家语音）"
+                          value={draft.label}
+                          onChange={(e) => setDraft({ ...draft, label: e.target.value })}
+                        />
+                      </div>
+                      <div className="ctf-row">
+                        <input
+                          className="ctf-type"
+                          placeholder="类型（如 tts / image / custom）"
+                          value={draft.type}
+                          onChange={(e) => setDraft({ ...draft, type: e.target.value })}
+                        />
+                        <input
+                          className="ctf-url"
+                          placeholder="URL（接口地址，如 https://api.example.com/v1）"
+                          value={draft.url}
+                          onChange={(e) => setDraft({ ...draft, url: e.target.value })}
+                        />
+                      </div>
+                      <textarea
+                        className="ctf-json"
+                        rows={3}
+                        placeholder='JSON 配置，可留空。例：{"method":"POST","path":"/audio/speech"}'
+                        value={draft.json}
+                        onChange={(e) => setDraft({ ...draft, json: e.target.value })}
+                      />
+                      {customErr && <Note kind="warn">{customErr}</Note>}
+                      <div className="ctf-actions">
+                        <button type="button" onClick={commitDraft}>加入类型</button>
+                        <button type="button" className="link" onClick={() => { setDraft(null); setCustomErr(null) }}>
+                          取消
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </label>
                 <label className="wide">
                   Base URL (可选)
@@ -310,6 +589,181 @@ export function ProvidersPage(props: { onBack: () => void }) {
           )
         })}
       </div>
+
+      <SectionCard
+        title="自定义模型类型"
+        hint="八类内置用途之外，可自建类型（自带 JSON 配置与 URL）。加好后会出现在每个模型的「模型用途」按钮里，勾选即生效。"
+        extra={
+          <button
+            type="button"
+            onClick={() => {
+              setCustomErr(null)
+              setDraft({ id: '', label: '', type: '', url: '', json: '' })
+            }}
+          >
+            ＋ 添加类型
+          </button>
+        }
+      >
+        {customs.length === 0 && !draft && (
+          <p className="empty">还没有自定义类型。点右上角「添加类型」新建一个。</p>
+        )}
+        {customs.length > 0 && (
+          <ul className="custom-type-list">
+            {customs.map((ct) => (
+              <li key={ct.id} className="custom-type-item">
+                <span className="cap-badge cap-custom">{ct.label}</span>
+                <span className="muted ct-id">{ct.id}</span>
+                {ct.type && <span className="pill soft">{ct.type}</span>}
+                {ct.url && <span className="muted ct-url" title={ct.url}>{shortUrl(ct.url)}</span>}
+                <span className="spacer" />
+                <button
+                  type="button"
+                  className="link"
+                  onClick={() => { setCustomErr(null); setDraft({ ...ct }) }}
+                >
+                  编辑
+                </button>
+                <button type="button" className="link danger" onClick={() => removeCustom(ct.id)}>
+                  删除
+                </button>
+              </li>
+            ))}
+          </ul>
+        )}
+        {draft && (
+          <div className="custom-type-form">
+            <div className="ctf-row">
+              <input
+                className="ctf-id"
+                placeholder="类型 id（英文/数字，如 my-tts）"
+                value={draft.id}
+                onChange={(e) => setDraft({ ...draft, id: e.target.value })}
+              />
+              <input
+                className="ctf-label"
+                placeholder="显示名（如 我家语音）"
+                value={draft.label}
+                onChange={(e) => setDraft({ ...draft, label: e.target.value })}
+              />
+            </div>
+            <div className="ctf-row">
+              <input
+                className="ctf-type"
+                placeholder="类型（如 tts / image / custom）"
+                value={draft.type}
+                onChange={(e) => setDraft({ ...draft, type: e.target.value })}
+              />
+              <input
+                className="ctf-url"
+                placeholder="URL（接口地址，如 https://api.example.com/v1）"
+                value={draft.url}
+                onChange={(e) => setDraft({ ...draft, url: e.target.value })}
+              />
+            </div>
+            <textarea
+              className="ctf-json"
+              rows={3}
+              placeholder='JSON 配置，可留空。例：{"method":"POST","path":"/audio/speech"}'
+              value={draft.json}
+              onChange={(e) => setDraft({ ...draft, json: e.target.value })}
+            />
+            {customErr && <Note kind="warn">{customErr}</Note>}
+            <div className="ctf-actions">
+              <button type="button" onClick={commitDraft}>保存类型</button>
+              <button type="button" className="link" onClick={() => { setDraft(null); setCustomErr(null) }}>
+                取消
+              </button>
+            </div>
+          </div>
+        )}
+      </SectionCard>
+
+      <SectionCard
+        title="用途分槽"
+        hint="把每种用途各绑到一个模型（对话 / 识图 / 生图 / 3D / 音频 / 视频 / 生音频 / 生视频）。图片默认只传路径，识图槽负责真正「看懂」图片；生图槽负责出图。同一厂商实例可以同时承担多个槽。"
+      >
+        {slots.length === 0 && <p className="empty">暂无槽位信息。</p>}
+        <div className="slot-list">
+          {slots.map((s) => {
+            const inst = rows.find((r) => r.id === s.instanceId)
+            const modelOpts = inst
+              ? [...inst.models.map((m) => m.id), ...(s.model && !inst.models.some((m) => m.id === s.model) ? [s.model] : [])]
+              : []
+            return (
+              <div key={s.slot} className="slot-row">
+                <div className="slot-head">
+                  <strong>{s.label}</strong>
+                  <span className="muted">（接受：{s.acceptsLabel}）</span>
+                  <CapBadge
+                    caps={s.capabilities ?? (s.capability ? [s.capability] : [])}
+                    labels={extraLabels}
+                  />
+                  {s.configured && !s.capabilityOk && (
+                    <span className="pill warn">能力不匹配</span>
+                  )}
+                  {!s.configured && <span className="pill warn">未配置</span>}
+                </div>
+                {s.slot === 'chat' ? (
+                  <p className="muted">
+                    当前对话模型：{s.configured ? `${s.instanceLabel} · ${s.model}` : '未设置'}
+                    <span className="muted">（在下方厂商卡片里改）</span>
+                  </p>
+                ) : (
+                  <div className="slot-fields">
+                    <select
+                      value={s.instanceId ?? ''}
+                      onChange={(e) => patchSlot(s.slot, { instanceId: e.target.value || null, model: '' })}
+                    >
+                      <option value="">— 选厂商实例 —</option>
+                      {rows.map((r) => (
+                        <option key={r.id} value={r.id}>
+                          {r.label || r.typeLabel} ({r.id})
+                        </option>
+                      ))}
+                    </select>
+                    <select
+                      value={s.model}
+                      disabled={!s.instanceId}
+                      onChange={(e) => patchSlot(s.slot, { model: e.target.value })}
+                    >
+                      <option value="">— 选模型 —</option>
+                      {modelOpts.map((mid) => (
+                        <option key={mid} value={mid}>{mid}</option>
+                      ))}
+                    </select>
+                    <input
+                      className="slot-model-input"
+                      placeholder="或手填模型 ID"
+                      value={s.model}
+                      onChange={(e) => patchSlot(s.slot, { model: e.target.value })}
+                    />
+                    <button
+                      type="button"
+                      className="link"
+                      disabled={!s.suggested}
+                      title={s.suggested ? `自动选：${s.suggested.model}` : '没有合适能力的模型'}
+                      onClick={() =>
+                        s.suggested &&
+                        patchSlot(s.slot, { instanceId: s.suggested.instanceId, model: s.suggested.model })
+                      }
+                    >
+                      自动选择
+                    </button>
+                    <button
+                      type="button"
+                      className="link danger"
+                      onClick={() => patchSlot(s.slot, { instanceId: null, model: '' })}
+                    >
+                      清除
+                    </button>
+                  </div>
+                )}
+              </div>
+            )
+          })}
+        </div>
+      </SectionCard>
 
       <SectionCard
         title="添加厂商"
@@ -774,6 +1228,9 @@ export function AgentConfigPage(props: { onBack: () => void }) {
     maxMemoryRounds: number
     maxToolSteps: number
     deepThinking: boolean
+    subagentEnabled?: boolean
+    imageContextMode?: 'path' | 'inline'
+    imageMaxEdge?: number
   } | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -825,7 +1282,7 @@ export function AgentConfigPage(props: { onBack: () => void }) {
   return (
     <DetailShell
       title="对话参数"
-      subtitle="控制 Agent 单次对话的上下文预算、压缩时机与工具步数上限。"
+      subtitle="控制 Agent 单次对话的上下文预算、压缩时机、工具步数上限，以及图片如何进入上下文。"
       onBack={props.onBack}
     >
       {error && <Note kind="warn">{error}</Note>}
@@ -902,6 +1359,66 @@ export function AgentConfigPage(props: { onBack: () => void }) {
                   </div>
                 </div>
               </div>
+              <div
+                className="cfg-row"
+                style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '4px 0' }}
+              >
+                <label className="skill-toggle" title="是否调用子agent助理">
+                  <input
+                    type="checkbox"
+                    checked={cfg.subagentEnabled ?? true}
+                    onChange={(e) => setCfg({ ...cfg, subagentEnabled: e.target.checked })}
+                  />
+                  <span className="skill-toggle-track" />
+                </label>
+                <div>
+                  <div style={{ fontWeight: 600 }}>调用子agent助理</div>
+                  <div className="muted" style={{ fontSize: 12 }}>
+                    允许主 Agent 把子任务委派给已配置的子代理;关闭后子代理工具不再下发
+                  </div>
+                </div>
+              </div>
+            </div>
+          </SectionCard>
+
+          <SectionCard
+            title="图片处理"
+            hint="图片的上下文开销随像素增长：默认只把「路径」记进上下文，看懂图片交给识图槽；最大边长可调，用来压住开销。"
+          >
+            <div className="provider-fields">
+              <label className="wide">
+                <span>图片进上下文方式</span>
+                <select
+                  value={cfg.imageContextMode ?? 'path'}
+                  onChange={(e) =>
+                    setCfg({ ...cfg, imageContextMode: e.target.value as 'path' | 'inline' })
+                  }
+                >
+                  <option value="path">只传路径（默认，省上下文）</option>
+                  <option value="inline">直接传图片（多模态主模型直读）</option>
+                </select>
+                <span className="muted" style={{ fontSize: 12 }}>
+                  只传路径：上下文里只有路径+尺寸，需要看图时由「识图」模型返回文字描述，
+                  或交给子代理代办；直接传图片：多模态主模型能直接看图，但 base64 会长期占用上下文。
+                </span>
+              </label>
+              <label className="wide">
+                <span>图片最大边长（像素）</span>
+                <input
+                  type="number"
+                  min={128}
+                  max={8192}
+                  step={128}
+                  value={cfg.imageMaxEdge ?? 2000}
+                  onChange={(e) =>
+                    setCfg({ ...cfg, imageMaxEdge: Number(e.target.value) || 2000 })
+                  }
+                />
+                <span className="muted" style={{ fontSize: 12 }}>
+                  读图/送图前把长边缩到这个上限（默认 2000）。调小可显著降低图片的
+                  token / 上下文开销，代价是细节变糊（建议 1024–2000）。
+                </span>
+              </label>
             </div>
           </SectionCard>
 

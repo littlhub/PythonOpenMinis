@@ -9,10 +9,12 @@ UI may offer) separate from the *store* (what the user configured).
 
 from __future__ import annotations
 
+import json
 import types
 from dataclasses import dataclass, field
 
 from ..agent.agent_runtime import ToolExecutor
+from ..core.logging import get_logger
 from ..data.model import LLMModel
 from ..data.model.agent_tool_definition import AgentToolDefinition
 from ..tools.agent_tools import AgentTools
@@ -20,6 +22,7 @@ from ..tools.browser_use_tool import BrowserUseTool
 from ..tools.file_edit_tool import FileEditTool
 from ..tools.file_read_tool import FileReadTool
 from ..tools.file_write_tool import FileWriteTool
+from ..tools.image_gen_tool import ImageGenTool
 from ..tools.ls_tool import LsTool
 from ..tools.memory_tools import (
     MemoryGetTool,
@@ -32,9 +35,12 @@ from ..tools.search_files_tool import SearchFilesTool
 from ..tools.shell_execute_tool import ShellExecuteTool
 from ..tools.subagent_tool import SubagentDelegateTool
 from ..tools.skill_use_tool import SkillUseTool
+from ..tools.tool_execution_result import ToolExecutionResult
 from ..tools.vision_group_resolver import VisionGroupResolver
 from ..tools.web_fetch_tool import WebFetchTool
 from ..tools.web_search_tool import WebSearchTool
+
+logger = get_logger(__name__)
 
 __all__ = [
     "ProviderMeta",
@@ -175,6 +181,8 @@ BUILTIN_IDENTITIES: list[Identity] = [
             "search_files",
             "web_fetch",
             "web_search",
+            "read_image",
+            "image_gen",
             "subagent_delegate",
             "skill_use",
             "memory_write",
@@ -199,6 +207,8 @@ BUILTIN_IDENTITIES: list[Identity] = [
             "search_files",
             "web_fetch",
             "web_search",
+            "read_image",
+            "image_gen",
             "subagent_delegate",
             "skill_use",
             "memory_write",
@@ -252,6 +262,8 @@ IDENTITY_TOOL_MATCH: dict[str, list[str]] = {
         "search_files",
         "web_fetch",
         "web_search",
+        "read_image",
+        "image_gen",
         "subagent_delegate",
         "skill_use",
         "memory_write",
@@ -266,6 +278,8 @@ IDENTITY_TOOL_MATCH: dict[str, list[str]] = {
         "search_files",
         "web_fetch",
         "web_search",
+        "read_image",
+        "image_gen",
         "subagent_delegate",
         "skill_use",
         "memory_write",
@@ -279,11 +293,12 @@ IDENTITY_TOOL_MATCH: dict[str, list[str]] = {
         "ls",
         "search_files",
         "read_image",
+        "image_gen",
         "skill_use",
         "memory_write",
         "memory_get",
     ],
-    "writer": ["file_read", "skill_use", "memory_write", "memory_get"],
+    "writer": ["file_read", "read_image", "image_gen", "skill_use", "memory_write", "memory_get"],
 }
 
 
@@ -305,6 +320,8 @@ def _tool_desc(tool_id: str) -> str:
             return FileEditTool.definition().description
         if tool_id == "read_image":
             return ReadImageTool.definition().description
+        if tool_id == "image_gen":
+            return ImageGenTool.definition().description
         if tool_id == "shell_execute":
             return ShellExecuteTool.definition().description
         if tool_id == "browser_use":
@@ -363,6 +380,12 @@ TOOL_CATALOG: list[dict] = [
         "id": "read_image",
         "name": "读图片",
         "description": _tool_desc("read_image"),
+        "category": "Vision",
+    },
+    {
+        "id": "image_gen",
+        "name": "生成图片",
+        "description": _tool_desc("image_gen"),
         "category": "Vision",
     },
     {
@@ -458,6 +481,115 @@ def _wrap_async_static_executor(definition: AgentToolDefinition, async_callable)
     return tool
 
 
+def _chat_model_has_native_vision(store) -> bool:  # noqa: ANN001
+    """主对话模型是否自带视觉（多模态 / 识图）。
+
+    判定用「能力」而不是硬编码模型名：用户在设置里把某模型标成 llm，就等于
+    宣告"它看不了图"，read_image 便会走识图槽描述。取不到信息时返回 True
+    （保守：宁可多给字节，也不要无谓地多花一次描述调用）。
+    """
+    try:
+        from .model_capability import CAP_VISION
+
+        binding = store.slot_binding("chat")
+        if binding is None:
+            return True
+        conf, model = binding
+        caps = store.resolve_model_capabilities(str(conf.get("id") or ""), model)
+        return CAP_VISION in caps
+    except Exception:  # pragma: no cover - settings unreadable
+        return True
+
+
+def _image_mode(store) -> str:  # noqa: ANN001
+    """``"path"``（默认，图片不进上下文）或 ``"inline"``。"""
+    try:
+        mode = str(store.agent_config().get("imageContextMode") or "path").lower()
+    except Exception:  # pragma: no cover - settings unreadable
+        return "path"
+    return mode if mode in ("path", "inline") else "path"
+
+
+_NO_VISION_SLOT_HINT = (
+    "当前未配置「识图」模型，图片内容无法读取（只拿到路径与尺寸）。"
+    "如需理解图片，请在 设置 → 模型服务 → 用途分槽 把「识图」槽指向一个"
+    "识图/多模态模型；或请用户直接用文字描述图片内容。不要凭路径猜测图片内容。"
+)
+
+
+async def _read_image_with_vision(args_json: str, session_id: str, **_kw):
+    """``read_image`` —— 图片默认**只回路径**，理解交给识图槽。
+
+    上下文策略由 ``agent.imageContextMode`` 决定：
+
+    * ``path``（默认）—— 图片字节**不进上下文**。工具结果只留 "路径|尺寸|字节数"，
+      需要"看图"时由识图槽模型返回**文本描述**（文本开销，远小于 base64），
+      或者由子代理代办、主上下文只记路径。
+    * ``inline`` —— 把字节交给多模态主模型（原项目行为，长期吃上下文）。
+
+    无论哪种模式，槽位缺失/调用失败都不会让回合崩掉：改成可读的提示文本。
+    """
+    result = ReadImageTool.execute(args_json, session_id)
+    if not result.success:
+        return result
+
+    try:
+        from .store import SettingsStore
+
+        store = SettingsStore.get()
+        mode = _image_mode(store)
+        has_vision = _chat_model_has_native_vision(store)
+    except Exception:  # pragma: no cover - settings unreadable
+        return result
+
+    # inline 且主模型自带视觉 → 原样返回字节（运行时附到下一轮请求）
+    if mode == "inline" and has_vision:
+        return result
+    if not result.image_data:
+        return result
+
+    base_text = result.output
+    title = result.tool_title or ReadImageTool.NAME
+
+    desc: str | None = None
+    try:
+        from .vision_service import describe_image
+
+        try:
+            prompt = str(json.loads(args_json).get("prompt") or "")
+        except Exception:  # pragma: no cover - args already validated upstream
+            prompt = ""
+        desc = await describe_image(
+            store,
+            result.image_data,
+            result.image_mime_type or "image/jpeg",
+            prompt=prompt,
+            image_path=result.image_file_path,
+        )
+    except Exception:  # pragma: no cover - never break the loop over this
+        logger.debug("read_image vision routing failed", exc_info=True)
+        desc = None
+
+    if desc:
+        # 只回文本 —— 图片字节不进上下文
+        return ToolExecutionResult(
+            output=f"{base_text}\n\n{desc}", success=True, tool_title=title
+        )
+
+    # 没有识图槽（或描述失败）：明确说明只有路径，避免模型硬猜图片内容
+    tail = _NO_VISION_SLOT_HINT
+    if mode == "path" and has_vision:
+        tail = (
+            "当前为「图片只传路径」模式（agent.imageContextMode=path），"
+            "因此没有把图片直接交给模型。若你确实需要直读图片，可请用户在"
+            " 模型设置 把图片模式改为 inline，或在 设置 → 模型服务 → 用途分槽 "
+            "配置「识图」模型。不要凭路径猜测图片内容。"
+        )
+    return ToolExecutionResult(
+        output=f"{base_text}\n\n{tail}", success=True, tool_title=title
+    )
+
+
 def build_tool_registry(enabled_ids: list[str]) -> dict[str, ToolExecutor]:
     """Instantiate the enabled tools as a runtime ``ToolExecutor`` registry.
 
@@ -480,8 +612,13 @@ def build_tool_registry(enabled_ids: list[str]) -> dict[str, ToolExecutor]:
                 FileEditTool.definition(), FileEditTool.execute
             )
         elif tool_id == "read_image":
-            out[tool_id] = _wrap_static_executor(
-                ReadImageTool.definition(), ReadImageTool.execute
+            # 走识图槽兜底（主模型无视觉时用识图模型描述图片）
+            out[tool_id] = _wrap_async_static_executor(
+                ReadImageTool.definition(), _read_image_with_vision
+            )
+        elif tool_id == "image_gen":
+            out[tool_id] = _wrap_async_static_executor(
+                ImageGenTool.definition(), ImageGenTool.execute
             )
         elif tool_id == "shell_execute":
             shell = ShellExecuteTool()

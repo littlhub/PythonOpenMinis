@@ -45,6 +45,7 @@ def test_default_settings_have_catalog(store):
         "file_write",
         "file_edit",
         "read_image",
+        "image_gen",
         "browser_use",
         "memory_write",
         "memory_get",
@@ -191,9 +192,11 @@ async def test_chat_setup_roundtrip_with_fake_engine(store, monkeypatch):
         "file_edit",
         "file_read",
         "file_write",
+        "image_gen",
         "ls",
         "memory_get",
         "memory_write",
+        "read_image",
         "search_files",
         "shell_execute",
         "skill_use",
@@ -576,3 +579,194 @@ def test_attribution_snapshot_falls_back_to_active_instance(store):
     })
     snap = attribution_snapshot(store, {"type": "openAI", "model": "gpt-5.2"})
     assert snap["provider_instance_id"] == "openAI"
+
+
+# ---------------------------------------------------------------------------
+# 模型类型（能力标签）+ 用途分槽
+# ---------------------------------------------------------------------------
+def test_model_types_roundtrip_and_clear(store):
+    """手动的模型用途覆盖:保存→读回;传空 map 清空;不传则保留。"""
+    store.apply_full({
+        "providers": [{"id": "gw", "type": "openAI", "apiKey": "k",
+                       "model": "gpt-4o", "baseUrl": "",
+                       "modelTypes": {"gpt-4o": ["llm"]}}],
+    })
+    assert store.model_types("gw") == {"gpt-4o": ["llm"]}
+    # 不传 modelTypes 的一次普通保存不能把它冲掉
+    store.apply_full({"providers": [{"id": "gw", "type": "openAI",
+                                     "model": "gpt-4o"}]})
+    assert store.model_types("gw") == {"gpt-4o": ["llm"]}
+    # 传空 map = 显式清空
+    store.apply_full({"providers": [{"id": "gw", "type": "openAI",
+                                     "model": "gpt-4o", "modelTypes": {}}]})
+    assert store.model_types("gw") == {}
+
+
+def test_model_types_drops_invalid_capability(store):
+    store.apply_full({
+        "providers": [{"id": "gw", "type": "openAI", "apiKey": "k",
+                       "model": "gpt-4o",
+                       "modelTypes": {"gpt-4o": "bogus", "vl": "vision"}}],
+    })
+    assert store.model_types("gw") == {"vl": ["vision"]}
+
+
+def test_settings_view_exposes_capability(store):
+    with TestClient(app) as c:
+        body = _put(
+            c,
+            providers=[{"id": "gw", "type": "openAI", "apiKey": "k",
+                        "baseUrl": "", "model": "gpt-4o",
+                        "modelTypes": {"gpt-4o": ["llm"]}}],
+            activeProviderId="gw",
+        )
+        p = body["providers"][0]
+        # 覆盖优先 → user
+        assert p["modelCapabilities"] == ["llm"]
+        assert p["modelCapabilitySource"] == "user"
+        assert p["modelTypes"] == {"gpt-4o": ["llm"]}
+        # 目录里其它模型走自动推断,并带上 capabilities 字段
+        gpt5 = next(m for m in p["models"] if m["id"] == "gpt-5.5")
+        assert gpt5["capabilities"] == ["llm", "vision"]
+        assert gpt5["capabilitySource"] == "auto"
+        # 用途目录 + 八个槽位都在
+        assert [x["id"] for x in body["capabilities"]] == [
+            "llm", "vision", "image", "model3d",
+            "audio", "video", "audio_gen", "video_gen"]
+        assert [s["slot"] for s in body["modelSlots"]] == [
+            "chat", "vision", "image", "model3d",
+            "audio", "video", "audio_gen", "video_gen"]
+
+
+def test_view_surfaces_custom_current_model_as_candidate(store):
+    """手填的自定义模型 id（既不在目录也没远程列表）也要出现在 models 里,
+    否则界面上无法给它指定类型。"""
+    with TestClient(app) as c:
+        body = _put(
+            c,
+            providers=[{"id": "gw", "type": "openAI", "apiKey": "k",
+                        "baseUrl": "", "model": "my-private-model"}],
+        )
+        ids = [m["id"] for m in body["providers"][0]["models"]]
+        assert "my-private-model" in ids
+
+
+def test_slot_binding_and_chat_translation(store):
+    store.apply_full({
+        "providers": [{"id": "gw", "type": "openAI", "apiKey": "k",
+                       "model": "gpt-4o", "baseUrl": ""}],
+        "activeProviderId": "gw",
+    })
+    assert store.slot_binding("chat") is not None
+    assert store.slot_capability("chat") == ["llm", "vision"]
+    assert store.slot_binding("vision") is None
+    # 配识图/生图槽
+    store.apply_full({"modelSlots": {
+        "vision": {"instanceId": "gw", "model": "qwen-vl-max"},
+        "image": {"instanceId": "gw", "model": "dall-e-3"},
+    }})
+    assert store.model_slots()["vision"] == {
+        "instanceId": "gw", "model": "qwen-vl-max"}
+    assert store.slot_capability("vision") == ["llm", "vision"]
+    assert store.slot_capability("image") == ["image"]
+    # chat 槽写进来会被翻译成 activeProviderId + provider.model
+    store.apply_full({"modelSlots": {
+        "chat": {"instanceId": "gw", "model": "gpt-5.2"}}})
+    assert store.load()["activeProviderId"] == "gw"
+    assert store.provider_conf("gw")["model"] == "gpt-5.2"
+    # chat 不落进 modelSlots 存储（单一事实来源）
+    assert "chat" not in store.model_slots()
+
+
+def test_slot_rejects_unknown_instance(store):
+    with TestClient(app) as c:
+        r = c.put("/api/settings", json={"modelSlots": {
+            "vision": {"instanceId": "nope", "model": "x"}}})
+        assert r.status_code == 400
+        assert "未配置的厂商" in r.text
+
+
+def test_slot_clear_and_auto_suggest(store):
+    with TestClient(app) as c:
+        body = _put(
+            c,
+            providers=[
+                {"id": "gw", "type": "openAI", "apiKey": "k",
+                 "baseUrl": "", "model": "gpt-4o"},
+                {"id": "gen", "type": "openAI", "apiKey": "k", "baseUrl": "",
+                 "model": "dall-e-3"},
+            ],
+            activeProviderId="gw",
+            modelSlots={"image": {"instanceId": "gen", "model": "dall-e-3"}},
+        )
+        img = next(s for s in body["modelSlots"] if s["slot"] == "image")
+        assert img["configured"] is True and img["capabilityOk"] is True
+        assert img["capability"] == "image"
+        # 清空
+        body2 = _put(c, modelSlots={"image": None})
+        img2 = next(s for s in body2["modelSlots"] if s["slot"] == "image")
+        assert img2["configured"] is False
+
+
+def test_slot_flags_capability_mismatch(store):
+    """把对话模型(多模态)塞进生图槽 → 标记能力不匹配,而不是静默接受。"""
+    with TestClient(app) as c:
+        body = _put(
+            c,
+            providers=[{"id": "gw", "type": "openAI", "apiKey": "k",
+                        "baseUrl": "", "model": "gpt-4o"}],
+            activeProviderId="gw",
+            modelSlots={"image": {"instanceId": "gw", "model": "gpt-4o"}},
+        )
+        img = next(s for s in body["modelSlots"] if s["slot"] == "image")
+        assert img["configured"] is True
+        assert img["capabilityOk"] is False
+
+
+# ---------------------------------------------------------------------------
+# 图片进上下文的方式 + 最大边长
+# ---------------------------------------------------------------------------
+def test_image_context_mode_default_and_validation(store):
+    assert store.agent_config()["imageContextMode"] == "path"
+    assert store.agent_config()["imageMaxEdge"] == 2000
+    store.apply_full({"agent": {"imageContextMode": "inline"}})
+    assert store.agent_config()["imageContextMode"] == "inline"
+    with pytest.raises(Exception):
+        store.apply_full({"agent": {"imageContextMode": "weird"}})
+
+
+def test_image_max_edge_clamped(store):
+    store.apply_full({"agent": {"imageMaxEdge": 100}})
+    assert store.agent_config()["imageMaxEdge"] == 128   # 下限
+    store.apply_full({"agent": {"imageMaxEdge": 99999}})
+    assert store.agent_config()["imageMaxEdge"] == 8192  # 上限
+    store.apply_full({"agent": {"imageMaxEdge": 1024}})
+    assert store.agent_config()["imageMaxEdge"] == 1024
+
+
+def test_image_context_discipline_switches_with_mode(store):
+    from openminis.settings.chat_service import (
+        IMAGE_INLINE_DISCIPLINE,
+        IMAGE_PATH_DISCIPLINE,
+        image_context_discipline,
+        identity_system_prompt,
+    )
+
+    assert image_context_discipline(store) == IMAGE_PATH_DISCIPLINE
+    assert IMAGE_PATH_DISCIPLINE in identity_system_prompt(store)
+    store.apply_full({"agent": {"imageContextMode": "inline"}})
+    assert image_context_discipline(store) == IMAGE_INLINE_DISCIPLINE
+
+
+def test_build_chat_setup_passes_image_mode(store):
+    store.apply_full({
+        "providers": [{"id": "gw", "type": "openAI", "apiKey": "k",
+                       "model": "gpt-4o", "baseUrl": "https://x/v1"}],
+        "activeProviderId": "gw",
+        "agent": {"imageContextMode": "inline"},
+    })
+    _, _, options, _, _ = build_chat_setup(store)
+    assert options.image_context_mode == "inline"
+    store.apply_full({"agent": {"imageContextMode": "path"}})
+    _, _, options2, _, _ = build_chat_setup(store)
+    assert options2.image_context_mode == "path"

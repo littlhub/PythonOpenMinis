@@ -29,6 +29,21 @@ _MAX_EDGE = 2000
 _SUPPORTED_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"}
 
 
+def _max_edge() -> int:
+    """长边缩放上限（像素）—— 读自设置 ``agent.imageMaxEdge``。
+
+    图片的 token/上下文开销随像素增长，所以这个上限是控制开销的旋钮。
+    设置读不到时退回 2000（与原 Kotlin 行为一致）。
+    """
+    try:
+        from ..settings.store import SettingsStore
+
+        val = int(SettingsStore.get().agent_config().get("imageMaxEdge") or _MAX_EDGE)
+    except Exception:  # pragma: no cover - settings unreadable
+        return _MAX_EDGE
+    return max(128, min(8192, val))
+
+
 class ReadImageTool:
     """Kotlin: ``object ReadImageTool`` — stateless namespace."""
 
@@ -39,15 +54,16 @@ class ReadImageTool:
         return AgentToolDefinition(
             name=ReadImageTool.NAME,
             description=(
-                "Read an image file from the filesystem and return it for "
-                "visual analysis. Supports PNG, JPEG, GIF, WEBP, and other "
-                "common image formats. Use this to inspect generated charts, "
-                "downloaded images, screenshots, or any visual output. If the "
-                "model natively supports vision the image is returned directly; "
-                "if not, it is routed through a configured Vision Group that "
+                "Read an image file from the filesystem and return information "
+                "about it. Supports PNG, JPEG, GIF, WEBP, and other common "
+                "image formats. Use this to inspect generated charts, downloaded "
+                "images, screenshots, or any visual output. Returns the path and "
+                "dimensions; when the main model has no native vision the image "
+                "is routed through the configured 识图 (vision) slot, which "
                 "returns a text description — pass a `prompt` to focus the "
-                "description on what you actually need. Metadata (dimensions, "
-                "file size) is always included."
+                "description on what you actually need. Image bytes are NOT "
+                "loaded into the conversation context (path-only mode), so this "
+                "is the way to 'see' an image without paying base64 context cost."
             ),
             parameters={
                 "tool_title": AgentToolParam(
@@ -114,9 +130,10 @@ class ReadImageTool:
             with Image.open(host) as im:
                 im.load()
                 original_w, original_h = im.size
-                # 2000px max edge downscale → same as the Kotlin path.
-                if max(original_w, original_h) > _MAX_EDGE:
-                    scale = _MAX_EDGE / max(original_w, original_h)
+                # 长边缩到设置里的上限（默认 2000）→ 控制送进模型的像素量
+                max_edge = _max_edge()
+                if max(original_w, original_h) > max_edge:
+                    scale = max_edge / max(original_w, original_h)
                     new_size = (int(original_w * scale), int(original_h * scale))
                     im = im.resize(new_size, Image.LANCZOS)
                 # Normalise mode to RGB so JPEG re-encode is lossless.

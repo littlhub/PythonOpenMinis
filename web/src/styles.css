@@ -1020,6 +1020,117 @@ details summary {
   color: #9a6b1f;
   background: #faf3e3;
 }
+
+/* 模型用途徽标 —— 一眼区分 对话/识图/生图/3D/音频/视频/生音频/生视频 */
+.cap-badges { display: inline-flex; align-items: center; gap: 4px; flex-wrap: wrap; }
+.cap-badge {
+  display: inline-block;
+  font-size: 11px;
+  line-height: 1.5;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  white-space: nowrap;
+  color: var(--muted);
+  background: #fff;
+}
+.cap-badge.cap-llm { border-color: #d7dde6; color: #55617a; background: #f4f6fa; }
+.cap-badge.cap-vision { border-color: #d6cdf0; color: #5b3fa8; background: #f4f1fd; }
+.cap-badge.cap-image { border-color: #f2d3dc; color: #a83a5e; background: #fdf2f6; }
+.cap-badge.cap-3d { border-color: #d3e6d8; color: #2f7a4d; background: #f0faf3; }
+.cap-badge.cap-audio { border-color: #f5ddc2; color: #9a6420; background: #fdf6ec; }
+.cap-badge.cap-video { border-color: #cfe4e8; color: #1f6b78; background: #eefafc; }
+.cap-badge.cap-audio-gen { border-color: #e8d2b8; color: #8a5a1a; background: #fbf3e8; }
+.cap-badge.cap-video-gen { border-color: #c9d8ee; color: #2f4f8a; background: #eef4fd; }
+.cap-badge.cap-user { border-color: #cfe0f5; color: #2b5fa8; background: #eff6ff; }
+.cap-badge.cap-custom { border-color: #d8d2e8; color: #6a5a9a; background: #f6f3fd; }
+
+/* 模型用途多选 —— 小按钮，选中后按用途变色 */
+.cap-picker { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding-top: 2px; }
+.cap-picker .chip { padding: 3px 10px; font-size: 12px; }
+.cap-chip { transition: border-color .12s, background .12s, color .12s; }
+.cap-chip.on { font-weight: 600; }
+.cap-chip.cap-llm.on { border-color: #a9b6c9; background: #e9edf5; color: #41506b; }
+.cap-chip.cap-vision.on { border-color: #b7a4e6; background: #ece5fd; color: #553a9e; }
+.cap-chip.cap-image.on { border-color: #e9a9c0; background: #fbe6ee; color: #a1355a; }
+.cap-chip.cap-3d.on { border-color: #a5d4b6; background: #e6f6ec; color: #2c7048; }
+.cap-chip.cap-audio.on { border-color: #e6c48f; background: #fbf1e1; color: #8f5c1c; }
+.cap-chip.cap-video.on { border-color: #9fd2db; background: #e2f5f8; color: #1c6472; }
+.cap-chip.cap-audio-gen.on { border-color: #dcbb8e; background: #f9eedd; color: #7f5318; }
+.cap-chip.cap-video-gen.on { border-color: #9db8e2; background: #e2ecfb; color: #2b4a82; }
+.cap-chip.cap-custom.on { border-color: #b9a8dd; background: #efeafc; color: #5f4a94; }
+.cap-chip.cap-add { border-style: dashed; }
+
+/* 自定义模型类型表单 / 列表 */
+.custom-type-form {
+  margin-top: 8px;
+  padding: 10px;
+  border: 1px dashed var(--border);
+  border-radius: 10px;
+  background: #fafbfd;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.custom-type-form .ctf-row { display: flex; gap: 6px; flex-wrap: wrap; }
+.custom-type-form input,
+.custom-type-form textarea {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 5px 9px;
+  font-size: 12.5px;
+  background: #fff;
+  color: inherit;
+}
+.custom-type-form .ctf-row input { flex: 1 1 160px; min-width: 120px; }
+.custom-type-form textarea.ctf-json { font-family: ui-monospace, Menlo, Consolas, monospace; resize: vertical; }
+.custom-type-form .ctf-actions { display: flex; gap: 8px; align-items: center; }
+.custom-type-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.custom-type-item { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.custom-type-item .ct-id { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+.custom-type-item .ct-url { font-size: 12px; overflow: hidden; text-overflow: ellipsis; }
+.custom-type-item .spacer { flex: 1 1 auto; }
+
+/* 分节标题右侧操作区 */
+.settings-section header.has-extra { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.settings-section header.has-extra .section-head-text { flex: 1 1 auto; min-width: 0; }
+.settings-section header .section-extra { flex: 0 0 auto; }
+
+/* 用途分槽 (对话 / 识图 / 生图) */
+.slot-list { display: flex; flex-direction: column; gap: 10px; }
+.slot-row {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: #fff;
+}
+.slot-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.slot-fields {
+  display: grid;
+  grid-template-columns: 1.1fr 1.1fr 1fr auto auto;
+  gap: 8px;
+  align-items: center;
+}
+.slot-fields select,
+.slot-fields input {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 9px;
+  font-size: 13px;
+  color: var(--text);
+  background: #fff;
+  min-width: 0;
+}
+.slot-fields .slot-model-input { font-size: 12px; }
+@media (max-width: 720px) {
+  .slot-fields { grid-template-columns: 1fr 1fr; }
+}
 button.link {
   background: none;
   border: 0;

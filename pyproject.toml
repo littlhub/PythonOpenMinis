@@ -30,6 +30,8 @@ dependencies = [
     "websockets>=12.0",
     "python-multipart>=0.0.9",
     "sse-starlette>=2.1",
+    # --- image (read_image 的缩放/重编码; 缺失时 read_image 直接报错) ---
+    "pillow>=10.0",
 ]
 
 [project.optional-dependencies]

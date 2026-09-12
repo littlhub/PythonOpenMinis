@@ -30,6 +30,7 @@ __all__ = [
     "attribution_snapshot",
     "build_chat_setup",
     "identity_system_prompt",
+    "image_context_discipline",
 ]
 
 
@@ -120,8 +121,35 @@ def identity_system_prompt(store: SettingsStore) -> str:
     return (
         identity.persona
         + RETRIEVAL_DISCIPLINE
+        + image_context_discipline(store)
         + active_skills_block(store)
     )
+
+
+#: 图片默认不进上下文 —— 只把**路径**记进对话，理解交给识图槽/子代理。
+#: 这段纪律让模型知道自己拿不到像素，别凭路径编内容。``inline`` 模式下换成
+#: 一句"可能直接收到图片"的说明。
+IMAGE_PATH_DISCIPLINE = (
+    "\n\n【图片处理】图片不会直接把像素放进你的上下文，你只会拿到图片的"
+    "**路径与尺寸**。需要看懂图片时，用 read_image 工具（它会把图片交给"
+    "「识图」模型，返回文字描述）；若它提示无法读取，就如实告诉用户去"
+    " 设置 → 模型服务 → 用途分槽 配置「识图」模型，或请用户用文字描述图片，"
+    "**不要凭路径猜测图片内容**。"
+)
+
+IMAGE_INLINE_DISCIPLINE = (
+    "\n\n【图片处理】图片可能直接随请求提供（多模态）。若只拿到路径而没有图片，"
+    "用 read_image 获取内容。"
+)
+
+
+def image_context_discipline(store: SettingsStore) -> str:
+    """按 ``agent.imageContextMode`` 选择图片纪律文案。"""
+    try:
+        mode = str(store.agent_config().get("imageContextMode") or "path").lower()
+    except Exception:  # pragma: no cover - settings unreadable
+        mode = "path"
+    return IMAGE_INLINE_DISCIPLINE if mode == "inline" else IMAGE_PATH_DISCIPLINE
 
 
 def _model_for(provider_type: str, model_id: str) -> LLMModel | None:
@@ -209,18 +237,29 @@ def build_chat_setup(  # noqa: ANN201
     provider = build_provider(pid, conf)
 
     identity = store.active_identity()
-    tools = build_tool_registry(identity.effective_tools())
-    runtime = AgentRuntime(tools=tools, chunk_sink=chunk_sink)
-    # Agent 对话参数(模型设置):执行步数上限 + 深度思考开关。缺省不深思考,
-    # 步数上限用设置里的值(默认 40),保证单次对话不会无限跑工具。
+    # Agent 对话参数(模型设置):执行步数上限 + 深度思考 + 子代理助理开关。
     agent_cfg = store.agent_config()
+    enabled_ids = list(identity.effective_tools())
+    if not agent_cfg.get("subagentEnabled", True):
+        # 关闭子代理助理:subagent_delegate 从 schema 与执行器里一并移除,
+        # 主模型连尝试的机会都没有(与 memory 开关同一思路)。
+        enabled_ids = [t for t in enabled_ids if t != "subagent_delegate"]
+    tools = build_tool_registry(enabled_ids)
+    runtime = AgentRuntime(tools=tools, chunk_sink=chunk_sink)
+    image_mode = str(agent_cfg.get("imageContextMode") or "path")
     options = AgentRuntimeOptions(
         system_prompt=(
-            identity.persona + RETRIEVAL_DISCIPLINE + active_skills_block(store)
+            identity.persona
+            + RETRIEVAL_DISCIPLINE
+            + (IMAGE_INLINE_DISCIPLINE if image_mode == "inline"
+               else IMAGE_PATH_DISCIPLINE)
+            + active_skills_block(store)
         ),
         max_turns=int(agent_cfg.get("maxToolSteps") or MAX_AGENT_TURNS),
         thinking_level=(
             ThinkingLevel.HIGH if agent_cfg.get("deepThinking") else ThinkingLevel.OFF
         ),
+        # 图片默认不进上下文（只留路径，看图交给识图槽/子代理）
+        image_context_mode=image_mode,
     )
     return provider, runtime, options, identity, conf

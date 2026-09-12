@@ -27,6 +27,7 @@ from .browser_use_tool import BrowserUseTool
 from .file_edit_tool import FileEditTool
 from .file_read_tool import FileReadTool
 from .file_write_tool import FileWriteTool
+from .image_gen_tool import ImageGenTool
 from .ls_tool import LsTool
 from .memory_tools import memory_get_definition, memory_write_definition
 from .read_image_tool import ReadImageTool
@@ -66,6 +67,9 @@ class AgentTools:
         # the tool can route through a describing member.
         if supports_image_input or vision_group_configured:
             out.append(ReadImageTool.definition())
+        # 生图 —— 走「生图槽」绑定的模型。未配置时调用会明确说明，schema
+        # 暴露是无害的（与 web_search 同一策略）。
+        out.append(ImageGenTool.definition())
         out.append(BrowserUseTool.definition())
         out.append(WebFetchTool.definition())
         out.append(WebSearchTool.definition())

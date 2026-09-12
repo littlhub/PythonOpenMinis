@@ -97,15 +97,20 @@ export function DetailShell(props: {
 export function SectionCard(props: {
   title?: string
   hint?: string
+  /** 标题右侧的操作区(例如「添加」按钮)。 */
+  extra?: React.ReactNode
   children: React.ReactNode
   className?: string
 }) {
   return (
     <section className={`settings-section ${props.className ?? ''}`}>
-      {props.title && (
-        <header>
-          <h3>{props.title}</h3>
-          {props.hint && <p className="muted">{props.hint}</p>}
+      {(props.title || props.extra) && (
+        <header className={props.extra ? 'has-extra' : undefined}>
+          <div className="section-head-text">
+            {props.title && <h3>{props.title}</h3>}
+            {props.hint && <p className="muted">{props.hint}</p>}
+          </div>
+          {props.extra && <div className="section-extra">{props.extra}</div>}
         </header>
       )}
       {props.children}
