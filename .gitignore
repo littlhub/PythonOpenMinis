@@ -10,13 +10,12 @@ __pycache__/
 .minis-server.pid
 *.log
 
-# PyInstaller output
+# PyInstaller output (root dist/ only; web/dist is tracked so downloads run)
 build/
-dist/
+/dist/
 
 # Frontend
 web/node_modules/
-web/dist/
 web/*.tsbuildinfo
 
 # Scratch / local temp (never tracked)
