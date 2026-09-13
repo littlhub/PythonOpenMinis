@@ -19,9 +19,15 @@ def env(tmp_path, monkeypatch):
 
 def _seed_memory(tmp_path: object) -> None:
     mem = tmp_path / "memory"  # type: ignore[operator]
-    mem.mkdir(exist_ok=True)
-    (mem / "2026-09-08.md").write_text(
+    (mem / "daily").mkdir(parents=True, exist_ok=True)
+    (mem / "daily" / "2026-09-08.md").write_text(
         "# 日志\n\n用户偏好中文回复\n", encoding="utf-8"
+    )
+    # 知识库与记忆分开：knowledge/ 是独立目录
+    kn = tmp_path / "knowledge"  # type: ignore[operator]
+    kn.mkdir(exist_ok=True)
+    (kn / "tooling.md").write_text(
+        "# 工具链\n\n用 uv 管理依赖\n", encoding="utf-8"
     )
 
 
@@ -50,7 +56,13 @@ def test_knowledge_search_filters_by_query_and_kind(env):
         r = c.get("/api/knowledge?q=中文回复&kind=memory")
         assert r.status_code == 200
         names = [it["source"] for it in r.json()["items"]]
-        assert "2026-09-08.md" in names
+        assert "daily/2026-09-08.md" in names
+
+        # 知识不是记忆：按 kind=knowledge 才搜得到（记忆与知识分开）
+        mem_hits = [it["source"] for it in c.get("/api/knowledge?q=uv&kind=memory").json()["items"]]
+        assert "tooling.md" not in mem_hits
+        kn_hits = [it["source"] for it in c.get("/api/knowledge?q=uv&kind=knowledge").json()["items"]]
+        assert "tooling.md" in kn_hits
 
 
 def test_knowledge_content_reads_memory_and_docs(env):
@@ -60,9 +72,10 @@ def test_knowledge_content_reads_memory_and_docs(env):
 
     _seed_memory(env)
     with TestClient(app) as c:
-        assert c.get("/api/knowledge/content/memory/2026-09-08.md").json()["content"].startswith(
+        assert c.get("/api/knowledge/content/memory/daily/2026-09-08.md").json()["content"].startswith(
             "# 日志"
         )
+        assert "uv" in c.get("/api/knowledge/content/knowledge/tooling.md").json()["content"]
         doc = c.get("/api/knowledge/content/doc/README.md")
         assert doc.status_code == 200
         assert "Python" in doc.json()["content"]

@@ -69,7 +69,9 @@ def test_storage_counts_dirs_and_files(isolated_home):
     (tmp / "workspace").mkdir(exist_ok=True)
     (tmp / "workspace" / "a.txt").write_text("x" * 100, encoding="utf-8")
     (tmp / "memory").mkdir(exist_ok=True)
-    (tmp / "memory" / "GLOBAL.md").write_text("# keep\n", encoding="utf-8")
+    mem_dir = tmp / "memory" / "long-term"
+    mem_dir.mkdir(parents=True, exist_ok=True)
+    (mem_dir / "LONG_TERM.md").write_text("# keep\n", encoding="utf-8")
     (tmp / "settings.json").write_text("{}", encoding="utf-8")
 
     body = client.get("/api/system/storage").json()
@@ -85,30 +87,37 @@ def test_storage_counts_dirs_and_files(isolated_home):
 def test_memory_write_read_list_delete(isolated_home):
     client, tmp = isolated_home
     mem = tmp / "memory"
-    mem.mkdir(exist_ok=True)
-    (mem / "GLOBAL.md").write_text("# 长期记忆\n- 用户喜欢简洁回复\n", encoding="utf-8")
+    (mem / "long-term").mkdir(parents=True, exist_ok=True)
+    (mem / "long-term" / "LONG_TERM.md").write_text(
+        "# 长期记忆\n- 用户喜欢简洁回复\n", encoding="utf-8"
+    )
 
     listing = client.get("/api/system/memory").json()
     assert listing["dir"] == str(mem)
-    assert [f["name"] for f in listing["files"]] == ["GLOBAL.md"]
+    assert [f["name"] for f in listing["files"]] == ["long-term/LONG_TERM.md"]
     assert "简洁" in listing["files"][0]["preview"]
+    # 五类定义随列表一起下发（前端按它分栏）
+    assert [k["id"] for k in listing["kinds"]] == [
+        "long_term", "daily", "rules", "troubleshooting", "preferences",
+    ]
 
     # read full content
-    got = client.get("/api/system/memory/GLOBAL.md").json()
+    got = client.get("/api/system/memory/long-term/LONG_TERM.md").json()
     assert "- 用户喜欢简洁回复" in got["content"]
 
     # overwrite + create new
-    r = client.put("/api/system/memory/GLOBAL.md", json={"content": "# 新内容\n"})
+    r = client.put("/api/system/memory/long-term/LONG_TERM.md",
+                   json={"content": "# 新内容\n"})
     assert r.status_code == 200
     r = client.put(
-        "/api/system/memory/2026-01-01.md", json={"content": "## 08:00\n\n测试\n"}
+        "/api/system/memory/daily/2026-01-01.md", json={"content": "## 08:00\n\n测试\n"}
     )
     assert r.status_code == 200
     assert len(client.get("/api/system/memory").json()["files"]) == 2
 
     # delete
-    assert client.delete("/api/system/memory/2026-01-01.md").json()["ok"] is True
-    assert client.delete("/api/system/memory/2026-01-01.md").status_code == 404
+    assert client.delete("/api/system/memory/daily/2026-01-01.md").json()["ok"] is True
+    assert client.delete("/api/system/memory/daily/2026-01-01.md").status_code == 404
 
 
 @pytest.mark.parametrize(
@@ -139,32 +148,40 @@ def test_memory_name_is_whitelisted(isolated_home, name):
 
 
 def test_memory_category_subpaths(isolated_home):
-    """wiki/<topic>.md / rules/RULES.md can be written, listed and read."""
+    """五类子目录（long-term/ rules/ preferences/ …）可写、可列、可读。"""
     client, tmp = isolated_home
     mem = tmp / "memory"
     mem.mkdir(exist_ok=True)
 
     for rel, content in [
-        ("wiki/project-conventions.md", "# 项目约定\n\n- 用 uv\n"),
+        ("long-term/LONG_TERM.md", "# 长期记忆\n\n- 用 uv\n"),
         ("rules/RULES.md", "- 永远说中文\n"),
+        ("preferences/USER.md", "- 喜欢简洁\n"),
     ]:
         r = client.put(f"/api/system/memory/{rel}", json={"content": content})
         assert r.status_code == 200, r.text
 
-    names = [f["name"] for f in client.get("/api/system/memory").json()["files"]]
-    assert "wiki/project-conventions.md" in names
+    listing = client.get("/api/system/memory").json()
+    names = [f["name"] for f in listing["files"]]
+    assert "long-term/LONG_TERM.md" in names
     assert "rules/RULES.md" in names
+    assert "preferences/USER.md" in names
+    # 分类标签跟着路径走（前端按它分栏）
+    kinds = {f["name"]: f["kind"] for f in listing["files"]}
+    assert kinds["long-term/LONG_TERM.md"] == "long_term"
+    assert kinds["preferences/USER.md"] == "preferences"
 
-    got = client.get("/api/system/memory/wiki/project-conventions.md").json()
+    got = client.get("/api/system/memory/long-term/LONG_TERM.md").json()
     assert "用 uv" in got["content"]
     assert client.get("/api/system/memory/rules/RULES.md").status_code == 200
 
     # traversal through a subdir is refused by the resolver (raw ".." names
     # cannot even reach the router — httpx normalises them first)
     with pytest.raises(HTTPException):
-        _resolve_memory("wiki/../GLOBAL.md")
+        _resolve_memory("preferences/../LONG_TERM.md")
     assert (
-        client.get("/api/system/memory/wiki/../GLOBAL.md").status_code in {400, 404}
+        client.get("/api/system/memory/preferences/../LONG_TERM.md").status_code
+        in {400, 404}
     )
 
 
@@ -177,8 +194,8 @@ def test_backup_zip_contains_settings_memory_prefs(isolated_home):
         '{"appearance.theme":"dark"}', encoding="utf-8"
     )
     mem = tmp / "memory"
-    mem.mkdir(exist_ok=True)
-    (mem / "GLOBAL.md").write_text("# keep\n", encoding="utf-8")
+    (mem / "long-term").mkdir(parents=True, exist_ok=True)
+    (mem / "long-term" / "LONG_TERM.md").write_text("# keep\n", encoding="utf-8")
 
     resp = client.get("/api/system/backup/download")
     assert resp.status_code == 200
@@ -187,7 +204,7 @@ def test_backup_zip_contains_settings_memory_prefs(isolated_home):
     names = set(zf.namelist())
     assert "settings.json" in names
     assert "prefs/minis_prefs.json" in names
-    assert "memory/GLOBAL.md" in names
+    assert "memory/long-term/LONG_TERM.md" in names
     assert "manifest.json" in names
     manifest = json.loads(zf.read("manifest.json"))
     assert manifest["app"] == "openminis"

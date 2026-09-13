@@ -23,7 +23,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from ..core.context import app_context  # noqa: F401
 from ..skills import SkillStore
-from ..tools.memory_tools import _memory_dir
+from ..tools.memory_tools import _knowledge_dir, _memory_dir
 from .system_api import _resolve_memory
 
 router = APIRouter(prefix="/api/knowledge", tags=["knowledge"])
@@ -37,8 +37,13 @@ _DOC_FILES = {
     "PORTING_MAP.md",
 }
 
-_KIND_ORDER = {"skill": 0, "memory": 1, "doc": 2}
-_KIND_LABEL = {"skill": "技能", "memory": "记忆", "doc": "项目文档"}
+_KIND_ORDER = {"skill": 0, "memory": 1, "knowledge": 2, "doc": 3}
+_KIND_LABEL = {
+    "skill": "技能",
+    "memory": "记忆",
+    "knowledge": "知识",
+    "doc": "项目文档",
+}
 
 
 @dataclass(frozen=True)
@@ -61,7 +66,8 @@ def _iter_docs() -> Iterator[_Doc]:
             modified=0,
             text=entry.body or "",
         )
-    # memory files — daily logs, wiki/<topic>.md, rules/RULES.md (recursive)
+    # memory files — 五类记忆（daily/ long-term/ rules/ troubleshooting/
+    # preferences/），与知识库彻底分开。
     root = _memory_dir()
     if root.is_dir():
         for p in sorted(root.rglob("*.md"), key=lambda x: x.as_posix()):
@@ -72,6 +78,22 @@ def _iter_docs() -> Iterator[_Doc]:
             rel = p.relative_to(root).as_posix()
             yield _Doc(
                 kind="memory",
+                name=rel,
+                title=rel.removesuffix(".md"),
+                modified=int(p.stat().st_mtime * 1000),
+                text=text,
+            )
+    # knowledge/ — 知识库（可复用资料、专题文档），**不属于记忆**。
+    kdir = _knowledge_dir()
+    if kdir.is_dir():
+        for p in sorted(kdir.rglob("*.md"), key=lambda x: x.as_posix()):
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:  # pragma: no cover
+                continue
+            rel = p.relative_to(kdir).as_posix()
+            yield _Doc(
+                kind="knowledge",
                 name=rel,
                 title=rel.removesuffix(".md"),
                 modified=int(p.stat().st_mtime * 1000),
@@ -179,9 +201,23 @@ async def knowledge_content(kind: str, name: str) -> dict[str, Any]:
             "modified": int(path.stat().st_mtime * 1000),
             "content": text,
         }
+    if kind == "knowledge":
+        kroot = _knowledge_dir().resolve()
+        target = (kroot / name).resolve()
+        if target != kroot and kroot not in target.parents:
+            raise HTTPException(status_code=400, detail="bad_name")
+        if not target.is_file():
+            raise HTTPException(status_code=404, detail="not_found")
+        return {
+            "kind": kind,
+            "name": name,
+            "title": name.removesuffix(".md"),
+            "source": name,
+            "modified": int(target.stat().st_mtime * 1000),
+            "content": target.read_text(encoding="utf-8", errors="replace"),
+        }
     # doc — whitelist only
-    if name not in _DOC_FILES:
-        raise HTTPException(status_code=404, detail="not_found")
+    if name not in _DOC_FILES:        raise HTTPException(status_code=404, detail="not_found")
     p = Path(__file__).resolve().parents[3] / name
     if not p.is_file():
         raise HTTPException(status_code=404, detail="not_found")

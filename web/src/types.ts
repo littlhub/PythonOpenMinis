@@ -343,14 +343,27 @@ export interface SettingsPayload {
 // ---------------------------------------------------------------------------
 export interface MemoryFileInfo {
   name: string
+  /** 记忆分类 id：long_term / daily / rules / troubleshooting / preferences
+   *  （另 soul / other 为特殊文件）。 */
+  kind?: string
+  kindLabel?: string
   size: number
   mtime: number
   preview: string
 }
 
+/** 五类记忆的定义（后端随列表下发，前端按它分栏排序）。 */
+export interface MemoryKindInfo {
+  id: string
+  label: string
+  path: string
+  desc: string
+}
+
 export interface MemoryList {
   dir: string
   files: MemoryFileInfo[]
+  kinds?: MemoryKindInfo[]
 }
 
 export interface MemoryDoc {
@@ -584,14 +597,14 @@ export interface KnowledgeContent {
   content: string
 }
 
-/** Result of a memory-organize pass (daily logs → RULES.md + wiki/*). */
+/** Result of a memory-organize pass（每日记忆 → 四类长期记忆）。 */
 export interface OrganizeResponse {
   ok: boolean
   applied: boolean
   message: string
   logsRead: number
-  rules: number
-  wiki: string[]
+  /** 各记忆分类写入的条数：{long_term, rules, troubleshooting, preferences} */
+  kinds: Record<string, number>
 }
 
 // ---------------------------------------------------------------------------

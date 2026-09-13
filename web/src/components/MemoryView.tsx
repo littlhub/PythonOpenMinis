@@ -5,8 +5,10 @@ import type { MemoryDoc, MemoryFileInfo } from '../types'
 /**
  * MemoryView - 记忆管理页面
  *
- * 直接编辑 <data_dir>/memory 下的 Markdown 文件（每日日志 YYYY-MM-DD.md、
- * GLOBAL.md、SOUL.md）。读写走后端 /api/system/memory，保存即写盘。
+ * 记忆**只分五类**：长期记忆（long-term/）、每日记忆（daily/）、特殊规则
+ * （rules/）、报错问题解决（troubleshooting/）、用户偏好（preferences/）。
+ * 知识（可复用资料）不在记忆里，去「知识库」页（独立 knowledge/ 目录）。
+ * 读写走后端 /api/system/memory，保存即写盘。
  */
 function fmtTime(ms: number): string {
   const d = new Date(ms)
@@ -14,28 +16,44 @@ function fmtTime(ms: number): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
 
-/** Special files always float on top; daily logs follow, newest first. */
+/** 排序：人设与长期记忆在前，每日记忆按时间倒序垫底。 */
 function rank(name: string): number {
   const base = name.toLowerCase()
   if (base === 'soul.md') return 0
-  if (base === 'global.md') return 1
-  return 2
+  if (base.startsWith('long-term/')) return 1
+  if (base.startsWith('preferences/')) return 2
+  if (base.startsWith('rules/')) return 3
+  if (base.startsWith('troubleshooting/')) return 4
+  return 6
 }
 
-type Category = 'all' | 'daily' | 'wiki' | 'rules' | 'core'
+/** 记忆**只分五类**（知识不在这里，去了独立的「知识库」页）。 */
+type Category =
+  | 'all'
+  | 'long_term'
+  | 'daily'
+  | 'rules'
+  | 'troubleshooting'
+  | 'preferences'
+  | 'core'
 
 function categoryOf(name: string): Category {
-  if (name.startsWith('wiki/')) return 'wiki'
+  if (name.startsWith('long-term/')) return 'long_term'
   if (name.startsWith('rules/')) return 'rules'
-  if (/^\d{4}-\d{2}-\d{2}\.md$/.test(name)) return 'daily'
+  if (name.startsWith('troubleshooting/')) return 'troubleshooting'
+  if (name.startsWith('preferences/')) return 'preferences'
+  if (name.startsWith('daily/')) return 'daily'
+  if (/^\d{4}-\d{2}-\d{2}\.md$/.test(name)) return 'daily' // 旧布局兜底
   return 'core'
 }
 
 const CATEGORY_LABEL: Record<Category, string> = {
   all: '全部',
-  daily: '日常',
-  wiki: '长期 wiki',
-  rules: '规则',
+  long_term: '长期记忆',
+  daily: '每日记忆',
+  rules: '特殊规则',
+  troubleshooting: '报错解决',
+  preferences: '用户偏好',
   core: '核心',
 }
 
@@ -195,7 +213,7 @@ export function MemoryView() {
             </span>
             <button
               className="memory-action-btn"
-              title="把日常日志整理成 RULES.md + wiki/ 主题文档（需已配置模型）"
+              title="把每日记忆蒸馏进四类长期记忆：长期记忆 / 特殊规则 / 报错解决 / 用户偏好（需已配置模型）"
               disabled={organizing}
               onClick={() => void doOrganize()}
             >
@@ -238,7 +256,7 @@ export function MemoryView() {
               <div className="create-task-form" style={{ display: 'flex', gap: 6 }}>
                 <input
                   type="text"
-                  placeholder="如 wiki/主题 或 rules/xxx 或 2026-09-08"
+                  placeholder="如 preferences/USER.md 或 rules/xxx"
                   value={newName}
                   autoFocus
                   onChange={(e) => setNewName(e.target.value)}

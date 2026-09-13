@@ -97,7 +97,7 @@ async def test_compact_writes_marker_and_memories(env):
     assert marker.summary.startswith("用户在移植 OpenMinis")
     assert marker.last_compacted_message_id
 
-    daily = (env / "memory").glob("*.md")
+    daily = (env / "memory" / "daily").glob("*.md")
     bodies = "\n".join(p.read_text(encoding="utf-8") for p in daily)
     assert "会话压缩记忆提取" in bodies
     assert "约定：测试用 uv 跑" in bodies

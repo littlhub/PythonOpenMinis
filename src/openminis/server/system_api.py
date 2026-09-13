@@ -35,7 +35,12 @@ from ..soul import (
     SoulStore,
     contains_injection_pattern,
 )
-from ..tools.memory_tools import _memory_dir  # shared single source of truth
+from ..tools.memory_tools import (  # shared single source of truth
+    MEMORY_KINDS,
+    _knowledge_dir,
+    _memory_dir,
+    ensure_memory_layout,
+)
 from .memory_organizer import organize_memories
 
 logger = get_logger(__name__)
@@ -68,8 +73,10 @@ def _dir_stats(root: Path) -> tuple[int, int]:
 def _resolve_memory(name: str) -> Path:
     """Resolve a memory file name to a path inside the memory root.
 
-    ``name`` may be a bare file (``2026-09-08.md``) or a relative path into a
-    category folder (``wiki/project-conventions.md``, ``rules/RULES.md``).
+    ``name`` may be a bare file or a path into the five categories
+    (``long-term/LONG_TERM.md``, ``daily/2026-09-08.md``,
+    ``rules/RULES.md``, ``troubleshooting/TROUBLESHOOTING.md``,
+    ``preferences/USER.md``).
     Anything that escapes the memory root is rejected.
     """
     if not name or ".." in name or name.startswith(("/", "\\")):
@@ -235,8 +242,30 @@ async def storage() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # memory — 记忆管理 (与 MemoryTools 同一目录; 前端可编辑 GLOBAL.md / 每日日志)
 # ---------------------------------------------------------------------------
+#: 记忆文件的分类标签：按相对路径前缀归属五类之一。
+_KIND_BY_PREFIX = (
+    ("daily/", "daily"),
+    ("long-term/", "long_term"),
+    ("rules/", "rules"),
+    ("troubleshooting/", "troubleshooting"),
+    ("preferences/", "preferences"),
+)
+_KIND_LABEL = {k["id"]: k["label"] for k in MEMORY_KINDS}
+
+
+def _kind_of(rel: str) -> str:
+    for prefix, kind in _KIND_BY_PREFIX:
+        if rel.startswith(prefix):
+            return kind
+    if rel == "SOUL.md":
+        return "soul"
+    return "other"
+
+
 @router.get("/memory")
 async def memory_list() -> dict[str, Any]:
+    """五类记忆清单：分类固定（无文件也返回），便于前端按类分栏显示。"""
+    ensure_memory_layout()
     root = _memory_dir()
     files: list[dict[str, Any]] = []
     if root.is_dir():
@@ -246,15 +275,24 @@ async def memory_list() -> dict[str, Any]:
                 text = p.read_text(encoding="utf-8", errors="replace")
             except OSError:  # pragma: no cover
                 continue
+            rel = p.relative_to(root).as_posix()
+            kind = _kind_of(rel)
             files.append(
                 {
-                    "name": p.relative_to(root).as_posix(),
+                    "name": rel,
+                    "kind": kind,
+                    "kindLabel": _KIND_LABEL.get(kind, "其它"),
                     "size": stat.st_size,
                     "mtime": int(stat.st_mtime * 1000),
                     "preview": _preview(text),
                 }
             )
-    return {"dir": str(root), "files": files}
+    return {
+        "dir": str(root),
+        "files": files,
+        # 五类定义（id/label/desc/路径），前端按这个顺序分栏。
+        "kinds": [dict(k) for k in MEMORY_KINDS],
+    }
 
 
 @router.get("/memory/{name:path}")
@@ -297,7 +335,7 @@ async def memory_delete(name: str) -> dict[str, Any]:
 
 @router.post("/memory/organize")
 async def memory_organize() -> dict[str, Any]:
-    """整理记忆: 把日常日志/规则/wiki 交给模型, 归纳为 RULES.md + wiki/<topic>.md。
+    """整理记忆：把每日记忆蒸馏进四类长期记忆（长期/规则/报错/偏好）。
 
     Requires an LLM provider to be configured (same setup as chat).
     """
@@ -315,17 +353,17 @@ async def memory_organize() -> dict[str, Any]:
             "applied": False,
             "message": result.skipped or "没有需要整理的内容",
             "logsRead": result.logs_read,
-            "rules": 0,
-            "wiki": [],
+            "kinds": {},
         }
+    detail = "、".join(
+        f"{_KIND_LABEL.get(k, k)} {v} 条" for k, v in result.kinds.items()
+    )
     return {
         "ok": True,
         "applied": True,
-        "message": f"已整理 {result.logs_read} 份日志 → {result.rules_lines} 条规则、"
-        f"{len(result.wiki_files)} 篇 wiki",
+        "message": f"已整理 {result.logs_read} 份每日记忆 → {detail}",
         "logsRead": result.logs_read,
-        "rules": result.rules_lines,
-        "wiki": result.wiki_files,
+        "kinds": result.kinds,
     }
 
 
@@ -466,8 +504,15 @@ async def backup_download() -> Response:
         add(ctx.files_dir / "minis_prefs.json", "prefs/minis_prefs.json")
         memory_root = _memory_dir()
         if memory_root.is_dir():
-            for p in sorted(memory_root.glob("*.md")):
-                add(p, f"memory/{p.name}")
+            # 递归收五类记忆（long-term/ daily/ rules/ troubleshooting/
+            # preferences/），不再只扫根目录。
+            for p in sorted(memory_root.rglob("*.md")):
+                add(p, f"memory/{p.relative_to(memory_root).as_posix()}")
+        # 知识库与记忆分开存放，备份时一起带上。
+        knowledge_root = _knowledge_dir()
+        if knowledge_root.is_dir():
+            for p in sorted(knowledge_root.rglob("*.md")):
+                add(p, f"knowledge/{p.relative_to(knowledge_root).as_posix()}")
         zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
     data = buf.getvalue()
     return Response(

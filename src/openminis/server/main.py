@@ -108,6 +108,14 @@ async def lifespan(app: FastAPI):  # noqa: ANN201
     # Seed SOUL.md on first launch so the system prompt builder always
     # has something to read; subsequent calls are no-ops.
     SoulStore.ensure_exists()
+    # 记忆五分类目录 + 旧布局归位（memory/YYYY-MM-DD.md → daily/、
+    # GLOBAL.md → long-term/、wiki/ → knowledge/）。幂等，启动时跑一次。
+    try:
+        from ..tools.memory_tools import ensure_memory_layout
+
+        ensure_memory_layout()
+    except Exception:  # pragma: no cover - 启动绝不能因记忆布局失败
+        logger.exception("memory layout setup failed")
     # Bundled skills + the generated builtin-tool manifest. Idempotent: an
     # existing (possibly user-edited) bundle is never overwritten.
     try:
