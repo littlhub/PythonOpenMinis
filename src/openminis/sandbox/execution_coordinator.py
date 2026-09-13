@@ -82,6 +82,18 @@ class ExecutionCoordinator:
     def clear_session_cwd(self, session_id: str) -> None:
         self._cwd_overrides.pop(session_id, None)
 
+    def cwd_for(self, session_id: str) -> str:
+        """会话当前的工作目录（沙箱守卫记录「调用目录」用）。"""
+        override = self._cwd_overrides.get(session_id)
+        if override is not None:
+            return str(override)
+        shell = self._shells.get(session_id)
+        for attr in ("cwd", "_cwd", "workdir"):
+            value = getattr(shell, attr, None)
+            if value:
+                return str(value)
+        return ""
+
     def shell_for(self, session_id: str) -> Optional[PersistentShell]:
         """[diag] accessor — mirror of Kotlin's private getOrCreateShell."""
         return self._shells.get(session_id)

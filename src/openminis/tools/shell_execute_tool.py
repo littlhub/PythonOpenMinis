@@ -160,6 +160,22 @@ class ShellExecuteTool:
         if not command.strip():
             return ToolExecutionResult("Error: 'command' is required", True,
                                        tool_title=tool_title)
+
+        # 沙箱守卫：异常删除 / 敏感信息（读密钥、外传凭据）先在这里拦下。
+        # 拦下后记一条事件，用户在「沙箱」页可以手动放行。
+        try:
+            from ..sandbox.guard import check_shell_command
+
+            blocked = check_shell_command(
+                command,
+                session_id=session_id,
+                cwd=self.coordinator.cwd_for(session_id),
+            )
+        except Exception:  # pragma: no cover - 守卫故障不该让 shell 整体失效
+            logger.exception("sandbox guard failed")
+            blocked = None
+        if blocked is not None:
+            return ToolExecutionResult(blocked, True, tool_title=tool_title)
         try:
             timeout = int(args.get("timeout", 900))
         except (TypeError, ValueError):

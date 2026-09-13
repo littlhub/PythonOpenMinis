@@ -31,6 +31,20 @@ from ..tools.tool_execution_result import ToolExecutionResult
 from .repeat_guard import RepeatGuard
 from .tool_loop_detector import LoopCheckResult, LoopLevel, ToolLoopDetector
 
+
+def _guard_outbound(messages: list[LLMMessage], session_id: str) -> None:
+    """出站敏感信息拦截：发给 LLM 前把明文凭据换成占位符/部分显示。
+
+    覆盖「密码 / 密钥 / 令牌 / 私钥」中英文写法；命中会记一条沙箱拦截事件
+    （沙箱页可见、可放行）。守卫本身出问题不能挡住对话。
+    """
+    try:
+        from ..sandbox.guard import sanitize_message_parts
+
+        sanitize_message_parts(messages, session_id=session_id)
+    except Exception:  # pragma: no cover - 脱敏失败不该中断本轮
+        logger.debug("outbound secret scan failed", exc_info=True)
+
 logger = get_logger("agent.runtime")
 
 __all__ = ["AgentRuntime", "AgentChunkSink", "AgentRuntimeOptions", "MAX_AGENT_TURNS"]
@@ -268,6 +282,7 @@ class AgentRuntime:
             # ── 1. stream the turn ─────────────────────────────────────────
             llm_started = time.monotonic()
             try:
+                _guard_outbound(messages, session_id)
                 stream = provider.stream_message(
                     messages,
                     opts.system_prompt,
@@ -530,6 +545,7 @@ class AgentRuntime:
                         for pass_tools in (finish_defs, None):
                             wrap_text: list[str] = []
                             wrap_calls: list[ToolUse] = []
+                            _guard_outbound(messages, session_id)
                             stream = provider.stream_message(
                                 messages,
                                 opts.system_prompt,
@@ -646,6 +662,7 @@ class AgentRuntime:
                 ))
                 wrap_up: list[str] = []
                 try:
+                    _guard_outbound(messages, session_id)
                     stream = provider.stream_message(
                         messages,
                         opts.system_prompt,

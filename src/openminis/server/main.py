@@ -22,7 +22,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -58,6 +58,7 @@ from ..settings.store import SettingsError, SettingsStore
 from ..skills import SkillStore
 from . import chat_api, compaction, fs_api, scheduled_api, workspaces, chat_store
 from .knowledge_api import router as knowledge_router
+from .guard_api import router as guard_router
 from .marketplace_api import router as marketplace_router
 from .scheduled_api import router as scheduled_router
 from .skills_api import router as skills_router
@@ -173,6 +174,41 @@ app.include_router(scheduled_router)
 app.include_router(usage_router)
 app.include_router(appearance_router)
 app.include_router(upload_router)
+app.include_router(guard_router)
+
+
+#: 访问闸门放行的路径前缀（解锁接口本身 + 静态资源）。
+_ACCESS_EXEMPT = ("/api/guard/access",)
+
+
+@app.middleware("http")
+async def _access_gate(request: Request, call_next: Any) -> Any:
+    """页面上锁时的兜底：没设密码就完全不拦（默认行为不变）。
+
+    设了「进入密码」且请求没带有效令牌时，``/api/*`` 一律 423 —— 前端会弹
+    解锁浮层。静态资源照常放行（不然浮层自己都加载不出来）。
+    """
+    try:
+        from ..sandbox.console_auth import ACCESS_COOKIE, access_auth
+
+        path = request.url.path
+        if (
+            access_auth.has_password()
+            and not access_auth.is_unlocked()
+            and path.startswith("/api/")
+            and not path.startswith(_ACCESS_EXEMPT)
+        ):
+            token = request.cookies.get(ACCESS_COOKIE) or request.headers.get(
+                "x-minis-access"
+            )
+            if not access_auth.token_valid(token):
+                return JSONResponse(
+                    {"detail": "locked", "locked": True, "error": "页面已锁定：请输入进入密码"},
+                    status_code=423,
+                )
+    except Exception:  # pragma: no cover - 闸门故障不该挡住整个站点
+        logger.debug("access gate failed", exc_info=True)
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -570,13 +606,45 @@ manager = ConnectionManager()
 
 async def _safe_send(client_id: str, payload: dict[str, Any]) -> None:
     """send_json that swallows WebSocketDisconnect so chat runs survive a
-    mid-stream client drop (e.g. user closes the browser tab)."""
+    mid-stream client drop (e.g. user closes the browser tab).
+
+    出站前过一遍沙箱敏感信息守卫：发给**前端**的文本里若带明文凭据（密码/
+    密钥，中英文），换成占位符/部分显示，并记一条可放行的拦截事件。
+    """
+    try:
+        from ..sandbox.guard import sanitize_outbound
+
+        for key in ("text", "output", "error"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                payload[key] = sanitize_outbound(value, where="frontend")
+    except Exception:  # pragma: no cover - 脱敏失败不该丢帧
+        logger.debug("frontend secret scan failed", exc_info=True)
     try:
         await manager.send_json(client_id, payload)
     except WebSocketDisconnect:
         manager.disconnect(client_id)
     except Exception:  # pragma: no cover - defensive
         logger.debug("ws send failed for %s", client_id, exc_info=True)
+
+
+#: 正在跑的对话轮次，key = 会话 id。对话跑在独立 task 里（不阻塞收帧循环），
+#: 否则「暂停」帧要等本轮结束才被读到，按钮就形同虚设。
+_RUNNING_CHATS: dict[str, asyncio.Task[None]] = {}
+
+
+async def _handle_stop(client_id: str, msg: dict[str, Any]) -> None:
+    """中断某会话正在生成的一轮（前端「暂停」按钮）。"""
+    sid = str(msg.get("session_id") or msg.get("sessionId") or "").strip()
+    task = _RUNNING_CHATS.get(sid)
+    if task is not None and not task.done():
+        task.cancel()
+        # asyncio.wait 不会把子任务的取消抛给当前协程（`await task` 会）。
+        await asyncio.wait({task})
+        logger.info("chat stopped by client (%s)", sid)
+    await _safe_send(
+        client_id, {"type": "done", "sessionId": sid, "stopped": True}
+    )
 
 
 @app.websocket("/ws")
@@ -605,6 +673,8 @@ async def websocket_endpoint(ws: WebSocket) -> None:
                 await _safe_send(client_id, {"type": "pong"})
             elif msg_type == "chat":
                 await _handle_chat(client_id, msg)
+            elif msg_type == "stop":
+                await _handle_stop(client_id, msg)
             elif msg_type == "shell":
                 await _handle_shell(client_id, msg)
             else:
@@ -619,6 +689,29 @@ async def websocket_endpoint(ws: WebSocket) -> None:
 
 
 async def _handle_chat(client_id: str, msg: dict[str, Any]) -> None:
+    """把一轮对话丢到后台 task 里跑，让收帧循环继续响应。
+
+    这样「暂停」帧（以及用户排队追加的下一条）能在本轮生成过程中就被处理；
+    同一会话已有轮次在跑时直接拒绝（前端负责排队，不在服务端并发）。
+    """
+    text = str(msg.get("text", ""))
+    if not text.strip():
+        await _safe_send(client_id, {"type": "error", "error": "empty message"})
+        return
+    sid = str(msg.get("session_id") or msg.get("sessionId") or "").strip()
+    running = _RUNNING_CHATS.get(sid)
+    if sid and running is not None and not running.done():
+        await _safe_send(
+            client_id, {"type": "error", "error": "上一条还在处理中"}
+        )
+        return
+    task = asyncio.create_task(_run_chat(client_id, msg))
+    if sid:
+        _RUNNING_CHATS[sid] = task
+        task.add_done_callback(lambda _t, key=sid: _RUNNING_CHATS.pop(key, None))
+
+
+async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
     """Stream an assistant reply through the real agent kernel.
 
     Chat is organised into persisted sessions (``/api/chats/*``): the frame
@@ -797,11 +890,26 @@ async def _handle_shell(client_id: str, msg: dict[str, Any]) -> None:
 
     PORT: placeholder until ``sandbox`` is ported. Runs locally with a hard
     timeout so the endpoint is safe by default.
+
+    设了控制台密码且未解锁时直接拒绝 —— 前端「沙箱」页要先输密码解锁。
     """
     command = str(msg.get("command", ""))
     if not command:
         await _safe_send(client_id, {"type": "error", "error": "empty command"})
         return
+
+    try:
+        from ..sandbox.console_auth import console_auth
+
+        if console_auth.has_password() and not console_auth.is_unlocked():
+            await _safe_send(client_id, {
+                "type": "error",
+                "error": "控制台已锁定：请先在沙箱页输入控制台密码解锁",
+                "locked": True,
+            })
+            return
+    except Exception:  # pragma: no cover - 闸门故障时按放行处理（与旧行为一致）
+        logger.debug("console auth check failed", exc_info=True)
 
     try:
         proc = await asyncio.create_subprocess_shell(

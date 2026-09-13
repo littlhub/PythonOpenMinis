@@ -33,7 +33,13 @@ __all__ = [
     "memory_write_definition",
     "memory_get_definition",
     "MEMORY_KINDS",
+    "KNOWLEDGE_KINDS",
     "normalize_kind",
+    "normalize_knowledge_kind",
+    "knowledge_kind_by_dir",
+    "knowledge_docs",
+    "knowledge_index_markdown",
+    "rebuild_knowledge_index",
     "kind_paths",
     "ensure_memory_layout",
     "_memory_dir",
@@ -68,8 +74,9 @@ def memory_write_definition() -> AgentToolDefinition:
             "- rules — 特殊规则记忆：必须始终遵守的行为规则/硬性约束；\n"
             "- troubleshooting — 报错问题解决记忆：报错现象 → 根因 → 解法；\n"
             "- preferences — 用户偏好：用户个人的习惯、风格、禁忌。\n"
-            "知识（可复用资料、专题文档）**不属于记忆**：用 scope=wiki 写进\n"
-            "独立的知识库（knowledge/<topic>.md）。\n"
+            "知识（可复用资料、专题文档）**不属于记忆**：用 scope=wiki 写进"
+            "独立的知识库，按 概念/实体/来源/分析/模板 五类归档"
+            "（scope=wiki + topic + category）。\n"
             "Memories persist across sessions and are keyword-searchable.\n"
             "avoid passwords/API keys/tokens/secrets unless the user "
             "explicitly confirms. Keep entries concise Markdown."
@@ -102,9 +109,14 @@ def memory_write_definition() -> AgentToolDefinition:
                 "Required when scope=wiki: the knowledge document name, e.g. "
                 "'project-conventions'. Auto-created on first use.",
             ),
+            "category": AgentToolParam(
+                "string",
+                "scope=wiki 时的知识分类：概念（默认）/ 实体 / 来源 / 分析 / 模板。",
+                enum_values=["概念", "实体", "来源", "分析", "模板"],
+            ),
         },
         required=["tool_title", "content"],
-        property_ordering=["tool_title", "content", "scope", "topic"],
+        property_ordering=["tool_title", "content", "scope", "topic", "category"],
     )
 
 
@@ -236,6 +248,78 @@ _KIND_ALIASES: dict[str, str] = {
 }
 
 
+#: 知识的五个分类（中文目录）—— 知识库**自己的**分类，与记忆五类互不干扰。
+#: 记忆是「关于我和这段关系」，知识是「可复用的资料」；前者按记忆五类归档，
+#: 后者按这五类归档，两边都落在各自的根目录下（memory/ 与 knowledge/）。
+KNOWLEDGE_KINDS: tuple[dict[str, str], ...] = (
+    {
+        "id": "concepts",
+        "label": "概念",
+        "dir": "概念",
+        "desc": "可复用的概念、方法、原理、风格、术语",
+    },
+    {
+        "id": "entities",
+        "label": "实体",
+        "dir": "实体",
+        "desc": "具体的人/项目/工具/作品/服务/配置对象",
+    },
+    {
+        "id": "sources",
+        "label": "来源",
+        "dir": "来源",
+        "desc": "外部资料：文章、文档、链接、论文、数据集",
+    },
+    {
+        "id": "analysis",
+        "label": "分析",
+        "dir": "分析",
+        "desc": "分析报告、结论、复盘、对比与决策记录",
+    },
+    {
+        "id": "templates",
+        "label": "模板",
+        "dir": "模板",
+        "desc": "可复用的模板、骨架、清单、提示词",
+    },
+)
+
+#: 知识分类别名 → 规范 id（中英文、单复数都吃）。
+_KNOWLEDGE_ALIASES: dict[str, str] = {
+    "concepts": "concepts", "concept": "concepts", "概念": "concepts",
+    "entities": "entities", "entity": "entities", "实体": "entities",
+    "sources": "sources", "source": "sources", "来源": "sources",
+    "analysis": "analysis", "analyze": "analysis", "分析": "analysis",
+    "templates": "templates", "template": "templates", "模板": "templates",
+}
+
+#: 默认知识分类（模型没指定时）。
+DEFAULT_KNOWLEDGE_KIND = "concepts"
+
+
+def normalize_knowledge_kind(raw: str) -> str:
+    """归一化知识分类；未知 → 默认「概念」。"""
+    return _KNOWLEDGE_ALIASES.get(
+        (raw or "").strip().lower(), DEFAULT_KNOWLEDGE_KIND
+    )
+
+
+def knowledge_kind_by_dir(name: str) -> str:
+    """从一个目录名/相对路径推断知识分类 id（图谱写着色、API 用）。"""
+    head = (name or "").strip().replace("\\", "/").split("/")[0]
+    for k in KNOWLEDGE_KINDS:
+        if head in (k["dir"], k["id"], k["label"]):
+            return k["id"]
+    return "other"
+
+
+def _knowledge_kind_dir(kind_id: str) -> Path:
+    for k in KNOWLEDGE_KINDS:
+        if k["id"] == kind_id:
+            return _knowledge_dir() / k["dir"]
+    return _knowledge_dir() / KNOWLEDGE_KINDS[0]["dir"]
+
+
 def normalize_kind(scope: str) -> str:
     """把用户/模型给的 scope 归一化成五类 id（未知 → ``daily``）。"""
     return _KIND_ALIASES.get((scope or "").strip().lower(), "daily")
@@ -319,6 +403,9 @@ def ensure_memory_layout() -> None:
     """
     for p in kind_paths().values():
         p.parent.mkdir(parents=True, exist_ok=True)
+    # 知识库的五个中文分类目录
+    for k in KNOWLEDGE_KINDS:
+        (_knowledge_dir() / k["dir"]).mkdir(parents=True, exist_ok=True)
 
     root = _memory_dir()
     # 旧每日日志 → daily/
@@ -387,6 +474,12 @@ def ensure_memory_layout() -> None:
         except OSError:  # pragma: no cover
             pass
 
+    # 索引按当前分类重建（幂等；内容没变不落盘）
+    try:
+        rebuild_knowledge_index()
+    except Exception:  # pragma: no cover - 索引失败不该挡住启动
+        logger.exception("rebuild_knowledge_index failed")
+
 
 #: 旧 wiki 里文件名带这些字样的，其实是「用户偏好」而不是知识 ——
 #: 迁移时归到 preferences/USER.md（用户反馈：记忆和知识混在一起了）。
@@ -395,6 +488,92 @@ _PREFERENCE_HINTS = ("偏好", "习惯", "用户交互", "用户特点", "沟通
 
 def _looks_like_preference(stem: str) -> bool:
     return any(h in stem for h in _PREFERENCE_HINTS)
+
+
+# ---------------------------------------------------------------------------
+# 知识库索引（index.md，按五类分组自动重建）
+# ---------------------------------------------------------------------------
+def knowledge_docs() -> list[tuple[str, Path]]:
+    """知识库文档清单 ``[(分类 id, 路径)]`` —— 五类目录优先，未归类的归 ``other``。"""
+    kdir = _knowledge_dir()
+    if not kdir.is_dir():
+        return []
+    out: list[tuple[str, Path]] = []
+    for k in KNOWLEDGE_KINDS:
+        d = kdir / k["dir"]
+        if d.is_dir():
+            out.extend((k["id"], p) for p in sorted(d.rglob("*.md")) if p.is_file())
+    # 还没归类的（直接躺在 knowledge/ 根下，index.md 不算）
+    for p in sorted(kdir.glob("*.md")):
+        if p.is_file() and p.stem != "index":
+            out.append(("other", p))
+    return out
+
+
+def _doc_summary(path: Path, limit: int = 80) -> str:
+    """取正文第一句有信息的话做索引说明（跳过标题/引用/分隔线）。"""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:  # pragma: no cover
+        return ""
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith(("#", ">", "---", "|")):
+            continue
+        s = re.sub(r"^[-*+\d.\s]+", "", s).strip()
+        if s:
+            return s[:limit]
+    return ""
+
+
+def knowledge_index_markdown() -> str:
+    """生成知识库索引正文（``[[主题]]`` 写法，同时供图谱建立连线）。"""
+    docs = knowledge_docs()
+    lines = [
+        "# 知识库索引",
+        "",
+        "> 自动生成：知识写入 / 记忆整理 / 服务启动时重建，请勿手写。",
+        "> 分类：概念 / 实体 / 来源 / 分析 / 模板。",
+        "",
+    ]
+    for k in KNOWLEDGE_KINDS:
+        items = [(cid, p) for cid, p in docs if cid == k["id"]]
+        lines.append(f"## {k['dir']}（{len(items)}）")
+        lines.append(f"_{k['desc']}_")
+        lines.append("")
+        if items:
+            for _, p in items:
+                summary = _doc_summary(p)
+                lines.append(f"- [[{p.stem}]]" + (f" — {summary}" if summary else ""))
+        else:
+            lines.append("- （暂空）")
+        lines.append("")
+    others = [(cid, p) for cid, p in docs if cid == "other"]
+    if others:
+        lines.append(f"## 未归类（{len(others)}）")
+        lines.append("")
+        for _, p in others:
+            summary = _doc_summary(p)
+            lines.append(f"- [[{p.stem}]]" + (f" — {summary}" if summary else ""))
+        lines.append("")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def rebuild_knowledge_index() -> Path | None:
+    """按当前文档重建 ``knowledge/index.md``；内容没变则不动盘（保 mtime）。"""
+    kdir = _knowledge_dir()
+    if not kdir.is_dir():
+        return None
+    text = knowledge_index_markdown()
+    target = kdir / "index.md"
+    if target.is_file():
+        try:
+            if target.read_text(encoding="utf-8", errors="replace") == text:
+                return target
+        except OSError:  # pragma: no cover
+            pass
+    target.write_text(text, encoding="utf-8")
+    return target
 
 
 def _label_for(path: Path) -> str:
@@ -415,17 +594,18 @@ def _safe_topic(topic: str) -> str:
     return cleaned or "untitled"
 
 
-def _target_path(scope: str, topic: str) -> tuple[Path, bool]:
+def _target_path(scope: str, topic: str, category: str = "") -> tuple[Path, bool]:
     """Resolve the storage file for a scope. ``fresh`` = first creation.
 
     五类记忆各有固定落点；``wiki`` 不再是记忆分类 —— 它写到独立的
-    ``knowledge/<topic>.md``（知识库），保持旧调用可用。
+    ``knowledge/<分类>/<topic>.md``（知识库，按概念/实体/来源/分析/模板归档）。
     """
     raw = (scope or "daily").strip().lower()
     if raw == "wiki":
         if not topic.strip():
             raise ValueError("scope=wiki 需要提供 topic")
-        p = _knowledge_dir() / f"{_safe_topic(topic)}.md"
+        kind = normalize_knowledge_kind(category)
+        p = _knowledge_kind_dir(kind) / f"{_safe_topic(topic)}.md"
         return p, not p.exists()
     kind = normalize_kind(raw)
     p = kind_paths()[kind]
@@ -450,10 +630,11 @@ class MemoryTools:
                 )
             scope = str(args.get("scope", "daily") or "daily")
             topic = str(args.get("topic", "") or "")
+            category = str(args.get("category", "") or "")
             is_wiki = scope.strip().lower() == "wiki"
             kind = "wiki" if is_wiki else normalize_kind(scope)
             try:
-                path, fresh = _target_path(scope, topic)
+                path, fresh = _target_path(scope, topic, category)
             except ValueError as e:
                 return ToolExecutionResult(str(e), False, tool_title=tool_title)
 
@@ -480,9 +661,16 @@ class MemoryTools:
                 else:
                     path.write_text(header + entry.strip() + "\n", encoding="utf-8")
             label = (
-                f"knowledge/{path.name}" if is_wiki
+                f"knowledge/{path.relative_to(_knowledge_dir()).as_posix()}"
+                if is_wiki
                 else path.relative_to(_memory_dir()).as_posix()
             )
+            if is_wiki:
+                # 知识库索引跟着改（新增/切换分类都会反映到 index.md）
+                try:
+                    rebuild_knowledge_index()
+                except Exception:  # pragma: no cover
+                    logger.exception("rebuild_knowledge_index failed")
             return ToolExecutionResult(
                 f"Memory saved to {label} ({len(content)} chars)",
                 True,

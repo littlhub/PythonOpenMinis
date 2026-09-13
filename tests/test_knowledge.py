@@ -94,3 +94,77 @@ def test_knowledge_rejects_unknown_and_traversal(env):
             404,
         }
         assert c.get("/api/knowledge/content/doc/secrets.py").status_code == 404
+
+
+def _seed_categorized(env) -> None:
+    """按五类中文目录写两篇互相引用的知识文档。"""
+    kn = env / "knowledge"
+    (kn / "概念").mkdir(parents=True, exist_ok=True)
+    (kn / "实体").mkdir(parents=True, exist_ok=True)
+    (kn / "概念" / "图像分析规范.md").write_text(
+        "# 图像分析规范\n\n分析维度：人物/场景/色彩\n\n## 相关\n- [[月夜剑姬插画]]\n",
+        encoding="utf-8",
+    )
+    (kn / "实体" / "月夜剑姬插画.md").write_text(
+        "# 月夜剑姬插画\n\n## 相关\n- [[图像分析规范]]\n", encoding="utf-8"
+    )
+
+
+def test_knowledge_docs_carry_category(env):
+    from fastapi.testclient import TestClient
+
+    from openminis.server.main import app
+
+    _seed_categorized(env)
+    with TestClient(app) as c:
+        body = c.get("/api/knowledge?kind=knowledge").json()
+        cats = {it["source"]: it["category"] for it in body["items"]}
+        assert cats["概念/图像分析规范.md"] == "concepts"
+        assert cats["实体/月夜剑姬插画.md"] == "entities"
+        labels = {it["source"]: it["categoryLabel"] for it in body["items"]}
+        assert labels["概念/图像分析规范.md"] == "概念"
+        assert body["categories"]["concepts"] == 1
+        assert body["categories"]["entities"] == 1
+        assert {k["id"] for k in body["knowledgeKinds"]} == {
+            "concepts",
+            "entities",
+            "sources",
+            "analysis",
+            "templates",
+        }
+        # 内容端点同样带分类
+        one = c.get("/api/knowledge/content/knowledge/概念/图像分析规范.md").json()
+        assert one["category"] == "concepts"
+        assert one["categoryLabel"] == "概念"
+
+
+def test_knowledge_graph_from_wikilinks(env):
+    from fastapi.testclient import TestClient
+
+    from openminis.server.main import app
+
+    _seed_categorized(env)
+    with TestClient(app) as c:
+        g = c.get("/api/knowledge/graph")
+        assert g.status_code == 200
+        graph = g.json()
+        ids = {n["id"] for n in graph["nodes"]}
+        assert ids == {
+            "knowledge:概念/图像分析规范.md",
+            "knowledge:实体/月夜剑姬插画.md",
+        }
+        # index.md 只是目录，不该成为节点
+        assert not any(n["path"].endswith("index.md") for n in graph["nodes"])
+        # [[双链]] 目标按文件名匹配 → 两条有向边（去重后剩一对，与方向无关）
+        edges = {frozenset((l["source"], l["target"])) for l in graph["links"]}
+        assert edges == {
+            frozenset(
+                (
+                    "knowledge:概念/图像分析规范.md",
+                    "knowledge:实体/月夜剑姬插画.md",
+                )
+            )
+        }
+        node = next(n for n in graph["nodes"] if n["path"] == "概念/图像分析规范.md")
+        assert node["category"] == "concepts"
+        assert node["label"] == "图像分析规范"

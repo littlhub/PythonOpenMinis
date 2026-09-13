@@ -33,7 +33,7 @@ export type ClientFrame =
 export type ServerFrame =
   | { type: 'pong' }
   | { type: 'delta'; text: string }
-  | { type: 'done'; exitCode?: number; sessionId?: string }
+  | { type: 'done'; exitCode?: number; sessionId?: string; stopped?: boolean }
   | { type: 'chatSession'; sessionId: string; title?: string }
   | {
       type: 'toolStart'
@@ -55,7 +55,7 @@ export type ServerFrame =
       cacheCreation?: number | null
       cacheRead?: number | null
     }
-  | { type: 'error'; error: string }
+  | { type: 'error'; error: string; /** 控制台被密码锁住时说一声 */ locked?: boolean }
 
 // ---------------------------------------------------------------------------
 // chat sessions & messages (设置无关的会话持久化)
@@ -573,12 +573,31 @@ export interface MarketplaceInstallResult {
 
 export interface KnowledgeItem {
   id: string
-  kind: 'skill' | 'memory' | 'doc'
+  kind: 'skill' | 'memory' | 'knowledge' | 'doc'
   kindLabel: string
   title: string
   source: string
   modified: number
   preview: string
+  /** 知识文档的五分类 id（仅 kind=knowledge） */
+  category?: KnowledgeCategoryId
+  categoryLabel?: string
+}
+
+/** 知识库五分类：概念 / 实体 / 来源 / 分析 / 模板（+ other 未归类）。 */
+export type KnowledgeCategoryId =
+  | 'concepts'
+  | 'entities'
+  | 'sources'
+  | 'analysis'
+  | 'templates'
+  | 'other'
+
+export interface KnowledgeKindInfo {
+  id: KnowledgeCategoryId
+  label: string
+  dir: string
+  desc: string
 }
 
 export interface KnowledgeList {
@@ -586,6 +605,9 @@ export interface KnowledgeList {
   count: number
   items: KnowledgeItem[]
   sources: Record<string, number>
+  /** 各知识分类的文档数 */
+  categories?: Record<string, number>
+  knowledgeKinds?: KnowledgeKindInfo[]
 }
 
 export interface KnowledgeContent {
@@ -595,6 +617,28 @@ export interface KnowledgeContent {
   source: string
   modified: number
   content: string
+  category?: KnowledgeCategoryId
+  categoryLabel?: string
+}
+
+/** 知识图谱：节点 = 文档（按分类着色），连线 = 文档间 [[双链]]。 */export interface KnowledgeGraphNode {
+  id: string
+  label: string
+  path: string
+  kind: string
+  category: KnowledgeCategoryId
+  categoryLabel: string
+}
+
+export interface KnowledgeGraphLink {
+  source: string
+  target: string
+}
+
+export interface KnowledgeGraph {
+  nodes: KnowledgeGraphNode[]
+  links: KnowledgeGraphLink[]
+  categories: KnowledgeKindInfo[]
 }
 
 /** Result of a memory-organize pass（每日记忆 → 四类长期记忆）。 */
@@ -666,4 +710,55 @@ export interface SubagentsList {
 export interface SubagentPlanResult {
   saved: boolean
   subagent: SubagentInfo
+}
+
+// ---------------------------------------------------------------------------
+// 沙箱守卫（异常删除 / 敏感信息拦截 + 控制台密码）
+// ---------------------------------------------------------------------------
+
+export type GuardFamily = 'escape' | 'delete' | 'secret'
+
+export interface GuardEvent {
+  id: string
+  time: number
+  family: GuardFamily
+  familyLabel: string
+  tool: string
+  session_id: string
+  /** 调用目录 —— 这条操作是在哪儿发起的 */
+  cwd: string
+  targets: string[]
+  reasons: string[]
+  command: string
+  /** 异常输出：原始命令 / 报错 / 命中片段 */
+  output: string
+  status: 'blocked' | 'allowed'
+  scope: string | null
+}
+
+export interface GuardEventList {
+  events: GuardEvent[]
+  counts: Record<string, number>
+  blocked: number
+  scopes: string[]
+}
+
+/** 放行范围：只放一次 / 本会话该目录 / 永久白名单。 */
+export type GuardScope = 'once' | 'session' | 'always'
+
+export interface ConsoleStatus {
+  hasPassword: boolean
+  locked: boolean
+  expiresAt: number | null
+  ttlSeconds: number
+}
+
+/** 实时检测流水：每条被扫描的命令一行（放行/拦截都显示，内存态）。 */
+export interface GuardLiveItem {
+  time: number
+  command: string
+  cwd: string
+  family: '' | 'escape' | 'delete' | 'secret'
+  reasons: string[]
+  blocked: boolean
 }

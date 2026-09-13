@@ -137,6 +137,11 @@ export function ChatView({
   const [workspaces, setWorkspaces] = useState<WorkspaceInfo[]>([])
   const [messages, setMessages] = useState<UiMessage[]>([])
   const [busy, setBusy] = useState(false)
+  // 生成中还可以继续输入：这些消息先排队，本轮结束后自动发下一条。
+  const queueRef = useRef<string[]>([])
+  const [queuedCount, setQueuedCount] = useState(0)
+  // 「暂停」后的提示（下一条消息发出时清掉）。
+  const [stoppedNote, setStoppedNote] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [configWarning, setConfigWarning] = useState<string | null>(null)
   const [pickerOpen, setPickerOpen] = useState(false)
@@ -233,6 +238,37 @@ export function ChatView({
     }
   }, [activeSessionId])
 
+  // -- 发送 / 排队 / 暂停 --------------------------------------------------
+  const dispatch = useCallback((text: string, sid: string) => {
+    const ws = socketRef.current
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      // keep the user message + busy false — the proxy will queue the
+      // frame and flush on the next open; a tiny pill surfaces the state.
+      setError('连接已断开,正在重连…')
+      setBusy(false)
+      return
+    }
+    setBusy(true)
+    ws.send(JSON.stringify({ type: 'chat', text, sessionId: sid }))
+  }, [])
+
+  /** 本轮结束后把排队的第一条发出去（一次一条，发完再等 done）。 */
+  const flushQueue = useCallback(() => {
+    const next = queueRef.current.shift()
+    setQueuedCount(queueRef.current.length)
+    if (next === undefined) return
+    const sid = activeIdRef.current
+    if (sid) dispatch(next, sid)
+  }, [dispatch])
+
+  /** 「暂停」：中断本轮生成（已排队/已输入内容都不受影响）。 */
+  const stop = useCallback(() => {
+    const sid = activeIdRef.current
+    const ws = socketRef.current
+    if (!sid || !ws || ws.readyState !== WebSocket.OPEN) return
+    ws.send(JSON.stringify({ type: 'stop', sessionId: sid }))
+  }, [])
+
   // -- one shared websocket ------------------------------------------------
   const handleFrame = useCallback((frame: ServerFrame) => {
     const sid = activeIdRef.current
@@ -307,8 +343,12 @@ export function ChatView({
       }
       case 'done': {
         setBusy(false)
+        if (frame.stopped) setStoppedNote(true)
         const completed = activeIdRef.current
-        if (completed) {
+        if (queueRef.current.length > 0) {
+          // 还有排队的消息 → 直接接着发（消息已在界面上，不必先刷历史）
+          flushQueue()
+        } else if (completed) {
           void api.chatMessages(completed).catch(() => undefined)
           void reloadSessions()
         }
@@ -317,11 +357,12 @@ export function ChatView({
       case 'error':
         setError(frame.error)
         setBusy(false)
+        if (queueRef.current.length > 0) flushQueue()
         break
       default:
         break
     }
-  }, [onChangeSession, reloadSessions])
+  }, [flushQueue, onChangeSession, reloadSessions])
 
   useEffect(() => {
     const ws = openSocket(handleFrame, { onStateChange: setSocketState })
@@ -347,26 +388,25 @@ export function ChatView({
 
   // -- actions --------------------------------------------------------------
   const send = useCallback((text: string) => {
-    if (!text.trim() || busy) return
-    setError(null)
-    setConfigWarning(null)
+    const t = text.trim()
+    if (!t) return
     const sid = activeIdRef.current
     if (!sid) return
-    setBusy(true)
+    setError(null)
+    setConfigWarning(null)
+    setStoppedNote(false)
     setMessages((prev) => [
       ...prev,
-      { id: `local-${Date.now()}`, role: 'user', text, toolCalls: [] },
+      { id: `local-${Date.now()}`, role: 'user', text: t, toolCalls: [] },
     ])
-    const ws = socketRef.current
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      // keep the user message + busy false — the proxy will queue the
-      // frame and flush on the next open; a tiny pill surfaces the state.
-      setError('连接已断开,正在重连…')
-      setBusy(false)
+    if (busy) {
+      // 生成中 → 先排队，本轮 done 后自动发出（消息已显示在界面上）
+      queueRef.current.push(t)
+      setQueuedCount(queueRef.current.length)
       return
     }
-    ws.send(JSON.stringify({ type: 'chat', text, sessionId: sid }))
-  }, [busy])
+    dispatch(t, sid)
+  }, [busy, dispatch])
 
   const createChatHere = useCallback(async (folderId?: string | null) => {
     try {
@@ -517,7 +557,17 @@ export function ChatView({
           </div>
         )}
         {error && <div className="chat-error">{error}</div>}
-        <Composer disabled={busy || !activeSessionId} onSend={send} onClearSession={clearSession} />
+        {stoppedNote && (
+          <div className="chat-stopped">⏹ 已暂停本轮生成（本轮内容未保存）</div>
+        )}
+        <Composer
+          disabled={!activeSessionId}
+          busy={busy}
+          queued={queuedCount}
+          onSend={send}
+          onStop={stop}
+          onClearSession={clearSession}
+        />
         {!activeSessionId && (
           <div className="chat-hint">
             从左侧选择一个会话,或点击左上「＋ 新建任务」开始对话。
@@ -722,11 +772,19 @@ function iconFor(name: string): string {
 
 function Composer({
   disabled,
+  busy = false,
+  queued = 0,
   onSend,
+  onStop,
   onClearSession,
 }: {
   disabled: boolean
+  /** 正在生成 → 输入框仍可用（消息排队），发送键变「暂停」。 */
+  busy?: boolean
+  /** 已排队待发的消息条数。 */
+  queued?: number
   onSend: (text: string) => void
+  onStop?: () => void
   onClearSession?: () => void
 }) {
   const [draft, setDraft] = useState('')
@@ -883,7 +941,9 @@ function Composer({
               ? '先选择一个会话…'
               : attachBusy
                 ? '上传中…'
-                : '输入消息…'
+                : busy
+                  ? '继续输入，回车加入队列…'
+                  : '输入消息…'
           }
           value={draft}
           disabled={disabled}
@@ -909,6 +969,11 @@ function Composer({
         {attachError && (
           <div className="composer-note err">附件上传失败：{attachError}</div>
         )}
+        {queued > 0 && (
+          <div className="composer-note">
+            📥 已排队 {queued} 条，本轮结束后自动发送
+          </div>
+        )}
       </div>
 
       {/* Right actions */}
@@ -922,11 +987,21 @@ function Composer({
         >
           🎤
         </button>
+        {busy && (
+          <button
+            type="button"
+            className="composer-stop-btn"
+            onClick={() => onStop?.()}
+            title="暂停当前生成（已排队/已输入的内容不受影响）"
+          >
+            ⏹
+          </button>
+        )}
         <button
           type="submit"
           className="composer-send-btn"
           disabled={disabled || !draft.trim()}
-          title="发送"
+          title={busy ? '加入队列（本轮结束后自动发送）' : '发送'}
         >
           ↑
         </button>

@@ -6,17 +6,23 @@ import type {
   ChatSessionInfo,
   ConfigFieldInfo,
   ConfigUpdateResult,
+  ConsoleStatus,
   FetchModelsRequest,
   FetchModelsResponse,
   FsNode,
   FsReadResult,
   FsRoot,
+  GuardEvent,
+  GuardEventList,
+  GuardLiveItem,
+  GuardScope,
   HealthInfo,
   HistoryEntry,
   KnowledgeContent,
+  KnowledgeGraph,
+  KnowledgeList,
   MarketplaceInstallResult,
   MarketplaceSource,
-  KnowledgeList,
   MemoryDoc,
   MemoryList,
   OrganizeResponse,
@@ -253,13 +259,80 @@ export const api = {
     }),
 
   // -- knowledge (知识库搜索) -------------------------------------
-  knowledgeSearch: (q = '', kind = '', limit = 80) =>
+  knowledgeSearch: (q = '', kind = '', limit = 80, category = '') =>
     request<KnowledgeList>(
-      `/knowledge?q=${encodeURIComponent(q)}&kind=${encodeURIComponent(kind)}&limit=${limit}`,
+      `/knowledge?q=${encodeURIComponent(q)}&kind=${encodeURIComponent(kind)}` +
+        `&category=${encodeURIComponent(category)}&limit=${limit}`,
     ),
 
   knowledgeContent: (kind: string, name: string) =>
     request<KnowledgeContent>(`/knowledge/content/${kind}/${encodeURIComponent(name)}`),
+
+  knowledgeGraph: () => request<KnowledgeGraph>('/knowledge/graph'),
+
+  // -- 沙箱守卫（拦截事件 + 放行 + 控制台密码）----------------------
+  guardLive: () => request<{ items: GuardLiveItem[] }>('/guard/live?limit=30'),
+
+  guardEvents: (family = '') =>
+    request<GuardEventList>(
+      `/guard/events?limit=200&family=${encodeURIComponent(family)}`,
+    ),
+
+  guardAllow: (id: string, scope: GuardScope) =>
+    request<{ ok: boolean; event: GuardEvent }>(
+      `/guard/events/${encodeURIComponent(id)}/allow`,
+      { method: 'POST', body: JSON.stringify({ scope }) },
+    ),
+
+  guardDeny: (id: string) =>
+    request<{ ok: boolean; event: GuardEvent }>(
+      `/guard/events/${encodeURIComponent(id)}/deny`,
+      { method: 'POST' },
+    ),
+
+  guardClear: () => request<{ ok: boolean }>('/guard/events/clear', { method: 'POST' }),
+
+  guardAllowlist: () =>
+    request<{ allowlist: Record<string, string[]> }>('/guard/allowlist'),
+
+  guardRevoke: (family = '', key = '') =>
+    request<{ ok: boolean; allowlist: Record<string, string[]> }>(
+      `/guard/allowlist/revoke?family=${encodeURIComponent(family)}` +
+        `&key=${encodeURIComponent(key)}`,
+      { method: 'POST' },
+    ),
+
+  consoleStatus: () => request<ConsoleStatus>('/guard/console/status'),
+
+  consoleUnlock: (password: string) =>
+    request<{ ok: boolean; ttlSeconds: number }>('/guard/console/unlock', {
+      method: 'POST',
+      body: JSON.stringify({ password }),
+    }),
+
+  consoleLock: () => request<{ ok: boolean }>('/guard/console/lock', { method: 'POST' }),
+
+  consoleSetPassword: (password: string, current = '') =>
+    request<ConsoleStatus>('/guard/console/password', {
+      method: 'POST',
+      body: JSON.stringify({ password, current }),
+    }),
+
+  accessStatus: () => request<ConsoleStatus>('/guard/access/status'),
+
+  accessUnlock: (password: string) =>
+    request<{ ok: boolean; ttlSeconds: number }>('/guard/access/unlock', {
+      method: 'POST',
+      body: JSON.stringify({ password }),
+    }),
+
+  accessLock: () => request<{ ok: boolean }>('/guard/access/lock', { method: 'POST' }),
+
+  accessSetPassword: (password: string, current = '') =>
+    request<ConsoleStatus>('/guard/access/password', {
+      method: 'POST',
+      body: JSON.stringify({ password, current }),
+    }),
 
   // -- subagents (助理 / 子代理) ---------------------------------
   scheduledList: () =>

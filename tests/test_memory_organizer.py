@@ -134,8 +134,10 @@ def test_organize_distils_into_four_kinds(env):
     assert "uv" in (mem / "long-term" / "LONG_TERM.md").read_text("utf-8")
     assert "reconfigure" in (mem / "troubleshooting" / "TROUBLESHOOTING.md").read_text("utf-8")
     assert "Markdown" in (mem / "preferences" / "USER.md").read_text("utf-8")
-    # 整理器不再产出知识文件
-    assert not (env / "knowledge").exists()
+    # 整理器不再产出知识文件（knowledge/ 只会有五类空目录 + 自动索引）
+    assert not list((env / "knowledge").rglob("*.md")) or {
+        p.name for p in (env / "knowledge").rglob("*.md")
+    } == {"index.md"}
 
 
 def test_organize_noop_without_sources(env):
