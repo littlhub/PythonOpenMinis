@@ -218,3 +218,11 @@ def test_web_search_declares_time_range_param():
     d = WebSearchTool.definition()
     assert "time_range" in d.parameters
     assert "time_range" in (d.description or "")
+
+
+def test_system_prompt_asks_for_parallel_tool_calls():
+    """工具已并发执行，提示必须让模型「一轮给全」，否则白等多次往返。"""
+    from openminis.settings.chat_service import PARALLEL_TOOL_DISCIPLINE
+
+    assert "并行" in PARALLEL_TOOL_DISCIPLINE
+    assert "同一轮" in PARALLEL_TOOL_DISCIPLINE

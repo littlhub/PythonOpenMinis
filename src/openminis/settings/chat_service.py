@@ -186,6 +186,17 @@ def current_time_block() -> str:
     )
 
 
+#: 并发工具纪律：一轮对话里的多个工具调用会**并发执行**，所以互不依赖的
+#: 动作要一次给全（4 张图 = 1 轮并发，而不是 4 轮串行）。每多一轮就多一次
+#: 模型往返（实测该接口首包 0.7–15s），这是省时间最直接的一条。
+PARALLEL_TOOL_DISCIPLINE = (
+    "\n\n【并行调用】一次回复里可以同时给出**多个互不依赖**的工具调用"
+    "（运行时会把它们并发执行，总耗时只等于最慢的那一个）。"
+    "因此：需要读多张图、查多个文件、搜多个关键词时，**在同一轮里一次给全**，"
+    "不要一次只调一个、等结果再调下一个。"
+    "仅有真正的前后依赖（后一个的输入来自前一个的输出）时才分轮。"
+)
+
 #: 工具失败的处置纪律：失败输出就是分析素材 —— 先读懂报错、修正、再重试；
 #: 绝不许因为「不知道怎么回事」就跑去调用一堆无关工具（典型恶例：shell
 #: 失败后疯狂 read_image 看图「找线索」，跟图毫无关系）。
@@ -213,6 +224,7 @@ def identity_system_prompt(store: SettingsStore) -> str:
         + (SUBAGENT_PLAN_DISCIPLINE if subagent_on else "")
         + COMPLETION_JUDGMENT_DISCIPLINE
         + TOOL_FAILURE_DISCIPLINE
+        + PARALLEL_TOOL_DISCIPLINE
         + active_skills_block(store)
     )
 
