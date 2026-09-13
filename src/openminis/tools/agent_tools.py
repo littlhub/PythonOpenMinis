@@ -32,6 +32,7 @@ from .ls_tool import LsTool
 from .memory_tools import memory_get_definition, memory_write_definition
 from .read_image_tool import ReadImageTool
 from .search_files_tool import SearchFilesTool
+from .send_tool import SendTool
 from .shell_execute_tool import ShellExecuteTool
 from .subagent_tool import SubagentDelegateTool
 from .skill_use_tool import SkillUseTool
@@ -73,6 +74,10 @@ class AgentTools:
         out.append(BrowserUseTool.definition())
         out.append(WebFetchTool.definition())
         out.append(WebSearchTool.definition())
+        # 把本地产物（生成的图/报告/下载）交付给用户。也是**硬停收尾阶段唯一
+        # 允许调用的工具**（agent_runtime 的 send-only 收尾轮），必须常驻 ——
+        # 否则收尾链空转，用户既拿不到产物也拿不到总结。
+        out.append(SendTool.definition())
         # Delegation to configured subagents — needs a subagent registry entry
         # at call time; schema exposure is harmless.
         out.append(SubagentDelegateTool.definition())

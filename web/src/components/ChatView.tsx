@@ -100,8 +100,14 @@ function splitAttachments(text: string): {
     const ref: ImageRef = { alt: alt || '图片', src }
     if (/^https?:\/\//.test(src)) ref.url = src
     else if (!src.startsWith('data:')) {
-      const base = src.split(/[\\/]/).pop()
-      if (base) ref.url = `/api/upload/raw?name=${encodeURIComponent(base)}`
+      if (/^[A-Za-z]:[\\/]/.test(src) || src.startsWith('/')) {
+        // 本地绝对路径：可能是 agent **生成**到 workspace 任意位置的图
+        // （image/、generated/ 都不在 uploads，upload/raw 按存储名取不到）。
+        ref.url = `/api/fs/raw?path=${encodeURIComponent(src)}`
+      } else {
+        const base = src.split(/[\\/]/).pop()
+        if (base) ref.url = `/api/upload/raw?name=${encodeURIComponent(base)}`
+      }
     }
     return ref
   }

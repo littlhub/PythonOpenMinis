@@ -34,6 +34,7 @@ from ..tools.memory_tools import (
 )
 from ..tools.read_image_tool import ReadImageTool
 from ..tools.search_files_tool import SearchFilesTool
+from ..tools.send_tool import SendTool
 from ..tools.shell_execute_tool import ShellExecuteTool
 from ..tools.subagent_tool import SubagentDelegateTool
 from ..tools.skill_use_tool import SkillUseTool
@@ -189,6 +190,7 @@ BUILTIN_IDENTITIES: list[Identity] = [
             "skill_use",
             "memory_write",
             "memory_get",
+            "send",
         ],
     ),
     Identity(
@@ -215,6 +217,7 @@ BUILTIN_IDENTITIES: list[Identity] = [
             "skill_use",
             "memory_write",
             "memory_get",
+            "send",
         ],
     ),
     Identity(
@@ -237,6 +240,7 @@ BUILTIN_IDENTITIES: list[Identity] = [
             "skill_use",
             "memory_write",
             "memory_get",
+            "send",
         ],
     ),
     Identity(
@@ -248,7 +252,7 @@ BUILTIN_IDENTITIES: list[Identity] = [
             "你是一名写作与编辑助手,擅长中文。行文自然、克制,避免空话套话;"
             "需要素材时可以读取文件,但不要随意执行有副作用的命令。"
         ),
-        recommended_tools=["file_read", "skill_use", "memory_write", "memory_get"],
+        recommended_tools=["file_read", "send", "skill_use", "memory_write", "memory_get"],
     ),
 ]
 
@@ -270,6 +274,7 @@ IDENTITY_TOOL_MATCH: dict[str, list[str]] = {
         "skill_use",
         "memory_write",
         "memory_get",
+        "send",
     ],
     "coder": [
         "shell_execute",
@@ -286,6 +291,7 @@ IDENTITY_TOOL_MATCH: dict[str, list[str]] = {
         "skill_use",
         "memory_write",
         "memory_get",
+        "send",
     ],
     "analyst": [
         "shell_execute",
@@ -299,8 +305,9 @@ IDENTITY_TOOL_MATCH: dict[str, list[str]] = {
         "skill_use",
         "memory_write",
         "memory_get",
+        "send",
     ],
-    "writer": ["file_read", "read_image", "image_gen", "skill_use", "memory_write", "memory_get"],
+    "writer": ["file_read", "read_image", "image_gen", "skill_use", "memory_write", "memory_get", "send"],
 }
 
 
@@ -344,6 +351,8 @@ def _tool_desc(tool_id: str) -> str:
             return SubagentDelegateTool.definition().description
         if tool_id == "skill_use":
             return SkillUseTool.definition().description
+        if tool_id == "send":
+            return SendTool.definition().description
     except Exception:  # pragma: no cover - defensive
         pass
     return tool_id
@@ -443,6 +452,12 @@ TOOL_CATALOG: list[dict] = [
         "name": "加载技能",
         "description": _tool_desc("skill_use"),
         "category": "Skill",
+    },
+    {
+        "id": "send",
+        "name": "发送文件",
+        "description": _tool_desc("send"),
+        "category": "Files",
     },
 ]
 
@@ -693,6 +708,10 @@ def build_tool_registry(enabled_ids: list[str]) -> dict[str, ToolExecutor]:
         elif tool_id == "skill_use":
             out[tool_id] = _wrap_async_static_executor(
                 SkillUseTool.definition(), SkillUseTool.execute
+            )
+        elif tool_id == "send":
+            out[tool_id] = _wrap_async_static_executor(
+                SendTool.definition(), SendTool.execute
             )
     return out
 

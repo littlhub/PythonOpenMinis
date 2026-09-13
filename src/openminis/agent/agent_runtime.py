@@ -225,6 +225,9 @@ class AgentRuntime:
         react_mode = (opts.loop_mode or "react").strip().lower() != "kt"
         detector = opts.loop_detector or ToolLoopDetector()
         repeat_guard = (opts.repeat_guard or RepeatGuard()) if react_mode else None
+        if repeat_guard is not None:
+            # 按轮计数的护栏在这里归零（「一张就停」），检测器的跨轮历史不动。
+            repeat_guard.begin_turn()
         tool_defs = self.tool_definitions()
 
         final_text: list[str] = []

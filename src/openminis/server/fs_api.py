@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
+from fastapi.responses import FileResponse
 
 from ..core.context import app_context
 
@@ -208,3 +209,51 @@ async def fs_read(
         "name": target.name,
         **data,
     }
+
+
+#: 允许通过 ``/raw`` 直接回读的扩展名 —— 只放行图片。
+#:
+#: ``/api/upload/raw`` 只认 uploads 目录下的存储名，而 agent **生成**的图片会落在
+#: ``workspace/image/``、``workspace/generated/`` 等别处，于是聊天里渲染不出来
+#: （前端 onError 里直接 display:none）。这条端点是「生成的图片发不到前端」的补口。
+_RAW_IMAGE_SUFFIXES = {
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico", ".avif",
+}
+_RAW_MAX_BYTES = 32 * 1024 * 1024
+
+
+def _resolve_raw_target(raw: str, workspace: str | None) -> Path:
+    """把 ``raw``（绝对路径或相对工作区）解析成可读文件，越界一律 400。"""
+    from ..tools.path_utils import readonly_roots
+
+    candidate = Path(raw.strip())
+    if candidate.is_absolute():
+        resolved = candidate.resolve()
+        roots = [_resolve_root(workspace).resolve()]
+        try:
+            roots.extend(p.resolve() for p in readonly_roots())
+        except Exception:  # pragma: no cover - 技能根读不到就不放行
+            pass
+        if not any(resolved == r or r in resolved.parents for r in roots):
+            raise HTTPException(status_code=400, detail="路径超出可读范围")
+        return resolved
+    return _resolve_relative(raw, _resolve_root(workspace))
+
+
+@router.get("/raw")
+async def fs_raw(
+    path: str = Query(..., description="工作区内的绝对路径，或相对工作区的路径"),
+    workspace: str | None = Query(default=None),
+) -> FileResponse:
+    """按路径回读工作区内的**图片**（聊天里渲染 agent 生成的图）。"""
+    target = _resolve_raw_target(path, workspace)
+    if not target.is_file():
+        raise HTTPException(status_code=404, detail="文件不存在")
+    if target.suffix.lower() not in _RAW_IMAGE_SUFFIXES:
+        raise HTTPException(status_code=400, detail="只支持图片预览")
+    try:
+        if target.stat().st_size > _RAW_MAX_BYTES:
+            raise HTTPException(status_code=400, detail="图片过大")
+    except OSError as exc:  # pragma: no cover
+        raise HTTPException(status_code=400, detail=f"无法读取: {exc}") from exc
+    return FileResponse(target)

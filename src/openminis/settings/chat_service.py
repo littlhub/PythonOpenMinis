@@ -189,6 +189,18 @@ def current_time_block() -> str:
     )
 
 
+#: 生图纪律。两个实测故障各占一半：
+#: ① 「只要一张图，模型却串行跑了 4 次脚本」→ 一次一张，禁止反复重跑凑数；
+#: ② 「图生成了但用户看不到」→ 产物必须用可渲染的路径交出去。
+IMAGE_GEN_DISCIPLINE = (
+    "\n\n【生成图片】动手前先判断**需要几张**：用户没明确说数量就按 1 张做；"
+    "一次只生成一张，禁止用同一或相近的提示词反复重跑凑数。确需多张时，"
+    "在**同一轮**里一次性给出多个互不依赖的调用（会被并发执行），不要串行重跑。"
+    "生成成功后必须把产物交给用户：优先用 send 工具，或在回复里单独成行写 "
+    "`![简短说明](图片的绝对路径)`。只写「已生成」而不给可渲染的路径，"
+    "用户在界面上是看不到图的。"
+)
+
 #: 并发工具纪律：一轮对话里的多个工具调用会**并发执行**，所以互不依赖的
 #: 动作要一次给全（4 张图 = 1 轮并发，而不是 4 轮串行）。每多一轮就多一次
 #: 模型往返（实测该接口首包 0.7–15s），这是省时间最直接的一条。
@@ -228,6 +240,7 @@ def identity_system_prompt(store: SettingsStore) -> str:
         + COMPLETION_JUDGMENT_DISCIPLINE
         + TOOL_FAILURE_DISCIPLINE
         + PARALLEL_TOOL_DISCIPLINE
+        + IMAGE_GEN_DISCIPLINE
         + active_skills_block(store)
     )
 
@@ -457,6 +470,11 @@ def build_chat_setup(  # noqa: ANN201
     # 空话（模型按清单调 skill_use 只会收到 Unknown tool）。这里补齐。
     if "skill_use" not in enabled_ids:
         enabled_ids.append("skill_use")
+    # send 同样是**能力开关**：agent 生成图片/报告后要把产物交付给用户，
+    # 硬停收尾轮也只允许调它。老 settings.json 存的 enabled_tools 里没有它时
+    # 必须补齐，否则「有产物但发不出去」。
+    if "send" not in enabled_ids:
+        enabled_ids.append("send")
     if agent_cfg.get("subagentEnabled", True):
         # 子代理委派是**能力开关**而不是身份工具：用户存的 enabled_tools 可能
         # 早于 subagent_delegate 出现（老 settings.json），照搬会让主 agent

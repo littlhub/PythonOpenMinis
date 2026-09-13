@@ -55,6 +55,7 @@ def test_default_settings_have_catalog(store):
         "web_search",
         "subagent_delegate",
         "skill_use",
+        "send",
     ]
 
 
@@ -198,6 +199,7 @@ async def test_chat_setup_roundtrip_with_fake_engine(store, monkeypatch):
         "memory_write",
         "read_image",
         "search_files",
+        "send",
         "shell_execute",
         "skill_use",
         "subagent_delegate",
