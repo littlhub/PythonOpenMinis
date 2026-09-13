@@ -12,6 +12,7 @@ emitter.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from dataclasses import dataclass, field
@@ -33,6 +34,15 @@ from .tool_loop_detector import LoopCheckResult, LoopLevel, ToolLoopDetector
 logger = get_logger("agent.runtime")
 
 __all__ = ["AgentRuntime", "AgentChunkSink", "AgentRuntimeOptions", "MAX_AGENT_TURNS"]
+
+
+def _round_dedup_key(params: dict[str, Any]) -> str:
+    """同轮去重用的参数指纹：忽略 ``tool_title``（纯展示字段）。"""
+    payload = {k: v for k, v in (params or {}).items() if k != "tool_title"}
+    try:
+        return json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):  # pragma: no cover - unusual arg shapes
+        return repr(sorted(payload.items(), key=lambda kv: kv[0]))
 
 
 def _skill_mistake_hint(name: str) -> str | None:
@@ -159,6 +169,42 @@ class AgentRuntime:
         if self.chunk_sink is not None:
             await self.chunk_sink(chunk)
 
+    async def _execute_tool(
+        self,
+        tu: ToolUse,
+        args_json: str,
+        session_id: str,
+        session_user_env: Optional[dict[str, str]],
+    ) -> ToolExecutionResult:
+        """Run one tool call, converting a crash into a failed result.
+
+        被 ``asyncio.gather`` 并发调用：任何异常都必须在这里被吃掉，否则
+        一个工具炸了会连带整轮结果一起丢。
+        """
+        executor = self.tools.get(tu.name)
+        if executor is None:  # pragma: no cover - gate already filtered this
+            return ToolExecutionResult(f"Unknown tool: {tu.name}", False,
+                                       tool_title=tu.name)
+        started = time.monotonic()
+        try:
+            result = await executor.executor(
+                args_json, session_id,
+                **({"env": session_user_env} if session_user_env else {}),
+            )
+        except Exception as exc:
+            logger.warning("tool %s raised %s: %s",
+                           tu.name, type(exc).__name__, exc)
+            result = ToolExecutionResult(
+                f"[tool error: {type(exc).__name__}] {exc}", False,
+                tool_title=tu.name,
+            )
+        # 每个工具的耗时单独打点：整轮慢时能立刻分清是哪个工具（网络/模型）
+        # 慢，而不是模型慢。
+        logger.info("tool_ms name=%s ms=%s ok=%s",
+                    tu.name, int((time.monotonic() - started) * 1000),
+                    result.success)
+        return result
+
     # ── main loop ──────────────────────────────────────────────────────────
     async def run(
         self,
@@ -217,6 +263,7 @@ class AgentRuntime:
             turn_stop_reason: Optional[str] = None
 
             # ── 1. stream the turn ─────────────────────────────────────────
+            llm_started = time.monotonic()
             try:
                 stream = provider.stream_message(
                     messages,
@@ -255,6 +302,11 @@ class AgentRuntime:
                     elif isinstance(chunk, LLMStreamChunk.Finished):
                         seen_finished = True
                         turn_stop_reason = chunk.stop_reason
+                # 每轮的模型耗时单独打点：工具慢/模型慢能一眼分清
+                # （上下文越大这一项越大，接不上时先看这里）。
+                logger.info("agent turn=%s llm_ms=%s tools=%s text_chars=%s",
+                            turn, int((time.monotonic() - llm_started) * 1000),
+                            len(round_tool_uses), len("".join(round_text)))
             except Exception as exc:  # network / api / auth errors
                 logger.warning("agent turn %s failed: %s: %s",
                                turn, type(exc).__name__, exc)
@@ -308,6 +360,12 @@ class AgentRuntime:
             tool_result_parts: list[ToolResult] = []
             executed_any = False
             blocked_any = False
+            #: 同一轮内「同工具 + 完全同参」的重复调用：detector 的历史要等
+            #: 执行后才写入，看不见同轮重复（模型一次吐两份一样的调用很常见），
+            #: 这里用集合补上（用户要求「第一次重复就停」）。
+            seen_in_round: set[tuple] = set()
+            #: 通过门禁、待执行的调用。并发跑，结果按原顺序回填。
+            runnable: list[tuple[ToolUse, str]] = []
             for tu in round_tool_uses:
                 args_json = json.dumps(tu.input, ensure_ascii=False)
                 # Loop-detector gate BEFORE execution. CRITICAL → surface the
@@ -319,6 +377,15 @@ class AgentRuntime:
                     extra = repeat_guard.check(tu.name, tu.input)
                     if extra.is_blocking:
                         gate = extra
+                dedup_key = (tu.name, _round_dedup_key(tu.input))
+                if not gate.is_blocking and dedup_key in seen_in_round:
+                    gate = LoopCheckResult(
+                        LoopLevel.CRITICAL,
+                        f"[LOOP BLOCKED] CRITICAL: 同一轮回复里 {tu.name} 用完全"
+                        "相同的参数被调用了两次，本次调用已被拦截。重复调用只会"
+                        "拿到重复结果，请直接引用已有结果继续或总结收尾。",
+                    )
+                seen_in_round.add(dedup_key)
                 if gate.is_blocking:
                     blocked_any = True
                     logger.warning("agent blocked tool %s: %s", tu.name, gate.message)
@@ -334,8 +401,7 @@ class AgentRuntime:
                     ))
                     continue
 
-                executor = self.tools.get(tu.name)
-                if executor is None:
+                if self.tools.get(tu.name) is None:
                     # Mirrors Kotlin ``else -> ToolExecutionResult("Unknown
                     # tool: $name", false)`` — the loop detector recognises this
                     # phrasing and escalates repeated hallucinations.
@@ -357,19 +423,28 @@ class AgentRuntime:
                     ))
                     continue
 
-                try:
-                    result = await executor.executor(
-                        args_json, session_id,
-                        **({"env": session_user_env} if session_user_env else {}),
+                runnable.append((tu, args_json))
+
+            # ── 4b. run this round's tools (concurrently) ──────────────────
+            # 一次回复里规划多个动作时，串行等每个工具跑完会把耗时直接相加
+            # （4 张识图 = 4 个视觉请求排队）。这里并发执行、结果按原顺序回填，
+            # 门禁与同轮去重已在上面按顺序判定过。
+            round_results: list[ToolExecutionResult] = []
+            if runnable:
+                tools_started = time.monotonic()
+                round_results = list(await asyncio.gather(*(
+                    self._execute_tool(tu, args_json, session_id, session_user_env)
+                    for tu, args_json in runnable
+                )))
+                if len(runnable) > 1:
+                    logger.info(
+                        "agent round=%s tools=%s ran concurrently in %s ms",
+                        turn, len(runnable),
+                        int((time.monotonic() - tools_started) * 1000),
                     )
-                    executed_any = True
-                except Exception as exc:
-                    logger.warning("tool %s raised %s: %s",
-                                   tu.name, type(exc).__name__, exc)
-                    result = ToolExecutionResult(
-                        f"[tool error: {type(exc).__name__}] {exc}", False,
-                        tool_title=tu.name,
-                    )
+
+            for (tu, args_json), result in zip(runnable, round_results):
+                executed_any = True
 
                 # Loop-detector record AFTER execution (may attach a warning).
                 rec = detector.record(tu.name, tu.input, result.output,

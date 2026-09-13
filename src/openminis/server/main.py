@@ -128,6 +128,13 @@ async def lifespan(app: FastAPI):  # noqa: ANN201
     yield
     if runner is not None:
         await runner.stop()
+    # Provider 连接池是跨轮复用的（省掉每次 TLS 握手），关服时要显式收掉。
+    try:
+        from ..settings.chat_service import close_provider_cache
+
+        await close_provider_cache()
+    except Exception:  # pragma: no cover - 关服绝不能因清理失败而报错
+        logger.debug("provider cache close failed", exc_info=True)
     logger.info("OpenMinis server stopping")
 
 

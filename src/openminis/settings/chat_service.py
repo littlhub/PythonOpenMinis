@@ -31,8 +31,11 @@ __all__ = [
     "ChatSetupError",
     "attribution_snapshot",
     "build_chat_setup",
+    "close_provider_cache",
+    "current_time_block",
     "identity_system_prompt",
     "image_context_discipline",
+    "reset_provider_cache",
     "reset_session_guards",
     "session_guards",
 ]
@@ -155,7 +158,32 @@ RETRIEVAL_DISCIPLINE = (
     "与用户语言/地区一致的来源（中文用户优先国内权威来源）；"
     "③ 不要凭记忆直接猜 Google News、BBC、CNN 这类国外新闻站首页；"
     "④ 只有在确实找不到合适来源时，才退化为直接猜测 URL 去抓取。"
+    "\n【时效纪律】涉及「今天/今日/最新/最近」的内容时："
+    "① web_search 必须传 time_range（今天=day、本周=week、本月=month），"
+    "不传就默认不限时间、会捞到陈旧页面；"
+    "② 引用前先核对页面日期：日期早于今天的，必须如实说明是「X月X日」的消息，"
+    "**绝不能把昨天或更早的新闻说成今天发生**；"
+    "③ 若检索结果里没有当天的新消息，就直接告诉用户「截至今天 X 日，"
+    "暂未检索到当天的新消息，最近一条是 X 月 X 日的……」，不要拿旧闻凑数；"
+    "④ 也不要凭训练数据里的旧信息编造今日新闻。"
 )
+
+
+def current_time_block() -> str:
+    """把「现在是什么时候」写进系统提示。
+
+    模型没有时钟：不告诉它今天几号，它就无法判断检索结果是不是「今天的」，
+    会把昨天的新闻当成今日最新报给用户（用户实测踩过）。
+    """
+    from datetime import datetime
+
+    now = datetime.now()
+    weekday = "周一周二周三周四周五周六周日"[now.weekday() * 2: now.weekday() * 2 + 2]
+    return (
+        f"\n\n【当前时间】现在是 {now.strftime('%Y-%m-%d %H:%M')}（{weekday}，"
+        "北京时间）。判断「今天/最新」时以这个时间为准；"
+        "检索结果里日期早于今天的，都不是今天的新消息。"
+    )
 
 
 #: 工具失败的处置纪律：失败输出就是分析素材 —— 先读懂报错、修正、再重试；
@@ -179,6 +207,7 @@ def identity_system_prompt(store: SettingsStore) -> str:
         subagent_on = True
     return (
         identity.persona
+        + current_time_block()
         + RETRIEVAL_DISCIPLINE
         + image_context_discipline(store)
         + (SUBAGENT_PLAN_DISCIPLINE if subagent_on else "")
@@ -273,13 +302,50 @@ def _model_for(provider_type: str, model_id: str) -> LLMModel | None:
     return None
 
 
+#: Provider 缓存：provider 内部持有 httpx 连接池，每轮对话新建一个就等于
+#: 每次都重新做 DNS+TCP+TLS 握手（实测到 apihub 的冷连接 ~1.4s，热连接
+#: ~0.85s/请求）。这里按「协议+地址+key+模型」指纹跨轮复用同一个 provider，
+#: 连接池与 keep-alive 一起复用。
+_PROVIDER_CACHE: dict[tuple, Any] = {}
+_PROVIDER_CACHE_LIMIT = 8
+
+
+def _provider_fingerprint(ptype: str, api_key: str, base_url: str,
+                          model_id: str) -> tuple:
+    import hashlib
+
+    key_hash = hashlib.sha1(api_key.encode("utf-8")).hexdigest()[:12]
+    return (ptype, base_url.rstrip("/"), key_hash, model_id)
+
+
+def reset_provider_cache() -> None:
+    """Drop the provider cache (settings changed / tests / shutdown)."""
+    _PROVIDER_CACHE.clear()
+
+
+async def close_provider_cache() -> None:
+    """Close every cached provider's connection pool."""
+    for provider in list(_PROVIDER_CACHE.values()):
+        closer = getattr(provider, "aclose", None)
+        if closer is None:
+            continue
+        try:
+            await closer()
+        except Exception:  # pragma: no cover - closing must never raise
+            logger.debug("provider close failed", exc_info=True)
+    _PROVIDER_CACHE.clear()
+
+
 def build_provider(provider_id: str, conf: dict[str, Any]):  # noqa: ANN201
-    """Instantiate the LLM provider for a stored provider config.
+    """Instantiate (or reuse) the LLM provider for a stored provider config.
 
     ``provider_id`` is the instance id; the wire protocol (and thus the
     engine) comes from ``conf["type"]``, so several OpenAI-compatible
     instances each get an OpenAIProvider with their own base URL.
     Only engines present in :data:`ENGINE_READY` can actually run.
+
+    Providers are cached by config fingerprint so the underlying HTTP
+    connection pool survives across turns (see :data:`_PROVIDER_CACHE`).
     """
     ptype = str(conf.get("type") or provider_id or "")
     engine = engine_for(ptype)
@@ -290,6 +356,20 @@ def build_provider(provider_id: str, conf: dict[str, Any]):  # noqa: ANN201
         raise ChatSetupError("尚未配置 API Key,请先在 设置 → 模型服务 中填写")
     model = _model_for(ptype, (conf.get("model") or "").strip())
     base_url = (conf.get("baseUrl") or "").strip()
+    model_id = (model.id if model is not None else "") or ""
+    fingerprint = _provider_fingerprint(engine, api_key, base_url, model_id)
+    cached = _PROVIDER_CACHE.get(fingerprint)
+    if cached is not None:
+        return cached
+    provider = _create_provider(engine, api_key, model, base_url, ptype)
+    if len(_PROVIDER_CACHE) >= _PROVIDER_CACHE_LIMIT:
+        _PROVIDER_CACHE.pop(next(iter(_PROVIDER_CACHE)))
+    _PROVIDER_CACHE[fingerprint] = provider
+    return provider
+
+
+def _create_provider(engine: str, api_key: str, model: Any, base_url: str,
+                     ptype: str):  # noqa: ANN202
     if engine == "anthropic":
         # DEFAULT_BASE_PATH is a module-level constant on the provider module,
         # not a class attribute — reference it through the module.

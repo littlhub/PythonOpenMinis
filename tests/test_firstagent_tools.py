@@ -166,15 +166,51 @@ def test_web_search_formats_results(home, monkeypatch):
 
     (home.parent / "websearch.json").write_text(
         json.dumps({"provider": "serper", "apiKey": "k"}), encoding="utf-8")
+    seen: dict = {}
 
-    async def fake_search(client, query, count, api_key):  # noqa: ANN001
+    async def fake_search(client, query, count, api_key, time_range="any"):  # noqa: ANN001
+        seen["time_range"] = time_range
         return [{"title": "FastAPI docs", "url": "https://fastapi.example",
-                 "snippet": "Modern web framework"}]
+                 "snippet": "Modern web framework", "date": "2026-09-13T08:00:00"}]
 
     monkeypatch.setattr(mod, "_search_serper", fake_search)
     r = _run(WebSearchTool.execute(_args(tool_title="t", query="fastapi"), "s"))
     assert r.success
     assert "FastAPI docs" in r.output and "fastapi.example" in r.output
+    # 结果里必须带上发布日期 + 今天是几号，否则模型会把旧闻当今日消息
+    assert "[2026-09-13]" in r.output
+    assert "今天是" in r.output
+
+
+def test_web_search_time_range_maps_to_provider(home, monkeypatch):
+    """「今天有什么新闻」必须能落到 provider 的时间过滤参数上。
+
+    原先 bocha 写死 ``freshness: noLimit``，模型问今日新闻拿到的是几个月前的
+    高权重旧页面，于是把昨天的新闻当成今天的答给用户。
+    """
+    import openminis.tools.web_search_tool as mod
+
+    (home.parent / "websearch.json").write_text(
+        json.dumps({"provider": "bocha", "apiKey": "k"}), encoding="utf-8")
+    seen: dict = {}
+
+    async def fake_bocha(client, query, count, api_key, time_range="any"):  # noqa: ANN001
+        seen["time_range"] = time_range
+        return [{"title": "今日新闻", "url": "https://news.example",
+                 "snippet": "…", "date": "2026-09-13"}]
+
+    monkeypatch.setattr(mod, "_search_bocha", fake_bocha)
+    r = _run(WebSearchTool.execute(
+        _args(tool_title="t", query="今日新闻", time_range="day"), "s"))
+    assert r.success and seen["time_range"] == "day"
+    assert "近一天" in r.output
+
+    # 别名与非法值都要归一化，任何取值都不会打挂请求
+    assert mod._normalize_time_range("today") == "day"
+    assert mod._normalize_time_range("7d") == "week"
+    assert mod._normalize_time_range("乱写") == "any"
+    assert mod.TIME_RANGE_BOCHA["day"] == "oneDay"
+    assert mod.TIME_RANGE_SERPER["day"] == "qdr:d"
 
 
 # ---------------------------------------------------------------------------

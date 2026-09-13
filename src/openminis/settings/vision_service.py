@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import time
 
@@ -194,7 +195,36 @@ async def describe_image_with_fallback(
     return text
 
 
+#: 并发识图上限：工具轮次现在并发执行，一次读 4 张图就是 4 个识图请求
+#: 同时打出去，识图模型容易直接 429。这里排队而不是打崩。
+_VISION_CONCURRENCY = 3
+_VISION_SEM: asyncio.Semaphore | None = None
+
+
+def _vision_sem() -> asyncio.Semaphore:
+    """懒建信号量（避免 import 期就绑定某个事件循环）。"""
+    global _VISION_SEM
+    if _VISION_SEM is None:
+        _VISION_SEM = asyncio.Semaphore(_VISION_CONCURRENCY)
+    return _VISION_SEM
+
+
 async def describe_image(
+    store: Any,
+    image_bytes: bytes,
+    mime_type: str,
+    *,
+    prompt: str = "",
+    image_path: str | None = None,
+) -> str | None:
+    """并发闸门 + :func:`_describe_image_inner`。"""
+    async with _vision_sem():
+        return await _describe_image_inner(
+            store, image_bytes, mime_type, prompt=prompt, image_path=image_path
+        )
+
+
+async def _describe_image_inner(
     store: Any,
     image_bytes: bytes,
     mime_type: str,

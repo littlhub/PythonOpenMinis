@@ -39,6 +39,33 @@ SKILL_FILE = "SKILL.md"
 BUILTIN_TOOLS_SKILL = "builtin-tools"
 _SCRIPTS_DIR = "scripts"
 
+#: 技能清单缓存：``{技能根路径: (目录签名, [SkillEntry…])}``。
+#: 每次对话轮次都会取一次清单（拼系统提示的「可用技能」段），而解析 40 个
+#: SKILL.md 的 frontmatter 要 100–300 ms。签名用目录里每个 manifest 的
+#: mtime+size，装/删/改技能都会让签名变化，缓存自然失效。
+_LIST_CACHE: dict[str, tuple[tuple, list["SkillEntry"]]] = {}
+
+
+def invalidate_skill_cache() -> None:
+    """Drop the listing cache (skill installed / removed / rewritten)."""
+    _LIST_CACHE.clear()
+
+
+def _root_signature(root: Path) -> tuple:
+    items: list[tuple] = []
+    try:
+        for child in sorted(root.iterdir()):
+            if not child.is_dir():
+                continue
+            try:
+                stat = (child / SKILL_FILE).stat()
+                items.append((child.name, stat.st_mtime_ns, stat.st_size))
+            except OSError:
+                items.append((child.name, 0, 0))
+    except OSError:
+        return ()
+    return tuple(items)
+
 
 class SkillError(Exception):
     """Raised when a skill cannot be installed or removed."""
@@ -243,8 +270,20 @@ class SkillStore:
 
     # -- read ------------------------------------------------------------
     def list(self) -> list[SkillEntry]:
+        """Every installed skill, with a directory-signature cache.
+
+        Parsing front matter of ~40 SKILL.md files costs 100–300 ms; the list
+        is requested on **every** chat turn (``active_skills_block``) so the
+        parse must not repeat when nothing changed. Cache key = skills root,
+        validated by a cheap signature (name + mtime + size per manifest).
+        """
         if not self.root.is_dir():
             return []
+        key = str(self.root)
+        signature = _root_signature(self.root)
+        cached = _LIST_CACHE.get(key)
+        if cached is not None and cached[0] == signature:
+            return list(cached[1])
         out: list[SkillEntry] = []
         for child in sorted(self.root.iterdir()):
             if not child.is_dir():
@@ -252,7 +291,8 @@ class SkillStore:
             entry = self._read_entry(child)
             if entry is not None:
                 out.append(entry)
-        return out
+        _LIST_CACHE[key] = (signature, out)
+        return list(out)
 
     def get(self, name: str) -> SkillEntry | None:
         """Look up by bundle directory name *or* frontmatter name."""
