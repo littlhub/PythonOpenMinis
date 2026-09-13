@@ -27,6 +27,7 @@ from ..data.model import (
 from ..data.model.agent_content_part import Text, ToolResult, ToolUse
 from ..data.model.agent_tool_definition import AgentToolDefinition
 from ..tools.tool_execution_result import ToolExecutionResult
+from .repeat_guard import RepeatGuard
 from .tool_loop_detector import LoopCheckResult, LoopLevel, ToolLoopDetector
 
 logger = get_logger("agent.runtime")
@@ -93,6 +94,16 @@ class AgentRuntimeOptions:
     # A ``ToolLoopDetector`` shared across the whole session — pass one in to
     # keep the sliding window across runs. When None a fresh one is created.
     loop_detector: Optional[ToolLoopDetector] = None
+    #: Project-specific companion guards (retrieval-family runaway /
+    #: effect-tool repeat). Same lifetime rules as ``loop_detector``: one per
+    #: session, injected by ``chat_service.session_guards``.
+    repeat_guard: Optional[RepeatGuard] = None
+    #: Agent 循环模式（设置 → Agent 对话参数 → 循环模式，聊天页也可切换）：
+    #: ``"react"``（默认）—— 增强版：额外启用补充护栏（同参重复立刻拦、检索
+    #:   家族空转、effect 一张就停）+ 空转自动收尾 + 连续全拦截硬停；
+    #: ``"kt"``  —— 原版：只跑 KT ToolLoopDetector 的四条策略（10/20/30），
+    #:   不做额外拦截与自动收尾，循环由模型自己停或 max_turns 用尽结束。
+    loop_mode: str = "react"
 
 
 @dataclass(slots=True)
@@ -163,7 +174,11 @@ class AgentRuntime:
         tool round, so the caller can persist it and continue later.
         """
         opts = options or AgentRuntimeOptions()
+        # 循环模式：'kt' = 只用 KT 原版四策略检测器；'react'（默认）额外启用
+        # 本项目补充护栏与空转自动收尾。
+        react_mode = (opts.loop_mode or "react").strip().lower() != "kt"
         detector = opts.loop_detector or ToolLoopDetector()
+        repeat_guard = (opts.repeat_guard or RepeatGuard()) if react_mode else None
         tool_defs = self.tool_definitions()
 
         final_text: list[str] = []
@@ -186,7 +201,7 @@ class AgentRuntime:
         wrap_up_after = (
             opts.wrap_up_rounds if opts.wrap_up_rounds is not None
             else max(6, min(12, opts.max_turns))
-        )
+        ) if react_mode else opts.max_turns + 1
         #: 上一轮工具返回的图片（read_image / 截图…）。工具输出里的图片字节
         #: 原先被 loop 直接丢弃，模型永远看不到图 —— 这里收集起来，在**下一次**
         #: 请求时作为 image_parts 附到末尾 user 消息上。有原生视觉的多模态模型
@@ -296,8 +311,14 @@ class AgentRuntime:
             for tu in round_tool_uses:
                 args_json = json.dumps(tu.input, ensure_ascii=False)
                 # Loop-detector gate BEFORE execution. CRITICAL → surface the
-                # message as a tool error and do NOT run the tool.
+                # message as a tool error and do NOT run the tool. Both the
+                # ported KT detector and the project-specific companion guard
+                # get a veto (see repeat_guard.py).
                 gate = detector.check(tu.name, tu.input)
+                if not gate.is_blocking and repeat_guard is not None:
+                    extra = repeat_guard.check(tu.name, tu.input)
+                    if extra.is_blocking:
+                        gate = extra
                 if gate.is_blocking:
                     blocked_any = True
                     logger.warning("agent blocked tool %s: %s", tu.name, gate.message)
@@ -325,6 +346,9 @@ class AgentRuntime:
                     logger.warning("agent: %s", msg)
                     detector.record(tu.name, tu.input, None, error_message=msg,
                                     tool_call_id=tu.id)
+                    if repeat_guard is not None:
+                        repeat_guard.record(tu.name, tu.input, None,
+                                            error_message=msg, tool_call_id=tu.id)
                     tool_result_parts.append(ToolResult(
                         id=tu.id, name=tu.name, content=msg, is_error=True,
                     ))
@@ -352,9 +376,18 @@ class AgentRuntime:
                                       error_message=None if result.success
                                       else result.output,
                                       tool_call_id=tu.id)
+                extra_rec = (
+                    repeat_guard.record(tu.name, tu.input, result.output,
+                                        error_message=None if result.success
+                                        else result.output,
+                                        tool_call_id=tu.id)
+                    if repeat_guard is not None else None
+                )
                 out_text = result.output
-                if rec.level == LoopLevel.WARNING and rec.message:
-                    out_text = f"{out_text}\n\n{rec.message}"
+                for warning in (rec, extra_rec):
+                    if (warning is not None and warning.level == LoopLevel.WARNING
+                            and warning.message):
+                        out_text = f"{out_text}\n\n{warning.message}"
 
                 # One-line run-trace entry so server logs keep an auditable
                 # "which tool ran when" trail (name, success, output size).
@@ -397,7 +430,7 @@ class AgentRuntime:
                     "",
                     content_parts=tool_result_parts,
                 ))
-                if blocked_any and not executed_any:
+                if blocked_any and not executed_any and react_mode:
                     blocked_rounds += 1
                     if blocked_rounds >= 2:
                         # Hard stop: the model kept calling the same tool even

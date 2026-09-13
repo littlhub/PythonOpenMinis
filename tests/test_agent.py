@@ -35,10 +35,23 @@ def test_detector_generic_repeat_warns_and_tool_title_is_ignored():
     assert r.level is LoopLevel.WARNING
 
 
+def test_detector_config_invariants_are_enforced():
+    """Kotlin's ``init{}`` require()s — the port must reject the same shapes."""
+    with pytest.raises(ValueError):
+        ToolLoopConfig(warning_threshold=0)
+    with pytest.raises(ValueError):
+        ToolLoopConfig(warning_threshold=9, critical_threshold=9)
+    with pytest.raises(ValueError):
+        ToolLoopConfig(critical_threshold=30, global_circuit_breaker_threshold=30)
+    with pytest.raises(ValueError):
+        # historySize must cover the global circuit breaker window
+        ToolLoopConfig(history_size=10, global_circuit_breaker_threshold=30)
+
+
 def test_detector_unknown_tool_escalates_to_critical():
     d = ToolLoopDetector(ToolLoopConfig(
-        warning_threshold=9, critical_threshold=9,
-        global_circuit_breaker_threshold=9, unknown_tool_threshold=2,
+        warning_threshold=8, critical_threshold=9,
+        global_circuit_breaker_threshold=10, unknown_tool_threshold=2,
     ))
     for _ in range(2):
         d.record("bash", {"command": "ls"}, None, "Error: unknown tool: nope")
@@ -61,7 +74,7 @@ def test_detector_no_progress_global_circuit_breaker():
 def test_detector_progress_resets_streak():
     d = ToolLoopDetector(ToolLoopConfig(
         warning_threshold=2, critical_threshold=3,
-        global_circuit_breaker_threshold=3, unknown_tool_threshold=9,
+        global_circuit_breaker_threshold=4, unknown_tool_threshold=9,
     ))
     for _ in range(2):
         d.record("bash", {"command": "ls"}, "same")
@@ -72,8 +85,8 @@ def test_detector_progress_resets_streak():
 
 def test_detector_warning_throttling():
     d = ToolLoopDetector(ToolLoopConfig(
-        warning_threshold=2, critical_threshold=99,
-        global_circuit_breaker_threshold=99, unknown_tool_threshold=99,
+        warning_threshold=2, critical_threshold=20,
+        global_circuit_breaker_threshold=30, unknown_tool_threshold=30,
     ))
     emitted = []
     for i in range(1, 7):

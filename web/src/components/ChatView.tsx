@@ -135,6 +135,9 @@ export function ChatView({
   const [configWarning, setConfigWarning] = useState<string | null>(null)
   const [pickerOpen, setPickerOpen] = useState(false)
   const [rightOpen, setRightOpen] = useState(true)
+  // Agent 循环模式：react=增强版（同参重复立刻拦 + 空转自动收尾）/ kt=KT 原版。
+  // 存在 settings.agent.loopMode，聊天页顶部可直接切换（下一轮对话生效）。
+  const [loopMode, setLoopMode] = useState<'react' | 'kt'>('react')
 
   const socketRef = useRef<OpenSocketHandle | null>(null)
   const [socketState, setSocketState] = useState<SocketState>('connecting')
@@ -144,6 +147,31 @@ export function ChatView({
   useEffect(() => {
     activeIdRef.current = activeSessionId
   }, [activeSessionId])
+
+  // 读一次循环模式（全局设置）；切换时写回，下一轮对话生效。
+  useEffect(() => {
+    let alive = true
+    api
+      .settingsGet()
+      .then((s) => {
+        if (alive && s.agent?.loopMode === 'kt') setLoopMode('kt')
+      })
+      .catch(() => {
+        /* 读不到就用默认 react */
+      })
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  const switchLoopMode = useCallback(async (mode: 'react' | 'kt') => {
+    setLoopMode(mode)
+    try {
+      await api.settingsPut({ agent: { loopMode: mode } })
+    } catch (e) {
+      console.warn('loopMode save failed', e)
+    }
+  }, [])
 
   // -- reload helpers --------------------------------------------------------
   const reloadSessions = useCallback(async () => {
@@ -430,6 +458,26 @@ export function ChatView({
           )}
 
           <div className="topbar-spacer" />
+
+          <div
+            className="cap-picker loop-mode-picker"
+            title="Agent 循环模式：ReAct 增强版会在第一次重复调用时立刻停下；KT 原版只跑移植的四条策略（10/20/30）"
+          >
+            <button
+              type="button"
+              className={`chip cap-chip cap-llm ${loopMode === 'react' ? 'on' : ''}`}
+              onClick={() => void switchLoopMode('react')}
+            >
+              ReAct
+            </button>
+            <button
+              type="button"
+              className={`chip cap-chip cap-vision ${loopMode === 'kt' ? 'on' : ''}`}
+              onClick={() => void switchLoopMode('kt')}
+            >
+              原版
+            </button>
+          </div>
 
           <button
             className="rp-toggle-edge"

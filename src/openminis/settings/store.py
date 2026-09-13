@@ -93,6 +93,14 @@ def _defaults() -> dict[str, Any]:
             # 同一条路）；True=主 Agent 委派识图子代理（用子代理自己的模型看图）。
             "imageVisionSubagent": False,
             "imageMaxEdge": 2000,
+            # Agent 循环模式：
+            #   "react"（默认）—— 增强版：KT 四策略检测器 + 本项目补充护栏
+            #                     （同参重复立刻拦、检索家族空转、effect 一张就停）
+            #                     + 空转自动收尾 + 连续全拦截硬停。
+            #   "kt"           —— 原版：只用 KT ToolLoopDetector 的四条策略
+            #                     （阈值 10/20/30），不做额外拦截与自动收尾，
+            #                     循环只在模型自己停或 maxToolSteps 用尽时结束。
+            "loopMode": "react",
         },
     }
 
@@ -520,6 +528,12 @@ class SettingsStore:
                         agent["imageContextMode"] = mode
                     else:
                         errors.append("agent.imageContextMode 只能是 path 或 inline")
+                if "loopMode" in raw:
+                    loop_mode = str(raw["loopMode"] or "").strip().lower()
+                    if loop_mode in ("react", "kt"):
+                        agent["loopMode"] = loop_mode
+                    else:
+                        errors.append("agent.loopMode 只能是 react 或 kt")
                 data["agent"] = agent
 
         if errors:

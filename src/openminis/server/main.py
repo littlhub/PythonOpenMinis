@@ -629,7 +629,7 @@ async def _handle_chat(client_id: str, msg: dict[str, Any]) -> None:
 
     store = SettingsStore.get()
     try:
-        provider, runtime, options, identity, conf = build_chat_setup(store)
+        provider, runtime, options, identity, conf = build_chat_setup(store, session_id=sid)
     except ChatSetupError as e:
         await _safe_send(client_id, {"type": "delta", "text": str(e)})
         await _safe_send(client_id, {"type": "done", "sessionId": sid})

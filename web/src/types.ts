@@ -284,6 +284,8 @@ export interface AgentConfig {
   imageContextMode?: 'path' | 'inline'
   /** 读图/送图前缩放的最大边长(px),用来压住图片的上下文开销. */
   imageMaxEdge?: number
+  /** Agent 循环模式:react=增强版(同参重复立刻拦 + 空转自动收尾) / kt=KT 原版四策略. */
+  loopMode?: 'react' | 'kt'
 }
 
 export interface FetchModelsRequest {

@@ -9,6 +9,8 @@ from __future__ import annotations
 from typing import Any, Awaitable, Callable
 
 from ..agent.agent_runtime import MAX_AGENT_TURNS, AgentRuntime, AgentRuntimeOptions
+from ..agent.repeat_guard import RepeatGuard
+from ..agent.tool_loop_detector import ToolLoopDetector
 from ..data.model import LLMModel, ThinkingLevel
 from ..data.model.agent_content_part import ToolUse  # noqa: F401  (re-exported for tests)
 from ..provider.anthropic.anthropic_provider import AnthropicProvider
@@ -31,7 +33,35 @@ __all__ = [
     "build_chat_setup",
     "identity_system_prompt",
     "image_context_discipline",
+    "reset_session_guards",
+    "session_guards",
 ]
+
+
+# ── 会话级循环防护 ──────────────────────────────────────────────────────────
+# KT 在 ChatViewModel 上持有**一个** ToolLoopDetector，滑动窗口跨整段对话累积。
+# Python 侧原先每次 run() 都新建实例 —— 等于每轮失忆，跨消息的「同一张图/同一
+# 条命令又来了」永远看不见。这里按 session_id 缓存一对（KT 检测器 + 本项目
+# 补充护栏），由 build_chat_setup(session_id=…) 注入到 AgentRuntimeOptions。
+_SESSION_GUARDS: dict[str, tuple[ToolLoopDetector, RepeatGuard]] = {}
+#: 简单的容量上限：会话被删/永不再用时不必显式清理（按插入序淘汰最旧的）。
+_SESSION_GUARD_LIMIT = 256
+
+
+def session_guards(session_id: str) -> tuple[ToolLoopDetector, RepeatGuard]:
+    """Return the (detector, repeat_guard) pair owned by ``session_id``."""
+    guards = _SESSION_GUARDS.get(session_id)
+    if guards is None:
+        if len(_SESSION_GUARDS) >= _SESSION_GUARD_LIMIT:
+            _SESSION_GUARDS.pop(next(iter(_SESSION_GUARDS)))
+        guards = (ToolLoopDetector(), RepeatGuard())
+        _SESSION_GUARDS[session_id] = guards
+    return guards
+
+
+def reset_session_guards(session_id: str) -> None:
+    """Drop a session's sliding window (session deleted / context cleared)."""
+    _SESSION_GUARDS.pop(session_id, None)
 
 
 def attribution_snapshot(store: SettingsStore, conf: dict[str, Any]) -> dict[str, Any]:
@@ -285,6 +315,7 @@ def build_chat_setup(  # noqa: ANN201
     *,
     instance_id: str | None = None,
     model_id: str | None = None,
+    session_id: str | None = None,
 ):
     """Return ``(provider, runtime, options, identity, provider_conf)`` for the
     active provider + identity, or raise :class:`ChatSetupError` with a
@@ -333,6 +364,14 @@ def build_chat_setup(  # noqa: ANN201
     tools = build_tool_registry(enabled_ids)
     runtime = AgentRuntime(tools=tools, chunk_sink=chunk_sink)
     image_mode = str(agent_cfg.get("imageContextMode") or "path")
+    # 循环模式：'react'（默认，增强护栏）| 'kt'（KT 原版四策略）。
+    loop_mode = str(agent_cfg.get("loopMode") or "react").strip().lower()
+    if loop_mode not in ("react", "kt"):
+        loop_mode = "react"
+    # 会话级循环防护：检测器的滑动窗口要跨轮累积（KT 是每会话一个实例）。
+    loop_detector, repeat_guard = (
+        session_guards(session_id) if session_id else (None, None)
+    )
     options = AgentRuntimeOptions(
         system_prompt=identity_system_prompt(store),
         max_turns=int(agent_cfg.get("maxToolSteps") or MAX_AGENT_TURNS),
@@ -341,5 +380,8 @@ def build_chat_setup(  # noqa: ANN201
         ),
         # 图片默认不进上下文（只留路径，看图交给识图槽/子代理）
         image_context_mode=image_mode,
+        loop_mode=loop_mode,
+        loop_detector=loop_detector,
+        repeat_guard=repeat_guard,
     )
     return provider, runtime, options, identity, conf

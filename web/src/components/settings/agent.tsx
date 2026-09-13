@@ -1299,6 +1299,7 @@ export function AgentConfigPage(props: { onBack: () => void }) {
     imageContextMode?: 'path' | 'inline'
     imageVisionSubagent?: boolean
     imageMaxEdge?: number
+    loopMode?: 'react' | 'kt'
   } | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -1491,6 +1492,35 @@ export function AgentConfigPage(props: { onBack: () => void }) {
                   token / 上下文开销，代价是细节变糊（建议 1024–2000）。
                 </span>
               </label>
+            </div>
+          </SectionCard>
+
+          <SectionCard
+            title="循环模式"
+            hint="控制 Agent 在工具循环里「什么时候停下来」。聊天页顶部也可以直接切换。"
+          >
+            <div className="provider-fields">
+              <div className="cap-picker" style={{ gap: 8 }}>
+                <button
+                  type="button"
+                  className={`chip cap-chip cap-llm ${(cfg.loopMode ?? 'react') === 'react' ? 'on' : ''}`}
+                  onClick={() => setCfg({ ...cfg, loopMode: 'react' })}
+                >
+                  ReAct 增强版
+                </button>
+                <button
+                  type="button"
+                  className={`chip cap-chip cap-vision ${cfg.loopMode === 'kt' ? 'on' : ''}`}
+                  onClick={() => setCfg({ ...cfg, loopMode: 'kt' })}
+                >
+                  KT 原版
+                </button>
+              </div>
+              <div className="muted" style={{ fontSize: 12 }}>
+                {(cfg.loopMode ?? 'react') === 'react'
+                  ? 'ReAct 增强版：同一个工具用完全相同的参数再调一次立刻拦下（第一次重复就停）；检索/生图类空转另有家族护栏，连续空转会自动收尾总结。'
+                  : 'KT 原版：只跑移植过来的 ToolLoopDetector 四条策略（阈值 10/20/30），不做额外拦截与自动收尾。'}
+              </div>
             </div>
           </SectionCard>
 

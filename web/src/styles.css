@@ -1048,6 +1048,9 @@ details summary {
 /* 模型用途多选 —— 小按钮，选中后按用途变色 */
 .cap-picker { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; padding-top: 2px; }
 .cap-picker .chip { padding: 3px 10px; font-size: 12px; }
+/* 聊天页顶部的循环模式切换（ReAct / 原版） */
+.loop-mode-picker { margin-right: 8px; }
+.loop-mode-picker .chip { cursor: pointer; }
 .cap-chip { transition: border-color .12s, background .12s, color .12s; }
 .cap-chip.on { font-weight: 600; }
 .cap-chip.cap-llm.on { border-color: #a9b6c9; background: #e9edf5; color: #41506b; }

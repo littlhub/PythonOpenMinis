@@ -243,6 +243,10 @@ async def delete_session(session_id: str) -> bool:
             return False
         await dao.delete_session(session_id)  # messages cascade
     drop_runtime(session_id)
+    # 会话不存在了，它的循环防护滑动窗口也一并丢弃（避免长期累积）。
+    from ..settings.chat_service import reset_session_guards
+
+    reset_session_guards(session_id)
     return True
 
 
