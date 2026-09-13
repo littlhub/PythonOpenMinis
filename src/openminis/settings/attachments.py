@@ -201,6 +201,21 @@ def _attached_files_xml(refs: list[AttachmentRef]) -> str:
     return "\n".join(lines)
 
 
+#: 图片轮次的「以图为准」规则。
+#:
+#: 用户实测踩过：上一轮在聊「今日新闻」，这一轮只发了一张时尚人像，主 agent
+#: 委派识图子代理拿到描述后，**接着去 web_fetch 新浪财经首页** —— 它把上一轮
+#: 的话题当成了本轮任务，图看了等于白看。任务本来就写在图里，不该由历史决定。
+_IMAGE_FOCUS_RULE = (
+    "本轮的**任务主语是这张图**：先看懂图片，再围绕图片里的具体内容"
+    "（人物/品牌/文字/商品/地点/作品等）回答或检索相关信息。"
+    "若用户本轮没写额外要求，默认任务就是「看懂这张图，并就图里的内容"
+    "作答或检索相关背景」，**不要延续上一轮对话的话题** —— 上一轮聊过新闻，"
+    "不代表这一轮还要搜新闻。需要联网时检索词必须来自图片内容或用户本轮原话，"
+    "不要抓新闻/财经门户首页来凑数。"
+)
+
+
 def _attachment_hint(
     store: Any,
     images: int,
@@ -254,6 +269,7 @@ def _attachment_hint(
                 "要看图请调用 read_image，path 填上面的路径"
                 "（识图模型会转成文字描述返回）。不要凭路径猜测图片内容。"
             )
+        bits.append(_IMAGE_FOCUS_RULE)
     if files:
         bits.append("文件内容请用 read_file 或 shell 按路径读取。")
     return "".join(bits) + "）"

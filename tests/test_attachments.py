@@ -301,3 +301,34 @@ def test_chat_persists_clean_text_without_attachment_noise(store, workspace):
     assert "<user-attached-files>" not in bundle.text
     assert "本轮" not in bundle.text
     assert bundle.text.strip().endswith(")")
+
+
+# ---------------------------------------------------------------------------
+# 图片轮次「以图为准」：不让上一轮的话题接管本轮
+# ---------------------------------------------------------------------------
+def test_image_turn_is_anchored_to_the_image(store, workspace):
+    """回归一个真实故障：上一轮在聊「今日新闻」，这一轮只发了一张时尚人像，
+    主 agent 委派识图子代理拿到描述后，**接着去 web_fetch 新浪财经首页** ——
+    图看了等于白看。提示必须点明本轮主语是图片，禁止延续上一轮话题。"""
+    png = _png(workspace / "uploads" / "portrait.png")
+    store.apply_full({"agent": {"imageContextMode": "path"}})
+    bundle = _ctx(store, workspace, f"![portrait.png]({png.as_posix()})")
+    assert "任务主语是这张图" in bundle.prompt
+    assert "不要延续上一轮" in bundle.prompt
+    # 明确点名旧话题：上一轮聊新闻 ≠ 这一轮还要搜新闻
+    assert "新闻" in bundle.prompt
+
+
+def test_no_image_means_no_focus_rule(store, workspace):
+    """纯文字轮次不注入「以图为准」，避免无谓的提示噪声。"""
+    bundle = _ctx(store, workspace, "帮我看看这段代码")
+    assert "任务主语是这张图" not in bundle.prompt
+
+
+def test_system_prompt_carries_image_focus():
+    """同一份规则在系统提示层也有一份（消息层 + 系统层双保险）。"""
+    from openminis.settings import chat_service as cs
+
+    assert "以图为准" in cs.IMAGE_SLOT_DISCIPLINE
+    assert "以图为准" in cs.IMAGE_SUBAGENT_DISCIPLINE
+    assert "检索词必须来自" in cs.RETRIEVAL_DISCIPLINE
