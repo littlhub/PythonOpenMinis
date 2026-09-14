@@ -238,7 +238,10 @@ class AgentRuntime:
         # 本项目补充护栏与空转自动收尾。
         react_mode = (opts.loop_mode or "react").strip().lower() != "kt"
         detector = opts.loop_detector or ToolLoopDetector()
-        repeat_guard = (opts.repeat_guard or RepeatGuard()) if react_mode else None
+        # kt 模式只跳过**启发式拦截**（同参重复 / 家族兜底），产物级规则照样生效：
+        # 生图「一张就停」与空转收尾都是产品行为，不是循环启发式。用户反馈开着
+        # kt 时连出 12 张图、且一直不总结收尾。
+        repeat_guard = opts.repeat_guard or RepeatGuard()
         if repeat_guard is not None:
             # 按轮计数的护栏在这里归零（「一张就停」），检测器的跨轮历史不动。
             repeat_guard.begin_turn()
@@ -261,10 +264,12 @@ class AgentRuntime:
         #: ``wrap_up_after`` such rounds we force a text-only wrap-up so the
         #: turn actually closes with a summary instead of spinning.
         stalled_rounds = 0
+        # 空转收尾是**产品行为**（必须有总结），kt 模式下也保留 —— 用户反馈
+        # kt 模式下「跑了十几轮还是没有总结」。
         wrap_up_after = (
             opts.wrap_up_rounds if opts.wrap_up_rounds is not None
             else max(6, min(12, opts.max_turns))
-        ) if react_mode else opts.max_turns + 1
+        )
         #: 上一轮工具返回的图片（read_image / 截图…）。工具输出里的图片字节
         #: 原先被 loop 直接丢弃，模型永远看不到图 —— 这里收集起来，在**下一次**
         #: 请求时作为 image_parts 附到末尾 user 消息上。有原生视觉的多模态模型
@@ -392,7 +397,12 @@ class AgentRuntime:
                 # get a veto (see repeat_guard.py).
                 gate = detector.check(tu.name, tu.input)
                 if not gate.is_blocking and repeat_guard is not None:
-                    extra = repeat_guard.check(tu.name, tu.input)
+                    # kt 模式只保留产物级规则（生图配额）；启发式拦截留给 react。
+                    extra = (
+                        repeat_guard.check(tu.name, tu.input)
+                        if react_mode
+                        else repeat_guard.check_image_budget(tu.name, tu.input)
+                    )
                     if extra.is_blocking:
                         gate = extra
                 dedup_key = (tu.name, _round_dedup_key(tu.input))
@@ -523,7 +533,10 @@ class AgentRuntime:
                     "",
                     content_parts=tool_result_parts,
                 ))
-                if blocked_any and not executed_any and react_mode:
+                if blocked_any and not executed_any:
+                    # 两种模式都要硬停：kt 下生图配额也会产生 blocked，
+                    # 少了这段模型会「拦截→重试→再拦截」一路空转到 max_turns，
+                    # 最后连总结都没有（用户反馈的「还是没有总结」）。
                     blocked_rounds += 1
                     if blocked_rounds >= 2:
                         # Hard stop: the model kept calling the same tool even

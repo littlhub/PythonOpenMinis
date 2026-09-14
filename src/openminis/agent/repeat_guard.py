@@ -30,6 +30,7 @@ returns CRITICAL.
 from __future__ import annotations
 
 import json
+import re
 from collections import deque
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -44,6 +45,13 @@ from .tool_loop_detector import (
 logger = get_logger("agent.repeat_guard")
 
 __all__ = ["RepeatRecord", "RepeatGuardConfig", "RepeatGuard"]
+
+#: 技能脚本里声明张数的写法：``--count 3`` / ``-n 3`` / ``--num 3``。
+_SHELL_IMAGE_COUNT_RE = re.compile(
+    r"(?:--count|--num|--n|-n)\s*[= ]\s*(\d+)", re.IGNORECASE
+)
+#: ``image_gen`` 工具里可能出现的张数字段名。
+_IMAGE_COUNT_KEYS = ("count", "n", "num_images", "number_of_images", "num")
 
 
 @dataclass(frozen=True)
@@ -80,18 +88,27 @@ class RepeatGuardConfig:
     #: 总结的收尾路径，这个兜底只负责「有文本但仍在反复跑命令」的残余场景。
     effect_run_warning: int = 6
     effect_run_critical: int = 14
-    #: 生图家族 —— 「一张就停」（技能脚本版）。用户实测：只要一张图，模型却
-    #: 串行跑了 4 次 agnes-image 脚本（17:16 / 17:17 / 17:18 各一张）。每次
-    #: prompt/种子不同 → 同参规则看不见；走 shell_execute → effect 兜底阈值
-    #: 6/14 又太高，4 次根本没到。生图是「一次就够」的动作，**同一轮内**
-    #: 第二次调用直接拦（同轮并发给全 = 用户明确要多张：check 发生在执行前、
-    #: 计数还是 0，不会被误伤）。
+    #: 生图家族 —— 张数由**模型自己按语义声明**（用户明确要求）。
+    #:
+    #: 用户实测：要一张图，模型却串行跑了 4 次 agnes-image 脚本（17:16 / 17:17
+    #: / 17:18 各一张）；后来开着 kt 又连出 12 张。每次 prompt/种子都不同 → 同参
+    #: 规则看不见；走 shell_execute → effect 兜底阈值 6/14 又太高。
+    #:
+    #: 现在的规则不是「硬限一张」，而是**消费模型声明的张数**：模型在调用里用
+    #: ``count``（``image_gen`` 工具）或 ``--count N``（技能脚本）一次性声明本轮
+    #: 要几张，护栏按这个预算放行 —— 说一张跑一次、说两张跑两次（同一次调用里
+    #: 串行跑 N 次）。没声明就按 ``image_default_per_turn`` 张算。声明张数被封顶
+    #: 在 ``max_images_per_turn``（防失控），成功数达到预算后同轮再调一律拦下，
+    #: 且不允许把预算无限抬高。
     image_gen_tools: tuple[str, ...] = ("image_gen",)
     #: shell 命令里出现这些片段就认定是「生图」动作（技能脚本形式）。
     image_command_markers: tuple[str, ...] = (
         "agnes-image", "agnes_image", "image_generation", "imagegen",
     )
-    image_repeat_critical: int = 1
+    #: 模型没在调用里声明张数时的默认预算。
+    image_default_per_turn: int = 1
+    #: 单轮生图张数硬上限（模型声明再多也不越过；防「12 张停不下来」回归）。
+    max_images_per_turn: int = 8
 
 
 class RepeatGuard:
@@ -105,41 +122,99 @@ class RepeatGuard:
         self.config = config
         self._history: deque[RepeatRecord] = deque()
         #: 本轮（一条用户消息 = 一个 run()）内**已成功生成**的图片数。
-        #: 「一张就停」是按轮计的：用户下一句再要一张图时不该被上一轮历史拦住。
+        #: 生图预算是按轮计的：用户下一句再要一张图时不该被上一轮历史拦住。
         self._turn_image_success = 0
+        #: 本轮的生图预算（模型声明的张数）。``None`` = 还没声明过，用默认值。
+        self._turn_image_budget: Optional[int] = None
 
     def reset(self) -> None:
         self._history.clear()
         self._turn_image_success = 0
+        self._turn_image_budget = None
 
     def begin_turn(self) -> None:
         """新的一轮用户消息开始 —— 按轮计数的护栏在这里归零。
 
-        由 ``AgentRuntime.run()`` 调用。生图「一张就停」只在本轮内生效，
-        跨轮保留会让用户第二次要图时莫名被拦。
+        由 ``AgentRuntime.run()`` 调用。生图预算只在本轮内生效，跨轮保留会让
+        用户第二次要图时莫名被拦。
         """
         self._turn_image_success = 0
+        self._turn_image_budget = None
+
+    def set_image_budget(self, count: Optional[int]) -> None:
+        """显式设定本轮生图预算（张数）。
+
+        供运行时在**执行前**注入一个已知张数（例如从模型声明的 JSON 配置里
+        解析出来）。``None`` 表示回到「按调用里声明的张数自适应」。
+        """
+        if count is None:
+            self._turn_image_budget = None
+            return
+        try:
+            n = int(count)
+        except (TypeError, ValueError):
+            return
+        if n > 0:
+            self._turn_image_budget = min(n, max(1, self.config.max_images_per_turn))
+
+    # ─── 生图配额（两种循环模式都生效）───────────────────────────────────────
+    def check_image_budget(
+        self, tool_name: str, params: dict[str, Any]
+    ) -> LoopCheckResult:
+        """按**模型声明的张数**放行本轮生图。
+
+        说一张跑一次、说两张跑两次：模型在调用里声明 ``count``（``image_gen``
+        工具）或 ``--count N``（技能脚本），这里按声明的张数建预算并放行；
+        没声明就按 ``image_default_per_turn``（默认 1）张算。
+
+        这是**产物规则**而不是循环启发式，所以 ``kt`` 模式（只用 KT 原版检测器）
+        下也照样生效：用户实测开着 kt 时连出 12 张图（每张 prompt 都不同，
+        KT 的「同参+同结果」策略永远看不见）。同轮并发给全 —— check 发生在
+        执行前、计数还是 0。
+
+        预算可以被**更大的声明**抬高（模型改主意要多几张），但封顶在
+        ``max_images_per_turn``；成功数达到预算后同轮再调一律拦下，所以
+        「每轮都声明白张」也堆不出失控（超过上限的声明会被裁到上限）。
+        """
+        if not self._is_image_generation(tool_name, params):
+            return LoopCheckResult.none()
+
+        declared = self._declared_image_count(tool_name, params)
+        cap = max(1, self.config.max_images_per_turn)
+        if declared is not None:
+            declared = min(declared, cap)
+            if self._turn_image_budget is None or declared > self._turn_image_budget:
+                self._turn_image_budget = declared
+
+        budget = (
+            self._turn_image_budget
+            if self._turn_image_budget is not None
+            else max(1, self.config.image_default_per_turn)
+        )
+        if self._turn_image_success < budget:
+            return LoopCheckResult.none()
+
+        msg = (
+            "[LOOP BLOCKED] CRITICAL: 本轮生图预算已用完"
+            f"（已生成 {self._turn_image_success} 张 / 预算 {budget} 张），"
+            "**不要再次生成**。需要多张图的正确做法是：在**一次**调用里把张数"
+            "声明清楚 —— `image_gen` 用 `count` 参数、技能脚本用 `--count N`"
+            "（例如 `--count 2`），而不是反复串行重跑同一个命令。"
+            "现在立刻停止生成，把已经拿到的图片用 "
+            "`![简短说明](图片绝对路径)` 写进你的回复交出产物并总结收尾。"
+        )
+        logger.warning("CRITICAL image_budget_exhausted tool=%s done=%s budget=%s",
+                       tool_name, self._turn_image_success, budget)
+        return LoopCheckResult(LoopLevel.CRITICAL, msg)
 
     # ─── before-execution hook ──────────────────────────────────────────────
     def check(self, tool_name: str, params: dict[str, Any]) -> LoopCheckResult:
         args_hash = args_hash_for(tool_name, params)
 
-        # 0. image_gen_repeat — 「一张就停」（含技能脚本形式）。放在最前面：
-        #    本轮已经出过图了，再跑一次只会多一张重复图。用户实测「生成一张图
-        #    却连续生成了 4 张」，根因就是这条缺口。
-        if self._is_image_generation(tool_name, params):
-            if self._turn_image_success >= self.config.image_repeat_critical:
-                msg = (
-                    "[LOOP BLOCKED] CRITICAL: 本轮已经成功生成过图片"
-                    f"（{self._turn_image_success} 张），**不要再次生成**。"
-                    "生成图片是「一次就够」的动作：用户没有明确要求多张时只出一张；"
-                    "确需多张也不是反复串行重跑，而是在**同一轮**里一次性给出多个调用。"
-                    "现在立刻停止生成，把已经拿到的图片用 "
-                    "`![简短说明](图片绝对路径)` 写进你的回复交出产物并总结收尾。"
-                )
-                logger.warning("CRITICAL image_gen_repeat tool=%s done=%s",
-                               tool_name, self._turn_image_success)
-                return LoopCheckResult(LoopLevel.CRITICAL, msg)
+        # 0. 生图配额 —— 「一张就停」。放在最前面：本轮已出过图，再跑只会多一张。
+        blocked = self.check_image_budget(tool_name, params)
+        if blocked.is_blocking:
+            return blocked
 
         # 1. identical_repeat — 「第一次重复就停」：紧接着用完全相同的参数再调
         #    一次（上次成功）本身就是空转。不看结果内容（生图/抓网页的结果每次
@@ -225,9 +300,13 @@ class RepeatGuard:
             args_hash=args_hash_for(tool_name, params),
             ok=error_message is None,
         ))
-        # 生图成功 → 记本轮已出图，供上面的「一张就停」用。
+        # 生图成功 → 记本轮已出图（按**声明的张数**累加，同样封顶），供上面的
+        # 生图预算用。
         if error_message is None and self._is_image_generation(tool_name, params):
-            self._turn_image_success += 1
+            self._turn_image_success += min(
+                self._declared_image_count(tool_name, params) or 1,
+                max(1, self.config.max_images_per_turn),
+            )
         while len(self._history) > self.config.history_size:
             self._history.popleft()
         return LoopCheckResult.none()
@@ -250,6 +329,43 @@ class RepeatGuard:
         except (TypeError, ValueError):  # pragma: no cover - 参数不可序列化
             blob = str(params).lower()
         return any(m in blob for m in self.config.image_command_markers)
+
+    def _declared_image_count(
+        self, tool_name: str, params: dict[str, Any]
+    ) -> Optional[int]:
+        """模型在本次调用里声明的张数（JSON 配置里的语义决策）。
+
+        * ``image_gen`` 工具：读 ``count`` / ``n`` / ``num_images`` … 参数；
+        * 技能脚本（shell）：从命令行里读 ``--count 2`` / ``-n 2``。
+
+        读不到就返回 ``None``（调用方按 ``image_default_per_turn`` 处理）。
+        """
+        if tool_name in self.config.image_gen_tools:
+            for key in _IMAGE_COUNT_KEYS:
+                if key not in params:
+                    continue
+                try:
+                    n = int(params[key])
+                except (TypeError, ValueError):
+                    continue
+                if n > 0:
+                    return n
+            return None
+        if tool_name not in ("shell_execute", "bash", "terminal"):
+            return None
+        try:
+            blob = json.dumps(params, ensure_ascii=False)
+        except (TypeError, ValueError):  # pragma: no cover - 参数不可序列化
+            blob = str(params)
+        match = _SHELL_IMAGE_COUNT_RE.search(blob)
+        if not match:
+            return None
+        try:
+            n = int(match.group(1))
+        except (TypeError, ValueError):  # pragma: no cover - 正则已保证是数字
+            return None
+        return n if n > 0 else None
+
     def _identical_success_streak(self, tool_name: str, args_hash: str) -> int:
         """Trailing *successful* records with identical (tool, args).
 

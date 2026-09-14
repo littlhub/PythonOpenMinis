@@ -7,9 +7,11 @@ stays allowed.
 Two layers guard image generation specifically, because the user hit both:
 
 * **identical args** — the same script call re-run verbatim;
-* **per-turn 「一张就停」** — the script re-run with *different* prompts inside the
+* **per-turn image budget** — the script re-run with *different* prompts inside the
   same user turn (实测：只要一张图，却串行跑了 4 次 agnes-image 脚本，
   17:16 / 17:17 / 17:18 各出一张 —— 同参规则看不见，effect 兜底阈值又太高).
+  张数不是硬编码一张，而是**由模型按语义声明**：``image_gen`` 的 ``count``
+  参数 / 脚本的 ``--count N`` —— 说一张跑一次、说两张跑两次（见下面 count 用例）。
 
 These rules are a runtime-level companion to the ported KT ToolLoopDetector —
 the detector itself deliberately stays at KT's four generic strategies.
@@ -17,7 +19,7 @@ the detector itself deliberately stays at KT's four generic strategies.
 
 from __future__ import annotations
 
-from openminis.agent.repeat_guard import RepeatGuard
+from openminis.agent.repeat_guard import RepeatGuard, RepeatGuardConfig
 from openminis.agent.tool_loop_detector import LoopLevel
 
 #: 生图（技能脚本形式）：命令里带 image_generation → 命中 image_gen 家族。
@@ -124,6 +126,65 @@ def test_failed_generation_does_not_count():
     g.record("image_gen", {"prompt": "x"}, error_message="boom",
              tool_call_id="i1")
     assert g.check("image_gen", {"prompt": "x"}).level == LoopLevel.NONE
+
+
+# ---------------------------------------------------------------------------
+# image_gen 家族 —— 张数由**模型按语义声明**（说一张跑一次、说两张跑两次）
+# ---------------------------------------------------------------------------
+def test_declared_count_runs_that_many_times():
+    """脚本用 ``--count 2`` 声明两张 → 本轮放行到 2 张才拦。"""
+    g = RepeatGuard()
+    g.begin_turn()
+    first = {"command": 'python scripts/image_generation.py "a" --count 2'}
+    assert g.check("shell_execute", first).level == LoopLevel.NONE
+    g.record("shell_execute", first, result="saved 2", tool_call_id="g1")
+    r = g.check("shell_execute",
+                {"command": 'python scripts/image_generation.py "b" --count 2'})
+    assert r.level == LoopLevel.CRITICAL
+    assert "预算" in (r.message or "")
+
+
+def test_native_image_gen_count_param():
+    """原生工具用 ``count`` 声明两张：一次调用给全，第二次才拦。"""
+    g = RepeatGuard()
+    g.begin_turn()
+    assert g.check("image_gen", {"prompt": "x", "count": 2}).level == LoopLevel.NONE
+    g.record("image_gen", {"prompt": "x", "count": 2}, result="2 imgs",
+             tool_call_id="i1")
+    assert g.check("image_gen", {"prompt": "y"}).level == LoopLevel.CRITICAL
+
+
+def test_budget_escalation_is_capped():
+    """模型改主意要多几张可以抬预算，但封顶；到顶后再声明也不放行。"""
+    g = RepeatGuard(config=RepeatGuardConfig(max_images_per_turn=3))
+    g.begin_turn()
+    g.record("image_gen", {"prompt": "a", "count": 1}, result="1",
+             tool_call_id="i1")
+    # 已出 1 张，声明 3 → 预算抬到 3，还放行
+    assert g.check("image_gen", {"prompt": "b", "count": 3}).level == LoopLevel.NONE
+    g.record("image_gen", {"prompt": "b", "count": 2}, result="2",
+             tool_call_id="i2")                       # 共 3 张 = 上限
+    # 声明再大也封顶在 3，而已经出了 3 张 → 拦死（「12 张停不下来」不回归）
+    assert g.check("image_gen", {"prompt": "c", "count": 99}).level == LoopLevel.CRITICAL
+
+
+def test_set_image_budget_overrides_declaration():
+    """运行时可以预先注入一个张数预算（例如从模型声明的 JSON 配置里解析）。"""
+    g = RepeatGuard()
+    g.begin_turn()
+    g.set_image_budget(2)
+    g.record("shell_execute",
+             {"command": 'python scripts/image_generation.py "a"'},
+             result="saved a", tool_call_id="g1")
+    assert g.check("shell_execute",
+                   {"command": 'python scripts/image_generation.py "b"'}
+                   ).level == LoopLevel.NONE
+    g.record("shell_execute",
+             {"command": 'python scripts/image_generation.py "b"'},
+             result="saved b", tool_call_id="g2")
+    assert g.check("shell_execute",
+                   {"command": 'python scripts/image_generation.py "c"'}
+                   ).level == LoopLevel.CRITICAL
 
 
 # ---------------------------------------------------------------------------

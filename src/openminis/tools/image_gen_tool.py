@@ -31,6 +31,8 @@ __all__ = ["ImageGenTool"]
 
 TIMEOUT_SECONDS = 120.0
 DEFAULT_SIZE = "1024x1024"
+#: 单次调用最多生成的张数（与 ``repeat_guard.max_images_per_turn`` 对齐）。
+MAX_COUNT = 8
 
 #: 该引擎是否支持 OpenAI 兼容的生图端点。
 _IMAGE_ENGINES = {"openai"}
@@ -64,7 +66,10 @@ class ImageGenTool:
                 "the 生图 (image) slot. Returns the saved file path plus the "
                 "image itself. The model must be configured in 设置 → 模型服务 → "
                 "用途分槽 → 生图; when it is not, the tool says so instead of "
-                "pretending to draw."
+                "pretending to draw. To make several images, set `count` "
+                "according to what the user asked for (说几张就填几), instead "
+                "of calling the tool again — it runs the generation `count` "
+                "times in this one call."
             ),
             parameters={
                 "tool_title": AgentToolParam(
@@ -83,9 +88,17 @@ class ImageGenTool:
                     "string",
                     f"Image size like '1024x1024' (default: {DEFAULT_SIZE}).",
                 ),
+                "count": AgentToolParam(
+                    "integer",
+                    "How many images to generate in THIS single call, decided "
+                    "from the user's wording: 说一张就填 1，说两张就填 2 "
+                    f"(default 1, max {MAX_COUNT}). Do NOT call this tool "
+                    "repeatedly to make several images — set `count` once and "
+                    "the tool will run the generation that many times.",
+                ),
             },
             required=["tool_title", "prompt"],
-            property_ordering=["tool_title", "prompt", "size"],
+            property_ordering=["tool_title", "prompt", "size", "count"],
         )
 
     @staticmethod
@@ -101,6 +114,12 @@ class ImageGenTool:
         if not prompt:
             return ToolExecutionResult("Error: 'prompt' is required", False,
                                        tool_title=tool_title)
+        # 张数由模型按语义决定（说一张填 1、说两张填 2）；这里只做范围收敛。
+        try:
+            count = int(args.get("count") or 1)
+        except (TypeError, ValueError):
+            count = 1
+        count = max(1, min(count, MAX_COUNT))
 
         # 读取生图槽 —— 槽位/存储是运行时的单一事实来源
         try:
@@ -147,68 +166,96 @@ class ImageGenTool:
         payload: dict = {"model": model_id, "prompt": prompt, "n": 1}
         if size:
             payload["size"] = size
+
+        # 一次调用里串行跑 count 次 —— 「说一张跑一次、说两张跑两次」。
+        images: list[tuple[bytes, Path]] = []
+        failures: list[str] = []
         try:
             async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
-                resp = await client.post(
-                    url,
-                    headers={"Authorization": f"Bearer {api_key}",
-                             "Content-Type": "application/json"},
-                    json=payload,
-                )
-        except Exception as exc:
-            logger.debug("image_gen request failed: %s", exc)
+                for _ in range(count):
+                    raw, err = await _generate_once(
+                        client, url, api_key, payload, model_id
+                    )
+                    if raw is None:
+                        failures.append(err or "未知错误")
+                        continue
+                    out_path = _generated_dir() / (
+                        f"img_{int(time.time())}_{uuid.uuid4().hex[:6]}.png"
+                    )
+                    try:
+                        out_path.write_bytes(raw)
+                    except OSError as exc:  # pragma: no cover - disk issues
+                        failures.append(f"生图成功但保存失败：{exc}")
+                        continue
+                    images.append((raw, out_path))
+        except Exception as exc:  # pragma: no cover - client construction
+            logger.debug("image_gen client failed: %s", exc)
             return ToolExecutionResult(
                 f"生图请求失败（{model_id}）: {type(exc).__name__}: {exc}", False,
                 tool_title=tool_title,
             )
 
-        if resp.status_code >= 400:
-            detail = resp.text[:400]
-            return ToolExecutionResult(
-                f"生图失败 HTTP {resp.status_code}（{model_id}）: {detail}", False,
-                tool_title=tool_title,
-            )
-
-        try:
-            body = resp.json()
-            item = (body.get("data") or [{}])[0]
-        except (ValueError, IndexError, AttributeError):
-            return ToolExecutionResult("生图失败：响应不是预期的 JSON 形状", False,
+        if not images:
+            detail = failures[0] if failures else "响应里没有图片数据"
+            return ToolExecutionResult(f"生图失败（{model_id}）：{detail}", False,
                                        tool_title=tool_title)
 
-        raw: bytes | None = None
-        if item.get("b64_json"):
-            try:
-                raw = base64.b64decode(item["b64_json"])
-            except (ValueError, TypeError):
-                raw = None
-        elif item.get("url"):
-            raw = await _download(item["url"])
-        if not raw:
-            return ToolExecutionResult("生图失败：响应里没有图片数据", False,
-                                       tool_title=tool_title)
+        lines = [f"[image_gen · {model_id} · {size} · {len(images)}/{count} 张]"]
+        for _, path in images:
+            lines.append(f"已生成图片并保存到工作区: generated/{path.name}")
+        if failures:
+            lines.append(f"（另有 {len(failures)} 张失败：{failures[0]}）")
 
-        ext = ".png"
-        out_path = _generated_dir() / f"img_{int(time.time())}_{uuid.uuid4().hex[:6]}{ext}"
-        try:
-            out_path.write_bytes(raw)
-        except OSError as exc:  # pragma: no cover - disk issues
-            return ToolExecutionResult(
-                f"生图成功但保存失败：{exc}", False, tool_title=tool_title
-            )
-
-        rel = f"generated/{out_path.name}"
+        first_raw, first_path = images[0]
         return ToolExecutionResult(
-            output=(
-                f"[image_gen · {model_id} · {size}]\n"
-                f"已生成图片并保存到工作区: {rel}（{len(raw)} bytes）"
-            ),
+            output="\n".join(lines),
             success=True,
-            image_data=raw,
+            image_data=first_raw,
             image_mime_type="image/png",
-            image_file_path=str(out_path),
+            image_file_path=str(first_path),
             tool_title=tool_title,
         )
+
+
+async def _generate_once(
+    client: "httpx.AsyncClient",
+    url: str,
+    api_key: str,
+    payload: dict,
+    model_id: str,
+) -> tuple[bytes | None, str | None]:
+    """One generation run. Returns ``(image_bytes, None)`` or ``(None, error)``."""
+    try:
+        resp = await client.post(
+            url,
+            headers={"Authorization": f"Bearer {api_key}",
+                     "Content-Type": "application/json"},
+            json=payload,
+        )
+    except Exception as exc:
+        logger.debug("image_gen request failed: %s", exc)
+        return None, f"请求失败 {type(exc).__name__}: {exc}"
+
+    if resp.status_code >= 400:
+        return None, f"HTTP {resp.status_code}: {resp.text[:400]}"
+
+    try:
+        body = resp.json()
+        item = (body.get("data") or [{}])[0]
+    except (ValueError, IndexError, AttributeError):
+        return None, "响应不是预期的 JSON 形状"
+
+    raw: bytes | None = None
+    if item.get("b64_json"):
+        try:
+            raw = base64.b64decode(item["b64_json"])
+        except (ValueError, TypeError):
+            raw = None
+    elif item.get("url"):
+        raw = await _download(item["url"])
+    if not raw:
+        return None, "响应里没有图片数据"
+    return raw, None
 
 
 async def _download(url: str) -> bytes | None:

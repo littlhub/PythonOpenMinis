@@ -106,11 +106,116 @@ def test_image_gen_missing_prompt(store, workspace):
     assert "'prompt' is required" in res.output
 
 
+def test_image_gen_count_runs_that_many_times(store, workspace, monkeypatch):
+    """``count`` 由模型按语义声明：说两张就在**一次调用**里跑两次生成。"""
+    import base64
+
+    import httpx
+
+    import openminis.tools.image_gen_tool as igt
+
+    class _Ctx:
+        external_files_dir = workspace
+
+    monkeypatch.setattr(igt, "app_context", lambda: _Ctx())
+
+    store.apply_full({
+        "providers": [{"id": "gw", "type": "openAI", "apiKey": "k",
+                       "baseUrl": "https://example.test/v1", "model": "dall-e-3"}],
+        "modelSlots": {"image": {"instanceId": "gw", "model": "dall-e-3"}},
+    })
+
+    png = base64.b64encode(b"\x89PNG\r\n\x1a\n").decode()
+    calls = {"n": 0}
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"data": [{"b64_json": png}]}
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, **kw):
+            calls["n"] += 1
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+
+    res = asyncio.run(ImageGenTool.execute(
+        json.dumps({"prompt": "a cat", "count": 2}), "s"))
+    assert res.success is True
+    assert calls["n"] == 2                      # 串行跑了两次生成
+    assert "2/2 张" in res.output
+    assert res.image_file_path and res.image_file_path.endswith(".png")
+
+
+def test_image_gen_single_call_by_default(store, workspace, monkeypatch):
+    """不声明 count 时仍然只跑一次（默认一张）。"""
+    import base64
+
+    import httpx
+
+    import openminis.tools.image_gen_tool as igt
+
+    class _Ctx:
+        external_files_dir = workspace
+
+    monkeypatch.setattr(igt, "app_context", lambda: _Ctx())
+    store.apply_full({
+        "providers": [{"id": "gw", "type": "openAI", "apiKey": "k",
+                       "baseUrl": "https://example.test/v1", "model": "dall-e-3"}],
+        "modelSlots": {"image": {"instanceId": "gw", "model": "dall-e-3"}},
+    })
+    png = base64.b64encode(b"\x89PNG\r\n\x1a\n").decode()
+    calls = {"n": 0}
+
+    class _Resp:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"data": [{"b64_json": png}]}
+
+    class _Client:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, **kw):
+            calls["n"] += 1
+            return _Resp()
+
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    res = asyncio.run(ImageGenTool.execute(
+        json.dumps({"prompt": "a cat"}), "s"))
+    assert res.success is True
+    assert calls["n"] == 1
+    assert "1/1 张" in res.output
+
+
 def test_image_gen_definition_shape():
     d = ImageGenTool.definition()
     assert d.name == "image_gen"
-    assert set(d.parameters) == {"tool_title", "prompt", "size"}
+    assert set(d.parameters) == {"tool_title", "prompt", "size", "count"}
     assert "prompt" in d.required
+    # 张数由模型按语义声明（说几张填几），不是硬编码一张。
+    assert "count" in d.parameters
+    assert "count" not in d.required
 
 
 # ---------------------------------------------------------------------------

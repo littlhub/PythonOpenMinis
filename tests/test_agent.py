@@ -318,3 +318,95 @@ async def test_runtime_auto_wrap_up_when_never_answering():
                and "自动总结" in (m.content or "") for m in out)
     # It must close early, not at the hard budget.
     assert len(out) < 30
+
+
+# --------------------------------------------------------------------------
+# kt 模式下也要保留的**产物级规则**（生图一张就停 / 空转收尾）
+# --------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_kt_mode_still_wraps_up_when_never_answering():
+    """kt 模式只是不做启发式拦截，空转收尾是产品行为，必须保留。
+
+    用户反馈：开着 kt 跑了十几轮还是没有总结。
+    """
+
+    class ActForeverNoText:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def stream_message(self, messages, system_prompt=None, max_tokens=0,
+                           temperature=None, image_parts=None, tools=None,
+                           thinking_level=ThinkingLevel.OFF):
+            async def gen():
+                self.n += 1
+                last = messages[-1]
+                txt = (last.content_parts[0].content
+                       if last.content_parts and hasattr(last.content_parts[0], "content")
+                       else (last.content or ""))
+                if "[auto wrap-up]" in txt:
+                    yield LLMStreamChunk.Text("自动总结：已完成。")
+                    yield LLMStreamChunk.Finished("end_turn")
+                else:
+                    yield LLMStreamChunk.ToolCallComplete(
+                        f"c{self.n}", "shell_execute", {"command": f"step-{self.n}"}
+                    )
+                    yield LLMStreamChunk.Finished("tool_use")
+            return gen()
+
+    rt = AgentRuntime()
+    rt.register(ToolExecutor(_shell_tool_def(), _fake_shell))
+    out, stop = await rt.run(
+        ActForeverNoText(),
+        [LLMMessage(LLMMessage.Role.USER, "长任务")],
+        "s",
+        AgentRuntimeOptions(max_turns=30, loop_mode="kt"),
+    )
+    assert stop == "auto_wrap_up"
+    assert any(m.role is LLMMessage.Role.ASSISTANT and "自动总结" in (m.content or "")
+               for m in out)
+
+
+@pytest.mark.asyncio
+async def test_kt_mode_stops_after_one_image():
+    """kt 模式下生图「一张就停」照样生效。
+
+    用户实测：开着 kt 连出 12 张图（每张 prompt 都不同，KT 的同参+同结果
+    策略永远看不见）。这是产物规则，不该被循环模式关掉。
+    """
+    ran: list[str] = []
+
+    async def fake_image_shell(args_json: str, session_id: str, **kw):
+        ran.append(args_json)
+        return ToolExecutionResult("saved /tmp/out.png", True)
+
+    class GenImagesForever:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def stream_message(self, messages, system_prompt=None, max_tokens=0,
+                           temperature=None, image_parts=None, tools=None,
+                           thinking_level=ThinkingLevel.OFF):
+            async def gen():
+                self.n += 1
+                yield LLMStreamChunk.ToolCallComplete(
+                    f"c{self.n}",
+                    "shell_execute",
+                    {"command": (
+                        "python C:/skills/agnes-image/scripts/image_generation.py "
+                        f'"prompt {self.n}"'
+                    )},
+                )
+                yield LLMStreamChunk.Finished("tool_use")
+            return gen()
+
+    rt = AgentRuntime()
+    rt.register(ToolExecutor(_shell_tool_def(), fake_image_shell))
+    out, stop = await rt.run(
+        GenImagesForever(),
+        [LLMMessage(LLMMessage.Role.USER, "生成一张图")],
+        "s",
+        AgentRuntimeOptions(max_turns=12, loop_mode="kt"),
+    )
+    # 只真的跑了一次生图脚本
+    assert len(ran) == 1, ran
+    assert stop in {"tool_loop_blocked", "auto_wrap_up"}
