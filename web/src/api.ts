@@ -51,10 +51,16 @@ const WS_URL = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.h
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${API}${path}`, {
     headers: { 'Content-Type': 'application/json' },
+    credentials: 'same-origin',
     ...init,
   })
   if (!res.ok) {
     const detail = await res.json().catch(() => ({ detail: res.statusText }))
+    // 423 = 页面锁着（后端 `_access_gate` 只放行解锁接口本身）。
+    // 广播出去让 App 换成锁屏 —— 令牌过期时不必等用户手动刷新。
+    if (res.status === 423) {
+      window.dispatchEvent(new CustomEvent('openminis:locked'))
+    }
     throw new Error(detail?.detail ?? res.statusText)
   }
   return res.json() as Promise<T>
@@ -503,7 +509,15 @@ function makeSocket(
     pendingRef.current = []
     setState('open')
   }
-  sock.onclose = () => {
+  sock.onclose = (event) => {
+    // 4401 = 服务端因「页面已锁定」拒绝握手（WS 不走 /api/，闸门单独判定）。
+    // 这种情况别重连 —— 广播出去让 App 换成锁屏。
+    if (event.code === 4401) {
+      closedRef.current = true
+      setState('closed')
+      window.dispatchEvent(new CustomEvent('openminis:locked'))
+      return
+    }
     if (closedRef.current || closingRef.current) {
       setState('closed')
       return

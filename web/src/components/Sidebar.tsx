@@ -615,7 +615,14 @@ export function Sidebar(props: SidebarProps) {
                       <button onClick={() => void accessSet()}>改密</button>
                     </div>
                     <div className="up-row">
-                      <button onClick={() => void api.accessLock().then(loadAccessStatus)}>
+                      <button
+                        onClick={() =>
+                          void api.accessLock().then(() => {
+                            // 立刻回到锁屏（否则要等某个请求撞上 423 才切）
+                            window.dispatchEvent(new CustomEvent('openminis:locked'))
+                          })
+                        }
+                      >
                         立即上锁
                       </button>
                       <button onClick={() => void accessClear()}>清除密码</button>

@@ -188,26 +188,37 @@ async def _access_gate(request: Request, call_next: Any) -> Any:
     设了「进入密码」且请求没带有效令牌时，``/api/*`` 一律 423 —— 前端会弹
     解锁浮层。静态资源照常放行（不然浮层自己都加载不出来）。
     """
-    try:
-        from ..sandbox.console_auth import ACCESS_COOKIE, access_auth
+    from ..sandbox.console_auth import ACCESS_COOKIE, access_auth
 
-        path = request.url.path
-        if (
+    path = request.url.path
+    # 注意：闸门自身的逻辑**不要**包在宽 except 里 —— 曾经因为 cookie 名导入
+    # 失败被静默吞掉，导致「设了密码却完全不拦」。开关本身出错按放行处理
+    # （与旧行为一致），但要留下 warning 级别的痕迹。
+    try:
+        locked = (
             access_auth.has_password()
             and not access_auth.is_unlocked()
             and path.startswith("/api/")
             and not path.startswith(_ACCESS_EXEMPT)
-        ):
-            token = request.cookies.get(ACCESS_COOKIE) or request.headers.get(
-                "x-minis-access"
-            )
-            if not access_auth.token_valid(token):
-                return JSONResponse(
-                    {"detail": "locked", "locked": True, "error": "页面已锁定：请输入进入密码"},
-                    status_code=423,
-                )
+        )
     except Exception:  # pragma: no cover - 闸门故障不该挡住整个站点
-        logger.debug("access gate failed", exc_info=True)
+        logger.warning("access gate check failed（按放行处理）", exc_info=True)
+        return await call_next(request)
+
+    if locked:
+        token = request.cookies.get(ACCESS_COOKIE) or request.headers.get(
+            "x-minis-access"
+        )
+        try:
+            valid = access_auth.token_valid(token)
+        except Exception:  # pragma: no cover
+            logger.warning("access token check failed（按放行处理）", exc_info=True)
+            valid = True
+        if not valid:
+            return JSONResponse(
+                {"detail": "locked", "locked": True, "error": "页面已锁定：请输入进入密码"},
+                status_code=423,
+            )
     return await call_next(request)
 
 
@@ -657,6 +668,19 @@ async def websocket_endpoint(ws: WebSocket) -> None:
     The agent kernel isn't ported yet, so ``chat`` currently echoes through the
     same frame shape the real implementation will use.
     """
+    # 访问闸门也要管住 WS：只拦 ``/api/`` 的话，锁屏状态下仍能通过 WS 聊天。
+    # 锁定且令牌无效 → 4401 拒绝握手，前端据此回到锁屏。
+    from ..sandbox.console_auth import ACCESS_COOKIE, access_auth
+
+    try:
+        if access_auth.has_password() and not access_auth.is_unlocked():
+            token = ws.cookies.get(ACCESS_COOKIE) or ws.headers.get("x-minis-access")
+            if not access_auth.token_valid(token):
+                await ws.close(code=4401)
+                return
+    except Exception:  # pragma: no cover - 闸门故障不该挡住整条通道
+        logger.warning("ws access gate failed（按放行处理）", exc_info=True)
+
     client_id = await manager.connect(ws)
     try:
         while True:

@@ -32,6 +32,7 @@ __all__ = [
     "PasswordGate",
     "console_auth",
     "access_auth",
+    "ACCESS_COOKIE",
     "UNLOCK_TTL_SECONDS",
     "ACCESS_TTL_SECONDS",
 ]
@@ -40,6 +41,10 @@ __all__ = [
 UNLOCK_TTL_SECONDS = 3600
 #: 页面访问解锁后多久失效（秒）—— 比控制台宽松些，免得频繁输密码。
 ACCESS_TTL_SECONDS = 12 * 3600
+
+#: 页面访问令牌的 cookie 名（``guard_api`` 签发、``main._access_gate`` 校验）。
+#: 常量放在这里 —— 签发方与校验方都从这里取，避免两边各写一份而悄悄失配。
+ACCESS_COOKIE = "minis_access"
 
 
 class PasswordGate:

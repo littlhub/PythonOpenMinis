@@ -23,6 +23,7 @@ from fastapi import APIRouter, HTTPException, Query, Response
 from pydantic import BaseModel
 
 from ..sandbox.console_auth import (
+    ACCESS_COOKIE,
     ACCESS_TTL_SECONDS,
     UNLOCK_TTL_SECONDS,
     access_auth,
@@ -142,7 +143,6 @@ async def console_password(body: PasswordRequest) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # 页面访问密码（「用户」按钮里设置；未解锁时其它 API 返回 423）
 # ---------------------------------------------------------------------------
-ACCESS_COOKIE = "minis_access"
 
 
 @router.get("/access/status")

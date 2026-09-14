@@ -11,6 +11,7 @@ import { MarketplaceView } from './components/MarketplaceView'
 import { ChannelsView } from './components/ChannelsView'
 import { SchedulerView } from './components/SchedulerView'
 import { SubagentsView } from './components/SubagentsView'
+import { LockScreen } from './components/LockScreen'
 import { api } from './api'
 import { applyBackground, hydrateBackground } from './theme'
 import type { WorkspaceInfo } from './types'
@@ -24,6 +25,33 @@ export default function App() {
   const [activeId, setActiveId] = useState<string | null>(null)
   const [, setWorkspaces] = useState<WorkspaceInfo[]>([])
 
+  // 访问闸门：设了「进入密码」且未解锁时，整个界面换成锁屏 —— 用户明确要求
+  // 「锁了就该只看到输入框」。'checking' 期间也不渲染界面，避免先漏一眼内容。
+  const [access, setAccess] = useState<'checking' | 'locked' | 'open'>('checking')
+
+  useEffect(() => {
+    let alive = true
+    void api
+      .accessStatus()
+      .then((s) => {
+        if (alive) setAccess(s.hasPassword && s.locked ? 'locked' : 'open')
+      })
+      // 状态读不到（后端没起/接口异常）不该把用户关在门外
+      .catch(() => {
+        if (alive) setAccess('open')
+      })
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  // 令牌过期时任意请求会拿到 423，request() 广播这个事件 → 回到锁屏
+  useEffect(() => {
+    const onLocked = () => setAccess('locked')
+    window.addEventListener('openminis:locked', onLocked)
+    return () => window.removeEventListener('openminis:locked', onLocked)
+  }, [])
+
   // hydrate from localStorage on mount
   useEffect(() => {
     const savedView = localStorage.getItem('openminis:view') as ViewId | null
@@ -35,13 +63,14 @@ export default function App() {
   // 背景偏好来自后端 config（不是 localStorage）—— 它跟着数据目录走，
   // 同一份配置换个浏览器打开外观一致。设置页改完发事件即时生效，不必刷新。
   useEffect(() => {
+    if (access !== 'open') return
     void hydrateBackground()
     const onAppearance = (e: Event) =>
       applyBackground((e as CustomEvent<string>).detail)
     window.addEventListener('openminis:appearance', onAppearance as EventListener)
     return () =>
       window.removeEventListener('openminis:appearance', onAppearance as EventListener)
-  }, [])
+  }, [access])
 
   // persist
   useEffect(() => {
@@ -100,6 +129,11 @@ export default function App() {
     await api.workspaceDelete(id)
     setWorkspaces((prev) => prev.filter((w) => w.id !== id))
   }, [])
+
+  // 锁着（或还没问清楚）就只渲染密码框 —— 侧栏、会话、内容一概不挂载。
+  if (access !== 'open') {
+    return <LockScreen mode={access} onUnlocked={() => setAccess('open')} />
+  }
 
   return (
     <div className={`app app-${view}`}>

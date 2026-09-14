@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from openminis.core import context
-from openminis.sandbox.console_auth import console_auth
+from openminis.sandbox.console_auth import ACCESS_COOKIE, access_auth, console_auth
 from openminis.sandbox.guard import (
     Guard,
     check_shell_command,
@@ -29,9 +29,11 @@ def env(tmp_path, monkeypatch):
     context.set_app_context(context.AppContext(data_dir=tmp_path, cache_dir=tmp_path))
     guard.reset()
     console_auth.reset()
+    access_auth.reset()
     yield tmp_path
     guard.reset()
     console_auth.reset()
+    access_auth.reset()
     context._context = None
 
 
@@ -339,3 +341,112 @@ def test_escape_allow_once_lets_next_through(env):
     event = guard.events()[0]
     assert guard.allow(event.id, "once")
     assert check_shell_command(cmd, session_id="s1", cwd="") is None
+
+
+# ---------------------------------------------------------------------------
+# 页面访问密码（access）：设了密码就把整个前端挡在门外
+# ---------------------------------------------------------------------------
+def test_access_gate_off_when_no_password(env):
+    """没设密码时闸门完全不起作用（默认行为不变）。"""
+    from fastapi.testclient import TestClient
+
+    from openminis.server.main import app
+
+    with TestClient(app) as c:
+        assert c.get("/api/health").status_code == 200
+
+
+def test_access_gate_blocks_api_until_unlocked(env):
+    """设了密码且处于锁定态 → /api/* 一律 423，解锁接口本身放行。"""
+    from fastapi.testclient import TestClient
+
+    from openminis.server.main import app
+
+    access_auth.set_password("", "hunter2")
+    access_auth.lock()
+
+    with TestClient(app) as c:
+        blocked = c.get("/api/health")
+        assert blocked.status_code == 423
+        assert blocked.json().get("locked") is True
+
+        # 解锁接口自己不能被拦，否则用户永远进不来
+        assert c.get("/api/guard/access/status").status_code == 200
+
+        # 输对密码 → 拿到令牌 → 之后畅通
+        r = c.post("/api/guard/access/unlock", json={"password": "hunter2"})
+        assert r.status_code == 200
+        assert c.get("/api/health").status_code == 200
+
+
+def test_access_gate_wrong_password_stays_locked(env):
+    from fastapi.testclient import TestClient
+
+    from openminis.server.main import app
+
+    access_auth.set_password("", "hunter2")
+    access_auth.lock()
+
+    with TestClient(app) as c:
+        assert c.post(
+            "/api/guard/access/unlock", json={"password": "nope"}
+        ).status_code == 403
+        assert c.get("/api/health").status_code == 423
+
+
+def test_access_gate_rejects_junk_token_and_issues_cookie(env):
+    """锁定态下乱给令牌照样 423；解锁后拿到的 cookie 是真令牌。"""
+    from fastapi.testclient import TestClient
+
+    from openminis.server.main import app
+
+    access_auth.set_password("", "hunter2")
+    access_auth.lock()
+
+    with TestClient(app) as c:
+        assert (
+            c.get("/api/health", headers={"x-minis-access": "junk"}).status_code == 423
+        )
+        r = c.post("/api/guard/access/unlock", json={"password": "hunter2"})
+        assert r.status_code == 200
+        token = r.cookies.get(ACCESS_COOKIE) or c.cookies.get(ACCESS_COOKIE)
+        assert token
+        # 非浏览器客户端可以不靠 cookie，直接带 x-minis-access 头
+        assert (
+            c.get("/api/health", headers={"x-minis-access": token}).status_code == 200
+        )
+
+
+def test_access_cookie_name_is_shared_with_gate(env):
+    """cookie 名只有一个来源 —— 签发方与校验方失配过（曾导致闸门形同虚设）。"""
+    from openminis.server import guard_api
+
+    assert guard_api.ACCESS_COOKIE == ACCESS_COOKIE
+
+
+def test_ws_rejected_while_locked(env):
+    """WS 不走 /api/，闸门要单独管 —— 否则锁屏状态下还能通过 WS 聊天。"""
+    from fastapi.testclient import TestClient
+    from starlette.websockets import WebSocketDisconnect
+
+    from openminis.server.main import app
+
+    access_auth.set_password("", "hunter2")
+    access_auth.lock()
+
+    with TestClient(app) as c:
+        with pytest.raises(WebSocketDisconnect) as exc:
+            with c.websocket_connect("/ws"):
+                pass
+        assert exc.value.code == 4401
+
+
+def test_ws_open_when_no_password(env):
+    from fastapi.testclient import TestClient
+
+    from openminis.server.main import app
+
+    with TestClient(app) as c:
+        with c.websocket_connect("/ws") as ws:
+            ws.send_json({"type": "ping"})
+            assert ws.receive_json()["type"] == "pong"
