@@ -125,8 +125,33 @@ _BULK_HINTS: tuple[tuple[str, str], ...] = (
     (r"\bdel\b[^\n|;]*[*?]", "批量删除：del 通配符"),
 )
 
-#: 从命令里挑出像路径的 token（用于判断"工作区之外"）。
-_PATH_TOKEN_RE = re.compile(r"""["']?([A-Za-z]:[\\/][^"'\s|;>]*|/[^"'\s|;>*]+)["']?""")
+#: 以空白/分隔符为界的**完整** token。
+#:
+#: 曾经用 ``findall`` 直接捞 ``/...`` 片段，结果把相对路径
+#: ``scripts/image_generation.py`` 截成 ``/image_generation.py`` 当成绝对路径，
+#: 于是 `cd <技能目录> && python scripts/xxx.py` 被误报「目录越界」（用户实测）。
+#: 现在只按整词判断，绝不在词中间截断。
+_TOKEN_RE = re.compile(r"[^\s|;&<>\"']+")
+
+#: 伪路径：不是真文件，永远不该算「工作区之外」。
+_PSEUDO_PATHS = frozenset(
+    {"/dev/null", "/dev/zero", "/dev/stdout", "/dev/stderr", "/dev/tty", "nul"}
+)
+
+
+def _path_candidates(command: str) -> list[str]:
+    """挑出命令里的**完整**路径 token（绝对路径，或含 ``..`` 的相对路径）。"""
+    out: list[str] = []
+    for m in _TOKEN_RE.finditer(command):
+        tok = m.group(0).strip("\"'").rstrip(',;)>')
+        if not tok or tok in out:
+            continue
+        if re.match(r"^[A-Za-z]:[\\/]", tok) or tok.startswith(("/", "\\")):
+            out.append(tok)
+        elif ".." in tok:
+            out.append(tok)
+    return out
+
 
 #: Windows 风格的开关（``del /f /s``、``taskkill /PID``）不是路径：单个短段、
 #: 无扩展名、无更多分隔符的 ``/xxx`` 一律当 flag。
@@ -143,24 +168,33 @@ _REDIRECT_RE = re.compile(r">>?\s*([^\s|;&<>]+)")
 #: 读敏感文件的命令特征（中英文 key/password 都算）。
 #: 注意误伤：`python -m venv env` / `cat .env.example` 这种正常命令不该被拦，
 #: 所以 env 系列要求出现在**命令开头或管道/分隔符之后**，`.env` 后面不能紧跟字。
-_SECRET_READ: tuple[tuple[str, str], ...] = (
+#: 三元组 = (正则, 说明, 需要校验「值」是否像真凭据的捕获组；0 = 整段命中即算)。
+_SECRET_READ: tuple[tuple[str, str, int], ...] = (
     (
         r"(?:^|[|;&]\s*)\b(cat|type|more|head|tail|less)\b[^\n|;]*"
         r"(\.env(?![.\w])|\.pem\b|\.key\b|id_rsa|credentials\b|\.netrc)",
         "读取密钥文件",
+        0,
     ),
     (
         r"(?:^|[|;&]\s*)\b(echo|printf)\b[^\n|;]*\$\{?[A-Z_]*(KEY|TOKEN|SECRET"
         r"|PASSWORD|PASSWD|PWD|CREDENTIAL)",
         "打印环境变量里的密钥",
+        0,
     ),
     (
         r"(?:^|[|;&]\s*)\b(printenv|env)\s*(\||$|>\s*&?\d?)",
         "枚举环境变量（含密钥）",
+        0,
     ),
-    (r"(?:^|[|;&]\s*)get-childitem\s+env:", "枚举环境变量（PowerShell）"),
-    (r"(?:^|[|;&]\s*)set\s*\|", "枚举环境变量"),
-    (r"(密码|密钥|令牌|私钥|凭据)\s*[:=]", "中文凭据赋值"),
+    (r"(?:^|[|;&]\s*)get-childitem\s+env:", "枚举环境变量（PowerShell）", 0),
+    (r"(?:^|[|;&]\s*)set\s*\|", "枚举环境变量", 0),
+    # 光提到「密码:」不算（文档、echo、注释里常见）—— 必须有**像真凭据的值**。
+    (
+        r"(密码|密钥|令牌|私钥|凭据)\s*[:=：]\s*([^\s，,;；\"']{4,})",
+        "中文凭据赋值",
+        2,
+    ),
 )
 
 
@@ -169,11 +203,13 @@ def _has_glob(token: str) -> bool:
 
 
 def _looks_like_path(token: str) -> bool:
-    """过滤掉 Windows 开关（``/f`` ``/PID``）和 URL，剩下的才算路径。"""
+    """过滤掉 Windows 开关（``/f`` ``/PID``）、URL 与伪路径，剩下的才算路径。"""
     raw = token.strip().strip("\"'")
     if not raw or "://" in raw:
         return False
     if _FLAG_TOKEN_RE.match(raw):
+        return False
+    if raw.lower() in _PSEUDO_PATHS:  # `> /dev/null` 不是写到外面
         return False
     return True
 
@@ -223,7 +259,7 @@ def scan_delete(command: str, cwd: str = "") -> DeleteRisk:
     for pattern, why in _BULK_HINTS:
         if re.search(pattern, low):
             risk.reasons.append(why)
-    for token in _PATH_TOKEN_RE.findall(command):
+    for token in _path_candidates(command):
         if _resolve_outside(token, cwd):
             risk.targets.append(token)
     # 相对路径的越界（``rm -rf ../../x``）也归到目标里。
@@ -275,7 +311,7 @@ def scan_escape(command: str, cwd: str = "") -> DeleteRisk:
 
     # 2) 命令里的越界路径（cd 目标已查过，跳过 cd 行）
     body = _CD_RE.sub(" ", command)
-    for token in _PATH_TOKEN_RE.findall(body):
+    for token in _path_candidates(body):
         if token in risk.targets:
             continue
         if _resolve_outside(token, cwd):
@@ -311,10 +347,20 @@ def scan_escape(command: str, cwd: str = "") -> DeleteRisk:
 def scan_secret_command(command: str) -> list[SecretHit]:
     """命令本身是否在读取/外传敏感信息，或直接带着明文密钥。"""
     hits: list[SecretHit] = []
-    for pattern, why in _SECRET_READ:
-        if re.search(pattern, command, re.IGNORECASE):
-            hits.append(SecretHit(label=why, kind="command", sample=_sample(command)))
+    for pattern, why, group in _SECRET_READ:
+        m = re.search(pattern, command, re.IGNORECASE)
+        if not m:
+            continue
+        # 带值的规则（中文明文凭据赋值）要求值真的像凭据 ——
+        # `echo "密码: 占位"`、`print('密钥:openai_key')` 这类只是提到变量/文档。
+        if group > 0 and not _looks_like_real_secret(m.group(group) or ""):
+            continue
+        hits.append(SecretHit(label=why, kind="command", sample=_sample(command)))
+    seen = {h.label for h in hits}
     for hit in scan_secret_text(command):
+        if hit.label in seen:  # 同一条凭据别在事件里记两遍
+            continue
+        seen.add(hit.label)
         hits.append(SecretHit(label=hit.label, kind="command", sample=hit.sample))
     return hits
 
@@ -356,6 +402,64 @@ def _partial(value: str) -> str:
     return f"{v[:4]}…{v[-4:]}「已拦截」"
 
 
+#: 一眼就是「占位符 / 示例」的值 —— 不遮。
+_FAKE_VALUE_WORDS = frozenset(
+    {
+        "none", "null", "nil", "true", "false", "undefined", "nan", "empty",
+        "changeme", "change_me", "placeholder", "example", "sample", "test",
+        "demo", "redacted", "hidden", "masked", "todo", "fixme",
+        "password", "passwd", "pwd", "secret", "token", "apikey", "api_key",
+        "your_password", "yourpassword", "your_token", "yourtoken",
+    }
+)
+_FAKE_VALUE_PREFIXES = (
+    "your", "my_", "xxx", "placeholder", "example", "sample", "test", "demo",
+    "todo", "change", "redacted", "某", "你的", "我的", "示例", "默认",
+)
+#: 本身就是「字段名」的词 —— `token = token` / `secret = secret` 是引用不是值。
+_FIELD_WORDS = frozenset(
+    {
+        "token", "secret", "password", "passwd", "pwd", "credential",
+        "api_key", "apikey", "access_key", "secret_key", "private_key",
+    }
+)
+
+
+def _looks_like_real_secret(value: str) -> bool:
+    """``xxx = value`` 里的 ``value`` 到底像不像**真凭据**。
+
+    「明文凭据赋值」这条通用规则太容易误伤，所以只在值**确实像密钥**时才遮：
+
+    * 不像：变量/字段名 —— ``api_key = openai_key``、``api_key = api_key``、
+      ``token = my_token`` 这类是**读变量**，不是明文（用户反馈的误伤）；
+    * 不像：占位符与示例 —— ``<your-token>``、``{{TOKEN}}``、``${TOKEN}``、
+      ``None``、``changeme``、``xxxx``、中文说明文字；
+    * 不像：代码表达式 —— ``os.environ["OPENAI_API_KEY"]``、``config.get('k')``；
+    * 像：带数字/符号的高熵串 —— ``supersecret123``、``Xk92!dLm#``、``a1B2c3D4``。
+
+    真密钥即使不命中这条通用规则，也还有 ``sk-`` / ``AKIA`` / ``ghp_`` / JWT /
+    长十六进制等**高置信度**规则兜底。
+    """
+    v = value.strip().strip("\"'`")
+    if len(v) < 8 or not v.isascii():
+        return False
+    low = v.lower()
+    if low in _FAKE_VALUE_WORDS or low in _FIELD_WORDS:
+        return False
+    if low.startswith(_FAKE_VALUE_PREFIXES):
+        return False
+    # 占位符 / 模板 / 代码形态：<your-token> {{t}} ${T} os.environ[x] config.get('k')
+    if re.match(r"^[<\[{]", v) or re.search(r"[\[\]()<>{}$]", v):
+        return False
+    # 蛇形标识符（openai_api_key / my_token / api_key）：下划线 + 全小写 —— 变量名
+    if "_" in v and re.fullmatch(r"[a-z0-9_]+", v):
+        return False
+    # 必须带数字或符号 —— 纯字母词更像普通单词，不是凭据
+    if not re.search(r"[0-9!@#$%^&*_\-+=:;,.?/|~]", v):
+        return False
+    return True
+
+
 def _mask_match(match: "re.Match[str]", group: int) -> str:
     """保留 ``password=`` 这类标签，只把**值**换成部分显示。"""
     raw = match.group(0)
@@ -376,30 +480,70 @@ def _sample(text: str, limit: int = 24) -> str:
     return flat[:limit] + ("…" if len(flat) > limit else "")
 
 
-def scan_secret_text(text: str) -> list[SecretHit]:
-    """扫一段出站文本里的明文凭据。"""
+def _find_secret_hits(text: str) -> list[tuple["re.Match[str]", str, int]]:
+    """按模式优先级取**互不重叠**的命中。
+
+    单次扫描是必要的：以前每条规则各自 ``re.sub`` 一遍，高置信度规则已经遮成
+    ``…「已拦截」``，通用规则又会在这段文字上再命中一次，产出
+    ``sk-a…已拦截」「已拦截」`` 这种垃圾。现在先到先得（``sk-`` 等排在前面），
+    重叠区间直接丢弃。
+    """
     if not text or len(text) < 8:
         return []
-    hits: list[SecretHit] = []
-    for pattern, label, _group in _SECRET_PATTERNS:
+    taken: list[tuple[int, int]] = []
+    found: list[tuple[int, int, "re.Match[str]", str, int]] = []
+    for pattern, label, group in _SECRET_PATTERNS:
         for m in re.finditer(pattern, text):
-            hits.append(SecretHit(label=label, kind="text", sample=_sample(m.group(0))))
-    return hits
+            if group > 0 and not _looks_like_real_secret(m.group(group) or ""):
+                continue
+            s, e = m.span()
+            if any(not (e <= ts or s >= te) for ts, te in taken):
+                continue
+            taken.append((s, e))
+            found.append((s, e, m, label, group))
+    found.sort(key=lambda item: item[0])
+    return [(m, label, group) for _s, _e, m, label, group in found]
+
+
+def scan_secret_text(text: str) -> list[SecretHit]:
+    """扫一段出站文本里的明文凭据。
+
+    命中样本给的是**已遮版**，所以沙箱面板里也不会出现明文。
+    """
+    return [
+        SecretHit(label=label, kind="text", sample=_sample(_mask_match(m, group)))
+        for m, label, group in _find_secret_hits(text)
+    ]
 
 
 def redact_secrets(text: str) -> tuple[str, list[SecretHit]]:
     """把明文凭据换成**占位符 / 部分显示**，返回（脱敏文本, 命中列表）。
 
-    ``password=abcd1234xyz`` → ``password=abcd…4xyz「已拦截」`` ——
+    ``password=Xk92!dLm#`` → ``password=Xk92…dLm#「已拦截」`` ——
     送到 LLM / 前端 / 机器人通道的就是这个版本。
+
+    判定为「不是真凭据」的（变量名、占位符、代码表达式）原样保留 ——
+    用户反馈 ``api_key = openai_key`` 被误遮，这类是**读变量**。
     """
-    hits = scan_secret_text(text)
-    if not hits:
+    hits: list[SecretHit] = []
+    spans: list[tuple[int, int, str]] = []
+    for m, label, group in _find_secret_hits(text):
+        hits.append(
+            SecretHit(label=label, kind="text", sample=_sample(_mask_match(m, group)))
+        )
+        s, e = m.span()
+        spans.append((s, e, _mask_match(m, group)))
+    if not spans:
         return text, []
-    out = text
-    for pattern, _label, group in _SECRET_PATTERNS:
-        out = re.sub(pattern, lambda m, g=group: _mask_match(m, g), out)
-    return out, hits
+    spans.sort()
+    out: list[str] = []
+    cursor = 0
+    for s, e, rep in spans:
+        out.append(text[cursor:s])
+        out.append(rep)
+        cursor = e
+    out.append(text[cursor:])
+    return "".join(out), hits
 
 
 # ---------------------------------------------------------------------------

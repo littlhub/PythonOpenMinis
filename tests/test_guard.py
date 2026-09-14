@@ -154,11 +154,46 @@ def test_redact_keeps_plain_mentions(env):
     assert hits == []
 
 
+def test_redact_keeps_variable_references(env):
+    """用户反馈：``api_key = openai_key`` 这类是**读变量**，不该被遮。"""
+    for text in (
+        "api_key = api_key",
+        "api_key = openai_key",
+        "api_key = openai_api_key",
+        "token = my_token",
+        'api_key = os.environ["OPENAI_API_KEY"]',
+        "token = <your-token>",
+        "secret = None",
+        "password: 你的密码",
+        "token = changeme",
+    ):
+        out, hits = redact_secrets(text)
+        assert out == text, text
+        assert hits == [], text
+
+
+def test_redact_masks_real_looking_values(env):
+    """真凭据照遮，且**只遮一次**（曾经高置信度规则遮完又被通用规则再遮一遍）。"""
+    for text in (
+        "api_key = sk-abcdefghijklmnopqrstuvwx",
+        "password = Xk92!dLm#",
+        "token = ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+        "password=supersecret123",
+    ):
+        out, hits = redact_secrets(text)
+        assert hits, text
+        assert "「已拦截」" in out
+        assert "」「已拦截」" not in out  # 双重遮蔽的垃圾串
+    assert "abcdefghijklmnopqrstuvwx" not in redact_secrets(
+        "api_key = sk-abcdefghijklmnopqrstuvwx"
+    )[0]
+
+
 def test_sanitize_outbound_records_and_masks(env):
     out = sanitize_outbound(
-        "把 token=abcdefghijklmno 写进配置", where="frontend", session_id="s1"
+        "把 token=Xk92dLm3q 写进配置", where="frontend", session_id="s1"
     )
-    assert "abcdefghijklmno" not in out
+    assert "Xk92dLm3q" not in out
     event = guard.events()[0]
     assert event.family == "secret"
     assert event.cwd == "outbound:frontend"
@@ -450,3 +485,28 @@ def test_ws_open_when_no_password(env):
         with c.websocket_connect("/ws") as ws:
             ws.send_json({"type": "ping"})
             assert ws.receive_json()["type"] == "pong"
+
+
+def test_scan_escape_ignores_relative_path_fragments(env):
+    """相对路径 `scripts/x.py` 里的 `/x.py` 曾被当成绝对路径误报目录越界。"""
+    from openminis.tools.path_utils import readonly_roots
+
+    roots = list(readonly_roots())
+    skills = (roots[0] if roots else Path(env) / "skills") / "agnes-image"
+    risk = scan_escape(f'cd "{skills}" && python scripts/image_generation.py "x"')
+    assert not risk.risky, risk.reasons
+    assert not scan_escape("python scripts/train.py").risky
+    assert not scan_escape("python -m pytest tests/test_guard.py").risky
+
+
+def test_scan_escape_ignores_dev_null(env):
+    """`> /dev/null` 是惯用法，不是「写到工作区外面」。"""
+    assert not scan_escape("foo > /dev/null 2>&1").risky
+    assert not scan_escape("python app.py > NUL").risky
+
+
+def test_scan_escape_still_blocks_real_absolutes(env):
+    """修误报不能把真越界放掉。"""
+    assert scan_escape(f"cd {OUTSIDE}").risky
+    assert scan_escape(f'cat "{Path.home() / "Desktop" / "x.txt"}').risky
+    assert scan_escape("rm -rf /tmp/xyz").risky
