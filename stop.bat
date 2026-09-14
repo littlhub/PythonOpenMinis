@@ -2,7 +2,7 @@
 rem ============================================================
 rem  OpenMinis Web - stop the service started by run.bat / app.py
 rem  Primary: pid file written by app.py (.minis-server.pid)
-rem  Fallback: any process listening on the default port 8765
+rem  Fallback: any process listening on the default port 8766
 rem  (only used if the pid file is missing/unreadable).
 rem ============================================================
 setlocal enabledelayedexpansion
@@ -30,10 +30,10 @@ if defined PID (
     echo [INFO] pid file empty or unreadable - using port fallback
 )
 
-rem --- 2) fallback: kill the process listening on default port 8765 ---
+rem --- 2) fallback: kill the process listening on default port 8766 ---
 if not defined STOPPED (
-    echo [INFO] scanning for a process on port 8765 ...
-    powershell -NoProfile -Command "$c = Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique; if ($c) { $c | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue; Write-Host ('[OK] stopped pid ' + $_) }; exit 0 } else { Write-Host '[INFO] nothing listening on port 8765'; exit 0 }"
+    echo [INFO] scanning for a process on port 8766 ...
+    powershell -NoProfile -Command "$c = Get-NetTCPConnection -LocalPort 8765 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique; if ($c) { $c | ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue; Write-Host ('[OK] stopped pid ' + $_) }; exit 0 } else { Write-Host '[INFO] nothing listening on port 8766'; exit 0 }"
 )
 
 echo.

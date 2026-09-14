@@ -410,3 +410,105 @@ async def test_kt_mode_stops_after_one_image():
     # 只真的跑了一次生图脚本
     assert len(ran) == 1, ran
     assert stop in {"tool_loop_blocked", "auto_wrap_up"}
+
+
+@pytest.mark.asyncio
+async def test_image_budget_block_stops_even_with_other_tools():
+    """生图预算用完后，**即使同一轮还有别的工具成功**，也必须停下来收尾。
+
+    用户实测：shell_execute(生图) 被拦 + skill_use 成功的交替轮次里，
+    原来的「整轮全被拦」判据永远为假 → blocked_rounds 每轮归零 →
+    「预算用完还在跑」，一路转到 max_turns 才甩出一句停止标记。
+    """
+    gen_ran: list[str] = []
+
+    async def fake_shell(args_json: str, session_id: str, **kw):
+        if "image_generation" in args_json:
+            gen_ran.append(args_json)
+            return ToolExecutionResult("saved /tmp/a.png", True)
+        return ToolExecutionResult("side effect ok", True)
+
+    class ImagePlusSide:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def stream_message(self, messages, system_prompt=None, max_tokens=0,
+                           temperature=None, image_parts=None, tools=None,
+                           thinking_level=ThinkingLevel.OFF):
+            async def gen():
+                self.n += 1
+                if tools is None:                     # 收尾轮：给一句总结
+                    yield LLMStreamChunk.Text("总结：已生成 1 张图。")
+                    yield LLMStreamChunk.Finished("end_turn")
+                    return
+                yield LLMStreamChunk.ToolCallComplete(
+                    f"g{self.n}", "shell_execute",
+                    {"command": ("python C:/skills/agnes-image/scripts/"
+                                 f'image_generation.py "p{self.n}"')},
+                )
+                yield LLMStreamChunk.ToolCallComplete(
+                    f"s{self.n}", "shell_execute",
+                    {"command": f"echo side-{self.n}"},
+                )
+                yield LLMStreamChunk.Finished("tool_use")
+            return gen()
+
+    rt = AgentRuntime()
+    rt.register(ToolExecutor(_shell_tool_def(), fake_shell))
+    out, stop = await rt.run(
+        ImagePlusSide(),
+        [LLMMessage(LLMMessage.Role.USER, "生成一张图")],
+        "s",
+        AgentRuntimeOptions(max_turns=12, loop_mode="kt"),
+    )
+    assert len(gen_ran) == 1, gen_ran          # 只真的生成了一次
+    assert stop == "tool_loop_blocked"         # 而不是一路跑到 max_turns
+    assert any("总结" in (m.content or "") for m in out)
+
+
+@pytest.mark.asyncio
+async def test_max_turns_ends_with_llm_summary_not_marker():
+    """max_turns 用尽时，最后要给**模型自己写的总结**，而不是生硬的停止标记。"""
+
+    class ToolForeverThenSummarize:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def stream_message(self, messages, system_prompt=None, max_tokens=0,
+                           temperature=None, image_parts=None, tools=None,
+                           thinking_level=ThinkingLevel.OFF):
+            async def gen():
+                self.n += 1
+                if tools is None:                     # 无工具收尾轮
+                    yield LLMStreamChunk.Text("已完成：生成了 1 张图并写好报告。")
+                    yield LLMStreamChunk.Finished("end_turn")
+                    return
+                yield LLMStreamChunk.ToolCallComplete(
+                    f"id{self.n}", "shell_execute",
+                    {"command": f"step-{self.n}"},
+                )
+                yield LLMStreamChunk.Finished("tool_use")
+            return gen()
+
+    rt = AgentRuntime()
+    rt.register(ToolExecutor(_shell_tool_def(), _fake_shell))
+    out, stop = await rt.run(
+        ToolForeverThenSummarize(),
+        [LLMMessage(LLMMessage.Role.USER, "长任务")],
+        "s",
+        AgentRuntimeOptions(max_turns=3),
+    )
+    assert stop == "max_turns"
+    texts: list[str] = []
+    for m in out:
+        if m.role is not LLMMessage.Role.ASSISTANT:
+            continue
+        if m.content:
+            texts.append(m.content)
+        for p in (m.content_parts or []):
+            t = getattr(p, "text", None)
+            if t:
+                texts.append(t)
+    joined = "\n".join(texts)
+    assert "已完成" in joined
+    assert "reached the maximum number of tool rounds" not in joined

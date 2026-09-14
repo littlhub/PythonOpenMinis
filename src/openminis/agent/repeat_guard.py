@@ -205,7 +205,10 @@ class RepeatGuard:
         )
         logger.warning("CRITICAL image_budget_exhausted tool=%s done=%s budget=%s",
                        tool_name, self._turn_image_success, budget)
-        return LoopCheckResult(LoopLevel.CRITICAL, msg)
+        # ``warning_key`` 让运行时能认出「这是生图预算被拦」而不是普通循环拦截：
+        # 预算用完后的每一次生图尝试都是纯空转，哪怕同一轮里还有别的工具成功，
+        # 也要计入硬停（见 agent_runtime 的 image_blocked_rounds）。
+        return LoopCheckResult(LoopLevel.CRITICAL, msg, "imagebudget")
 
     # ─── before-execution hook ──────────────────────────────────────────────
     def check(self, tool_name: str, params: dict[str, Any]) -> LoopCheckResult:

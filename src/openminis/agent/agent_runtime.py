@@ -256,6 +256,12 @@ class AgentRuntime:
         #: runtime counter the model can spin on "blocked → retry → blocked"
         #: forever (only MAX_AGENT_TURNS would stop it). 2 strikes → hard stop.
         blocked_rounds = 0
+        #: Rounds in which a **生图预算** block happened (cumulative, never reset).
+        #: 这条必须独立于 ``blocked_rounds``：预算用完后模型若夹着别的工具一起调
+        #: （实测 shell_execute 被拦 + skill_use 成功交替），原来的
+        #: 「整轮全被拦」判据永远为假 → blocked_rounds 归零 → 「预算用完还在跑」
+        #: 一直转到 max_turns。预算用完后的每次生图尝试都是纯空转，累计到 2 就收尾。
+        image_blocked_rounds = 0
         #: Consecutive rounds that ran tools but wrote nothing to the user.
         #: The loop's ONLY natural exit is the model declining to call a tool;
         #: when it falls into an act-only rhythm (very common after a research
@@ -383,6 +389,8 @@ class AgentRuntime:
             tool_result_parts: list[ToolResult] = []
             executed_any = False
             blocked_any = False
+            #: 本轮是否出现过「生图预算已用完」的拦截（product-level，与循环启发式不同）。
+            image_blocked_any = False
             #: 同一轮内「同工具 + 完全同参」的重复调用：detector 的历史要等
             #: 执行后才写入，看不见同轮重复（模型一次吐两份一样的调用很常见），
             #: 这里用集合补上（用户要求「第一次重复就停」）。
@@ -416,6 +424,8 @@ class AgentRuntime:
                 seen_in_round.add(dedup_key)
                 if gate.is_blocking:
                     blocked_any = True
+                    if (gate.warning_key or "") == "imagebudget":
+                        image_blocked_any = True
                     logger.warning("agent blocked tool %s: %s", tu.name, gate.message)
                     tool_result_parts.append(ToolResult(
                         id=tu.id, name=tu.name,
@@ -533,12 +543,15 @@ class AgentRuntime:
                     "",
                     content_parts=tool_result_parts,
                 ))
-                if blocked_any and not executed_any:
+                # 生图预算被拦：**独立累计、不归零**（见上面 image_blocked_rounds）。
+                if image_blocked_any:
+                    image_blocked_rounds += 1
+                if (blocked_any and not executed_any) or image_blocked_any:
                     # 两种模式都要硬停：kt 下生图配额也会产生 blocked，
                     # 少了这段模型会「拦截→重试→再拦截」一路空转到 max_turns，
                     # 最后连总结都没有（用户反馈的「还是没有总结」）。
                     blocked_rounds += 1
-                    if blocked_rounds >= 2:
+                    if blocked_rounds >= 2 or image_blocked_rounds >= 2:
                         # Hard stop: the model kept calling the same tool even
                         # after a CRITICAL block. Two finishing passes:
                         # ① send-only round — deliver an already-generated
@@ -638,8 +651,9 @@ class AgentRuntime:
                             LLMMessage.Role.ASSISTANT, summary,
                         ))
                         logger.warning(
-                            "agent hard-stopped: %s consecutive fully-blocked rounds",
-                            blocked_rounds,
+                            "agent hard-stopped: blocked_rounds=%s "
+                            "image_blocked_rounds=%s",
+                            blocked_rounds, image_blocked_rounds,
                         )
                         return messages, "tool_loop_blocked"
                 else:
@@ -706,7 +720,40 @@ class AgentRuntime:
 
         # ── max_turns exhausted ────────────────────────────────────────────
         logger.warning("agent hit max_turns=%s", opts.max_turns)
-        if not last_tool_round_emitted:
+        # 用户要求：最后一轮不要再甩一句生硬的 [stopped: reached the maximum
+        # number of tool rounds …] 报错 —— 要让模型**用自己的话总结**（做完了
+        # 什么、产物在哪、还差什么）。这里补一次「无工具」收尾轮；只有它彻底
+        # 失败或空回时才退回原来那句停止标记。
+        messages.append(LLMMessage(
+            LLMMessage.Role.USER,
+            f"[auto wrap-up] 本轮工具调用已达到上限（{opts.max_turns} 轮），"
+            "**不要再调用任何工具**。请立即用文本把已经完成的工作与产物整理成"
+            "总结回复给用户：生成的图片单独成行写 `![简短说明](图片绝对路径)`，"
+            "写好的文件给出路径；如果任务还没做完，就直接说明还差哪一步、"
+            "需要用户补充什么。",
+        ))
+        summary: Optional[str] = None
+        try:
+            _guard_outbound(messages, session_id)
+            stream = provider.stream_message(
+                messages,
+                opts.system_prompt,
+                opts.max_tokens,
+                opts.temperature,
+                tools=None,
+                thinking_level=opts.thinking_level,
+            )
+            closing: list[str] = []
+            async for chunk in stream:
+                await self._emit(chunk)
+                if isinstance(chunk, LLMStreamChunk.Text):
+                    closing.append(chunk.text)
+            summary = "".join(closing).strip() or None
+        except Exception as exc:  # a failed wrap-up must not lose the turn
+            logger.warning("max_turns wrap-up failed: %s: %s",
+                           type(exc).__name__, exc)
+        if summary is None:
+            # 收尾轮彻底空回（连一句话都没有）才退回原来的停止标记。
             messages.append(LLMMessage(
                 LLMMessage.Role.ASSISTANT,
                 "",
@@ -716,4 +763,6 @@ class AgentRuntime:
                     "new question.]"
                 )],
             ))
+        else:
+            messages.append(LLMMessage(LLMMessage.Role.ASSISTANT, summary))
         return messages, "max_turns"
