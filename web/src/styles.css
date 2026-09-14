@@ -4631,3 +4631,144 @@ dl.facts.usage-detail {
   background: var(--accent-soft);
   color: var(--accent);
 }
+
+/* 气泡里的图片可点开预览 */
+.bubble-attachment img {
+  cursor: zoom-in;
+}
+.bubble-attachment img:hover {
+  border-color: var(--accent);
+  filter: brightness(0.97);
+}
+
+/* ============================================================
+ * 图片预览灯箱（点缩略图放大看原图）
+ * ============================================================ */
+.img-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  background: rgba(12, 14, 13, 0.82);
+  display: flex;
+  flex-direction: column;
+  backdrop-filter: blur(2px);
+}
+.img-lb-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  color: #f2f2f0;
+  font-size: 12.5px;
+  background: rgba(0, 0, 0, 0.35);
+}
+.img-lb-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 40vw;
+  opacity: 0.9;
+}
+.img-lb-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.img-lb-actions button,
+.img-lb-actions a {
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  background: rgba(255, 255, 255, 0.08);
+  color: #f2f2f0;
+  border-radius: 7px;
+  padding: 4px 10px;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  text-decoration: none;
+  white-space: nowrap;
+}
+.img-lb-actions button:hover,
+.img-lb-actions a:hover {
+  background: rgba(255, 255, 255, 0.2);
+}
+.img-lb-stage {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  overflow: auto;
+  padding: 16px;
+}
+/* 用 margin:auto 居中而不是 flex 居中 —— flex 居中时溢出部分滚不到
+   （上/左边会被裁掉），margin:auto 在 overflow 容器里两端都能滚到。 */
+.img-lb-stage img {
+  margin: auto;
+  border-radius: 6px;
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5);
+  cursor: default;
+}
+/* fit：缩放到窗口内；zoom：按显式像素尺寸（可滚动查看） */
+.img-lb-stage img.fit {
+  max-width: 100%;
+  max-height: 100%;
+}
+.img-lb-stage img.zoom {
+  max-width: none;
+  max-height: none;
+  flex-shrink: 0;
+}
+.img-lb-hint {
+  text-align: center;
+  padding: 8px;
+  font-size: 11.5px;
+  color: rgba(255, 255, 255, 0.6);
+}
+
+/* 输入框上方的已选图片缩略图（点开预览 / × 移除） */
+.composer-input-wrap {
+  position: relative;
+}
+.composer-attach-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 2px 4px;
+}
+.composer-attach-thumb {
+  position: relative;
+  width: 46px;
+  height: 46px;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: var(--bg);
+}
+.composer-attach-thumb img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  cursor: zoom-in;
+}
+.composer-attach-thumb .thumb-x {
+  position: absolute;
+  top: 1px;
+  right: 1px;
+  width: 16px;
+  height: 16px;
+  line-height: 1;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.55);
+  color: #fff;
+  font-size: 12px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.composer-attach-thumb .thumb-x:hover {
+  background: var(--danger);
+}

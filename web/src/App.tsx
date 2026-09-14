@@ -12,6 +12,7 @@ import { ChannelsView } from './components/ChannelsView'
 import { SchedulerView } from './components/SchedulerView'
 import { SubagentsView } from './components/SubagentsView'
 import { LockScreen } from './components/LockScreen'
+import { ImageLightbox } from './components/ImageLightbox'
 import { api } from './api'
 import { applyBackground, hydrateBackground } from './theme'
 import type { WorkspaceInfo } from './types'
@@ -137,6 +138,7 @@ export default function App() {
 
   return (
     <div className={`app app-${view}`}>
+      <ImageLightbox />
       <Sidebar
         view={view}
         activeSessionId={activeId}

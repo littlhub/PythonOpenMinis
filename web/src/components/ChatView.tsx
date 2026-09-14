@@ -18,6 +18,7 @@ import type {
   WorkspaceInfo,
 } from '../types'
 import { RightPanel } from './RightPanel'
+import { openImagePreview } from './ImageLightbox'
 
 interface ChatViewProps {
   activeSessionId: string | null
@@ -89,6 +90,24 @@ interface FileRef {
   src: string
 }
 
+/**
+ * 图片引用 → 可直接加载的 URL。
+ * * 远程 http(s) 原样用；
+ * * 本地绝对路径（`C:\…` / `/…`）走 `/api/fs/raw` —— agent **生成**到 workspace
+ *   任意位置的图（image/、generated/ 等）不在 uploads，`upload/raw` 按存储名取不到；
+ * * 其余按上传存储名走 `/api/upload/raw`。
+ * * `data:` 内联不预览（体积大且没意义）。
+ */
+function imageUrlFor(src: string): string | undefined {
+  if (/^https?:\/\//.test(src)) return src
+  if (src.startsWith('data:')) return undefined
+  if (/^[A-Za-z]:[\\/]/.test(src) || src.startsWith('/')) {
+    return `/api/fs/raw?path=${encodeURIComponent(src)}`
+  }
+  const base = src.split(/[\\/]/).pop()
+  return base ? `/api/upload/raw?name=${encodeURIComponent(base)}` : undefined
+}
+
 /** 把附件引用从正文里摘出来，正文只留用户真正打的字。 */
 function splitAttachments(text: string): {
   text: string
@@ -98,17 +117,8 @@ function splitAttachments(text: string): {
   const images: ImageRef[] = []
   const toRef = (alt: string, src: string): ImageRef => {
     const ref: ImageRef = { alt: alt || '图片', src }
-    if (/^https?:\/\//.test(src)) ref.url = src
-    else if (!src.startsWith('data:')) {
-      if (/^[A-Za-z]:[\\/]/.test(src) || src.startsWith('/')) {
-        // 本地绝对路径：可能是 agent **生成**到 workspace 任意位置的图
-        // （image/、generated/ 都不在 uploads，upload/raw 按存储名取不到）。
-        ref.url = `/api/fs/raw?path=${encodeURIComponent(src)}`
-      } else {
-        const base = src.split(/[\\/]/).pop()
-        if (base) ref.url = `/api/upload/raw?name=${encodeURIComponent(base)}`
-      }
-    }
+    const url = imageUrlFor(src)
+    if (url) ref.url = url
     return ref
   }
   let out = text.replace(IMAGE_REF_RE, (_m, alt: string, src: string) => {
@@ -704,7 +714,19 @@ function Bubble({
                   src={img.url}
                   alt={img.alt}
                   loading="lazy"
-                  title={img.src}
+                  title={`点击预览大图 · ${img.src}`}
+                  role="button"
+                  tabIndex={0}
+                  onClick={() =>
+                    img.url &&
+                    openImagePreview({ url: img.url, alt: img.alt, src: img.src })
+                  }
+                  onKeyDown={(e) => {
+                    if ((e.key === 'Enter' || e.key === ' ') && img.url) {
+                      e.preventDefault()
+                      openImagePreview({ url: img.url, alt: img.alt, src: img.src })
+                    }
+                  }}
                   onError={(e) => {
                     // 文件被清理 / 不在 uploads（例如老会话里的绝对路径）
                     ;(e.currentTarget as HTMLImageElement).style.display = 'none'
@@ -796,8 +818,48 @@ function Composer({
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const audioChunksRef = useRef<Blob[]>([])
 
-  const insertTool = (prefix: string) => {
-    const ta = document.querySelector<HTMLTextAreaElement>('form.composer textarea')
+  /**
+   * 草稿里的图片引用 —— 渲染成输入框上方的缩略图，让「我要发哪张图」看得见
+   * （以前只插一行 `![name](path)` 文本，完全靠脑补）。点图放大，× 移除该引用。
+   */
+  const draftImages = useMemo(() => {
+    const out: {
+      alt: string
+      src: string
+      url: string
+      raw: string
+      index: number
+    }[] = []
+    const re = new RegExp(IMAGE_REF_RE.source, 'g')
+    let m: RegExpExecArray | null
+    while ((m = re.exec(draft))) {
+      const src = m[2]
+      const url = imageUrlFor(src)
+      if (url) {
+        out.push({
+          alt: m[1] || '图片',
+          src,
+          url,
+          raw: m[0],
+          index: m.index,
+        })
+      }
+    }
+    return out
+  }, [draft])
+
+  /** 从草稿里删掉某条图片引用（按位置切片，避免误删同名图）。 */
+  const removeDraftImage = (index: number, raw: string) => {
+    setDraft((d) => {
+      const cut =
+        d.slice(index, index + raw.length) === raw
+          ? d.slice(0, index) + d.slice(index + raw.length)
+          : d.replace(raw, '')
+      return cut.replace(/\n{3,}/g, '\n\n')
+    })
+  }
+
+  const insertTool = (prefix: string) => {    const ta = document.querySelector<HTMLTextAreaElement>('form.composer textarea')
     if (!ta || disabled) return
     const pos = ta.selectionStart ?? ta.value.length
     const before = ta.value.slice(0, pos)
@@ -934,6 +996,33 @@ function Composer({
 
       {/* Text input */}
       <div className="composer-input-wrap">
+        {draftImages.length > 0 && (
+          <div className="composer-attach-strip">
+            {draftImages.map((im) => (
+              <div
+                key={`${im.index}-${im.src}`}
+                className="composer-attach-thumb"
+              >
+                <img
+                  src={im.url}
+                  alt={im.alt}
+                  title={`点击预览大图 · ${im.src}`}
+                  onClick={() =>
+                    openImagePreview({ url: im.url, alt: im.alt, src: im.src })
+                  }
+                />
+                <button
+                  type="button"
+                  className="thumb-x"
+                  title="移除这张图"
+                  onClick={() => removeDraftImage(im.index, im.raw)}
+                >
+                  ×
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
         <textarea
           rows={1}
           placeholder={
