@@ -47,6 +47,8 @@ export type ServerFrame =
       name: string
       ok: boolean
       output: string
+      /** 本次调用新生成、可直接预览的图片（本地绝对路径）—— 生图自动预览用。 */
+      images?: string[]
     }
   | {
       type: 'usage'

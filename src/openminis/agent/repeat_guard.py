@@ -44,7 +44,10 @@ from .tool_loop_detector import (
 
 logger = get_logger("agent.repeat_guard")
 
-__all__ = ["RepeatRecord", "RepeatGuardConfig", "RepeatGuard"]
+__all__ = [
+    "RepeatRecord", "RepeatGuardConfig", "RepeatGuard",
+    "looks_like_image_generation",
+]
 
 #: 技能脚本里声明张数的写法：``--count 3`` / ``-n 3`` / ``--num 3``。
 _SHELL_IMAGE_COUNT_RE = re.compile(
@@ -52,6 +55,39 @@ _SHELL_IMAGE_COUNT_RE = re.compile(
 )
 #: ``image_gen`` 工具里可能出现的张数字段名。
 _IMAGE_COUNT_KEYS = ("count", "n", "num_images", "number_of_images", "num")
+
+#: 默认的「生图」判定参数（与 ``RepeatGuardConfig`` 的默认值一致）。
+DEFAULT_IMAGE_GEN_TOOLS: tuple[str, ...] = ("image_gen",)
+DEFAULT_IMAGE_COMMAND_MARKERS: tuple[str, ...] = (
+    "agnes-image", "agnes_image", "image_generation", "imagegen",
+)
+
+
+def looks_like_image_generation(
+    tool_name: str,
+    params: Optional[dict[str, Any]] = None,
+    *,
+    image_gen_tools: tuple[str, ...] = DEFAULT_IMAGE_GEN_TOOLS,
+    command_markers: tuple[str, ...] = DEFAULT_IMAGE_COMMAND_MARKERS,
+) -> bool:
+    """这次工具调用是不是「生成图片」。
+
+    两条路都要认：原生 ``image_gen`` 工具；技能脚本形式 —— ``shell_execute``
+    跑 agnes-image 的 ``image_generation*.py``（本项目实际在走的那条）。
+
+    提到模块级是因为除了循环护栏，服务端还要用它决定「本轮生成了图 → 通知
+    前端自动预览」（见 ``server/main.py`` 的 toolEnd 帧）。
+    """
+    if tool_name in image_gen_tools:
+        return True
+    if tool_name not in ("shell_execute", "bash", "terminal"):
+        return False
+    try:
+        blob = json.dumps(params or {}, ensure_ascii=False).lower()
+    except (TypeError, ValueError):  # pragma: no cover - 参数不可序列化
+        blob = str(params).lower()
+    return any(m in blob for m in command_markers)
+
 
 
 @dataclass(frozen=True)
@@ -316,22 +352,12 @@ class RepeatGuard:
 
     # ─── strategy helpers ───────────────────────────────────────────────────
     def _is_image_generation(self, tool_name: str, params: dict[str, Any]) -> bool:
-        """这一次调用是不是「生成图片」。
-
-        两条路都要认：
-        * 原生 ``image_gen`` 工具；
-        * 技能脚本形式 —— ``shell_execute`` 跑 agnes-image 的
-          ``image_generation*.py``（本项目实际在走的那条）。
-        """
-        if tool_name in self.config.image_gen_tools:
-            return True
-        if tool_name not in ("shell_execute", "bash", "terminal"):
-            return False
-        try:
-            blob = json.dumps(params, ensure_ascii=False).lower()
-        except (TypeError, ValueError):  # pragma: no cover - 参数不可序列化
-            blob = str(params).lower()
-        return any(m in blob for m in self.config.image_command_markers)
+        """这一次调用是不是「生成图片」（详见模块级同名函数）。"""
+        return looks_like_image_generation(
+            tool_name, params,
+            image_gen_tools=self.config.image_gen_tools,
+            command_markers=self.config.image_command_markers,
+        )
 
     def _declared_image_count(
         self, tool_name: str, params: dict[str, Any]

@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -56,7 +57,9 @@ from ..settings.remote_models import (
 )
 from ..settings.store import SettingsError, SettingsStore
 from ..skills import SkillStore
+from ..agent.repeat_guard import looks_like_image_generation
 from . import chat_api, compaction, fs_api, scheduled_api, workspaces, chat_store
+from .media_scan import append_image_refs, collect_recent_images
 from .knowledge_api import router as knowledge_router
 from .guard_api import router as guard_router
 from .marketplace_api import router as marketplace_router
@@ -783,11 +786,22 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
         "cacheReadTokens": 0,
     }
 
+    #: 生图自动预览用：toolStart 记下参数与发起时刻，toolEnd 时据此判断
+    #: 「这是一次生图调用」并扫出本次新落盘的图片。
+    pending_tool_args: dict[str, dict] = {}
+    pending_tool_started: dict[str, float] = {}
+    #: 本轮自动生成的图片（绝对路径，去重），落库时补进回复正文。
+    generated_images: list[str] = []
+
     async def sink(chunk: object) -> None:
         if isinstance(chunk, LLMStreamChunk.Text):
             await _safe_send(client_id, {"type": "delta", "text": chunk.text})
         elif isinstance(chunk, LLMStreamChunk.ToolCallComplete):
             # Frontend renders this as a "tool starting" card.
+            # 记下参数与开始时间：toolEnd 时要判断这是不是一次生图调用，
+            # 以及「本次调用新落盘的图」是哪几张（自动预览用）。
+            pending_tool_args[chunk.id] = chunk.args or {}
+            pending_tool_started[chunk.id] = time.time()
             await _safe_send(client_id, {
                 "type": "toolStart",
                 "id": chunk.id,
@@ -799,13 +813,26 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
             body = chunk.content or ""
             if len(body) > 4000:
                 body = body[:4000] + "\n…(输出过长已截断)"
-            await _safe_send(client_id, {
+            frame: dict[str, Any] = {
                 "type": "toolEnd",
                 "id": chunk.id,
                 "name": chunk.name,
                 "ok": not chunk.is_error,
                 "output": body,
-            })
+            }
+            # 生图调用成功 → 顺手把本次新产生的图片路径带上，前端自动预览。
+            # 生图脚本只打印文件名，模型又常常忘记写 `![](路径)` —— 前端拿不到
+            # 可渲染路径时用户「图生成了但看不到」。
+            args = pending_tool_args.pop(chunk.id, None)
+            started = pending_tool_started.pop(chunk.id, None)
+            if not chunk.is_error and looks_like_image_generation(chunk.name, args):
+                images = collect_recent_images(since=started)
+                if images:
+                    frame["images"] = images
+                    for path in images:
+                        if path not in generated_images:
+                            generated_images.append(path)
+            await _safe_send(client_id, frame)
         elif isinstance(chunk, LLMStreamChunk.Usage):
             # Token usage of a finished assistant turn — surfaced to the
             # Web client so the chat can display per-step counts, and summed
@@ -871,6 +898,9 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
             final_text = "".join(
                 p.text for p in (tail.content_parts or []) if isinstance(p, Text)
             )
+            # 生图自动交付：模型忘了写 `![](路径)` 时补上，保证刷新/切换会话后
+            # 图片依然能渲染（即时那份由前端 toolEnd 帧的自动预览负责）。
+            final_text = append_image_refs(final_text, generated_images)
             if final_text.strip():
                 await chat_store.append_turn(
                     sid, "assistant", final_text,

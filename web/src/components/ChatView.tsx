@@ -31,6 +31,9 @@ interface UiMessage {
   role: 'user' | 'assistant'
   text: string
   toolCalls?: ToolCallCard[]
+  /** 本轮由工具**自动产出的图片**（后端随 toolEnd 帧推来的绝对路径）。
+   *  模型不写 `![](路径)` 时，界面也要能自动把它们预览出来。 */
+  generated?: string[]
 }
 
 interface ToolCallCard {
@@ -346,7 +349,13 @@ export function ChatView({
               ? { ...c, ok: frame.ok, output: frame.output }
               : c,
           )
-          list[list.length - 1] = { ...tail, toolCalls: cards }
+          // 生图自动预览：后端把本次新生成的图片路径带在 toolEnd 上，
+          // 直接挂到这条 assistant 消息（去重），无需模型写 markdown。
+          const incoming = frame.images ?? []
+          const generated = incoming.length
+            ? Array.from(new Set([...(tail.generated ?? []), ...incoming]))
+            : tail.generated
+          list[list.length - 1] = { ...tail, toolCalls: cards, generated }
           return list
         })
         break
@@ -645,6 +654,13 @@ function Bubble({
   const [copied, setCopied] = useState(false)
   const [deleting, setDeleting] = useState(false)
 
+  // 本轮工具自动产出的图片（后端随 toolEnd 推来）——正文里已经写过的剔除，
+  // 避免模型自己写了 `![](路径)` 时重复展示一遍。
+  const autoImages = useMemo(() => {
+    const mentioned = new Set(images.map((img) => img.src))
+    return (msg.generated ?? []).filter((src) => !mentioned.has(src))
+  }, [msg.generated, images])
+
   const copyText = async () => {
     try {
       await navigator.clipboard.writeText(msg.text)
@@ -736,6 +752,45 @@ function Bubble({
               <figcaption title={img.src}>🖼️ {img.alt}</figcaption>
             </figure>
           ))}
+        </div>
+      )}
+      {autoImages.length > 0 && (
+        <div className="bubble-generated">
+          <div className="bubble-generated-title">🖼️ 本轮生成</div>
+          <div className="bubble-attachments">
+            {autoImages.map((src) => {
+              const url = imageUrlFor(src)
+              const alt = src.split(/[\\/]/).pop() || '生成的图片'
+              return (
+                <figure key={src} className="bubble-attachment is-generated">
+                  {url ? (
+                    <img
+                      src={url}
+                      alt={alt}
+                      loading="lazy"
+                      title={`点击预览大图 · ${src}`}
+                      role="button"
+                      tabIndex={0}
+                      onClick={() => {
+                        if (url) openImagePreview({ url, alt, src })
+                      }}
+                      onKeyDown={(e) => {
+                        if ((e.key === 'Enter' || e.key === ' ') && url) {
+                          e.preventDefault()
+                          openImagePreview({ url, alt, src })
+                        }
+                      }}
+                      onError={(e) => {
+                        // 文件被清理 / 不在可读根内
+                        ;(e.currentTarget as HTMLImageElement).style.display = 'none'
+                      }}
+                    />
+                  ) : null}
+                  <figcaption title={src}>🖼️ {alt}</figcaption>
+                </figure>
+              )
+            })}
+          </div>
         </div>
       )}
       {msg.toolCalls && msg.toolCalls.length > 0 && (
