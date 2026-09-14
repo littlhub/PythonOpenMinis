@@ -4772,3 +4772,28 @@ dl.facts.usage-detail {
 .composer-attach-thumb .thumb-x:hover {
   background: var(--danger);
 }
+
+/* 「项目文件」里的图片预览（点图 → 灯箱放大） */
+.fs-image-stage {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 8px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  max-height: 320px;
+  overflow: auto;
+}
+.fs-image-stage img {
+  display: block;
+  max-width: 100%;
+  max-height: 296px;
+  width: auto;
+  height: auto;
+  border-radius: 6px;
+  cursor: zoom-in;
+}
+.fs-image-stage img:hover {
+  filter: brightness(0.96);
+}

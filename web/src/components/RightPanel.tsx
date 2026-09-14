@@ -1,6 +1,10 @@
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../api'
 import type { FsNode, HistoryEntry } from '../types'
+import { openImagePreview } from './ImageLightbox'
+
+/** 「项目文件」里可以直接当图片预览的扩展名（与后端 `/api/fs/raw` 放行的一致）。 */
+const IMAGE_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|svg|ico|avif)$/i
 
 interface RightPanelProps {
   activeSessionId: string | null
@@ -74,7 +78,22 @@ function FilesTab({ workspace }: { workspace?: string | null }) {
     size: number
   } | null>(null)
   const [previewError, setPreviewError] = useState<string | null>(null)
+  // 图片走独立预览（文本预览接口对二进制一律 415，图片得用 /api/fs/raw 回读）。
+  const [image, setImage] = useState<{
+    path: string
+    name: string
+    url: string
+  } | null>(null)
   const [loading, setLoading] = useState(false)
+
+  const rawUrl = useCallback(
+    (path: string) => {
+      const q = new URLSearchParams({ path })
+      if (workspace) q.set('workspace', workspace)
+      return `/api/fs/raw?${q.toString()}`
+    },
+    [workspace],
+  )
 
   const reload = useCallback(async () => {
     try {
@@ -104,15 +123,28 @@ function FilesTab({ workspace }: { workspace?: string | null }) {
     })
 
   const openFile = async (path: string) => {
-    setLoading(true)
+    const name = path.split(/[\\/]/).pop() || path
     setPreviewError(null)
+    // 图片：直接交给 /api/fs/raw 显示（文本预览接口遇到二进制会 415）。
+    if (IMAGE_EXT_RE.test(name)) {
+      setPreview(null)
+      setImage({ path, name, url: rawUrl(path) })
+      return
+    }
+    setImage(null)
+    setLoading(true)
     try {
       const ws = workspace || undefined
       const r = await api.fsRead(path, 80_000, ws)
       setPreview(r)
     } catch (e) {
       setPreview(null)
-      setPreviewError(String((e as Error).message))
+      const msg = String((e as Error).message)
+      setPreviewError(
+        /二进制/.test(msg)
+          ? `${name}：二进制文件，暂不支持文本预览（图片可直接预览）`
+          : msg,
+      )
     } finally {
       setLoading(false)
     }
@@ -149,6 +181,35 @@ function FilesTab({ workspace }: { workspace?: string | null }) {
               <div className="rp-empty">工作目录为空</div>
             )}
           </div>
+          {image && (
+            <div className="fs-preview fs-preview--image">
+              <div className="fs-preview-head">
+                <span className="fs-preview-name">{image.name}</span>
+                <span className="muted">图片 · 点击放大</span>
+                <button className="link" onClick={() => setImage(null)}>
+                  关闭
+                </button>
+              </div>
+              <div className="fs-image-stage">
+                <img
+                  src={image.url}
+                  alt={image.name}
+                  title={`点击预览大图 · ${image.path}`}
+                  onClick={() =>
+                    openImagePreview({
+                      url: image.url,
+                      alt: image.name,
+                      src: image.path,
+                    })
+                  }
+                  onError={() => {
+                    setImage(null)
+                    setPreviewError(`${image.name}：图片读取失败（文件可能已被删除）`)
+                  }}
+                />
+              </div>
+            </div>
+          )}
           {preview && (
             <div className="fs-preview">
               <div className="fs-preview-head">
@@ -241,6 +302,7 @@ function humanSize(n: number): string {
 }
 
 function iconFor(name: string): string {
+  if (IMAGE_EXT_RE.test(name)) return '🖼️'
   if (name.endsWith('.py')) return '🐍'
   if (name.endsWith('.ts') || name.endsWith('.tsx')) return '📘'
   if (name.endsWith('.js') || name.endsWith('.jsx')) return '📒'
