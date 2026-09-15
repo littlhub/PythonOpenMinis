@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api } from '../api'
-import type { ChatSessionInfo, ConsoleStatus, WorkspaceInfo } from '../types'
+import type {
+  ChatSessionInfo,
+  ConsoleStatus,
+  SubagentInfo,
+  WorkspaceInfo,
+} from '../types'
 
 export type ViewId = 'chat' | 'workspaces' | 'sandbox' | 'settings' | 'projects' | 'knowledge' | 'memory' | 'skills' | 'market' | 'channels' | 'scheduler'
 
@@ -24,10 +29,22 @@ const MANAGE_NAV: NavItem[] = [
   { id: 'scheduler', label: '定时', icon: '⏰' },
 ]
 
+// 「项目和沙箱」尾部导航（沙箱在前）。
 const TAIL_NAV: NavItem[] = [
-  { id: 'projects', label: '项目', icon: '◇' },
   { id: 'sandbox', label: '沙箱', icon: '⏚' },
+  { id: 'projects', label: '项目', icon: '◇' },
 ]
+
+// 「管理」折叠组各项的一句话描述（折叠态右弹面板里显示）。
+const MANAGE_DESC: Record<string, string> = {
+  workspaces: '子代理与模型配置',
+  knowledge: '知识库与图谱',
+  memory: '长期记忆与偏好',
+  skills: '内置与自定义技能',
+  market: '技能广场',
+  channels: '模型服务通道',
+  scheduler: '定时任务',
+}
 
 const MANAGE_STORAGE_KEY = 'openminis:nav-manage'
 // 「聊天」折叠组同理：点开向下弹出会话列表，记住开关状态。
@@ -84,19 +101,31 @@ export function Sidebar(props: SidebarProps) {
   const [lastManageView, setLastManageView] = useState<ViewId>('workspaces')
 
   // 折叠态右弹抽屉：左边栏收成窄条时，点「聊天」/「管理」图标从图标右侧
-  // 弹出悬浮面板（好友栏 = 会话列表 / 管理项），点空白处收起。
+  // 弹出悬浮面板（好友栏 = 好友 + 会话 / 管理项），点空白处收起。
   const [flyout, setFlyout] = useState<null | {
     kind: 'chat' | 'manage'
     top: number
     left: number
   }>(null)
+  // 好友栏的「好友」段：助理页配置的子代理（带描述）。
+  const [friends, setFriends] = useState<SubagentInfo[]>([])
+
+  const loadFriends = useCallback(async () => {
+    try {
+      const r = await api.subagentsList()
+      setFriends(r.subagents ?? [])
+    } catch {
+      /* 助理页还没配过子代理 —— 好友栏就只剩你和主代理 */
+    }
+  }, [])
 
   // 展开左边栏时右弹抽屉自然作废。
   useEffect(() => {
     if (!props.collapsed) setFlyout(null)
   }, [props.collapsed])
 
-  /** 折叠态：以被点图标为锚，在它右侧开一个悬浮抽屉。 */
+  /** 折叠态：以被点图标为锚，在它右侧开一个悬浮抽屉。
+   *  「聊天」同时切到聊天页（当前会话不动），面板叠加在上面选。 */
   const openFlyout = (
     kind: 'chat' | 'manage',
     e: React.MouseEvent<HTMLButtonElement>,
@@ -104,9 +133,11 @@ export function Sidebar(props: SidebarProps) {
     const r = e.currentTarget.getBoundingClientRect()
     setFlyout({
       kind,
-      top: Math.max(8, Math.min(r.top, window.innerHeight - 360)),
+      top: Math.max(8, Math.min(r.top, window.innerHeight - 420)),
       left: r.right + 6,
     })
+    if (kind === 'chat') props.onChangeView('chat')
+    void loadFriends()
   }
 
   const closeFlyout = () => setFlyout(null)
@@ -448,6 +479,52 @@ export function Sidebar(props: SidebarProps) {
           >
             {flyout.kind === 'chat' ? (
               <>
+                {/* 好友段：你 / 主代理 / 助理页的子代理（带一句话描述） */}
+                <div className="nav-flyout-title">好友</div>
+                <div className="nav-flyout-list">
+                  <button
+                    className="flyout-friend"
+                    onClick={closeFlyout}
+                    title="你（登录的用户）"
+                  >
+                    <span className="ic">🙋</span>
+                    <span className="flyout-friend-txt">
+                      <b>你</b>
+                      <i>登录的用户</i>
+                    </span>
+                  </button>
+                  <button
+                    className="flyout-friend"
+                    onClick={closeFlyout}
+                    title="主代理（替你和子代理对接）"
+                  >
+                    <span className="ic">🧭</span>
+                    <span className="flyout-friend-txt">
+                      <b>主代理</b>
+                      <i>替你和子代理对接</i>
+                    </span>
+                  </button>
+                  {friends.map((f) => (
+                    <button
+                      key={f.id}
+                      className="flyout-friend"
+                      onClick={closeFlyout}
+                      title={f.description || f.id}
+                    >
+                      <span className="ic">{f.emoji || '🤖'}</span>
+                      <span className="flyout-friend-txt">
+                        <b>{f.name}</b>
+                        <i>{f.description || f.id}</i>
+                      </span>
+                    </button>
+                  ))}
+                  {friends.length === 0 && (
+                    <div className="nav-flyout-empty">
+                      还没有子代理 —— 去「管理 · 助理」创建
+                    </div>
+                  )}
+                </div>
+
                 <div className="nav-flyout-title">
                   会话<span className="badge">{totalCount}</span>
                 </div>
@@ -481,16 +558,20 @@ export function Sidebar(props: SidebarProps) {
                   {MANAGE_NAV.map((n) => (
                     <button
                       key={n.id}
-                      className={`nav-item sub ${
+                      className={`flyout-friend ${
                         props.view === n.id ? 'active' : ''
                       }`}
                       onClick={() => {
                         props.onChangeView(n.id)
                         closeFlyout()
                       }}
+                      title={MANAGE_DESC[n.id] || n.label}
                     >
                       <span className="ic">{n.icon}</span>
-                      <span className="lbl">{n.label}</span>
+                      <span className="flyout-friend-txt">
+                        <b>{n.label}</b>
+                        <i>{MANAGE_DESC[n.id]}</i>
+                      </span>
                     </button>
                   ))}
                 </div>
