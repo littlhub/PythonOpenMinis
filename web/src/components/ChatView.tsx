@@ -25,9 +25,6 @@ import { openImagePreview } from './ImageLightbox'
 interface ChatViewProps {
   activeSessionId: string | null
   onChangeSession: (id: string) => void
-  /** 微信式布局：聊天页有自己的「好友栏」，盖住应用的左边栏；
-   *  点「返回」回到上一个页面（没有上一个页面时不渲染这个按钮）。 */
-  onExitChat?: () => void
 }
 
 interface UiMessage {
@@ -306,7 +303,6 @@ function splitAttachments(text: string): {
 export function ChatView({
   activeSessionId,
   onChangeSession,
-  onExitChat,
 }: ChatViewProps) {
   // sessions list (for the small "switch" chip + the new-session button on top)
   const [sessions, setSessions] = useState<ChatSessionInfo[]>([])
@@ -973,90 +969,6 @@ export function ChatView({
   // -- render --------------------------------------------------------------
   return (
     <div className="view chat chat-with-rail">
-      {/* 微信式「好友栏」：盖住应用的左边栏 —— 顶部是返回 + 新建，下面是
-          「好友」（群里的人与可拉进群的子代理）和「会话」两段列表。 */}
-      <aside className="chat-contacts">
-        <div className="cc-head">
-          {onExitChat && (
-            <button className="cc-back" onClick={onExitChat} title="返回上一页">
-              ❮ 返回
-            </button>
-          )}
-          <button
-            className="cc-new"
-            onClick={() => void createChatHere(null)}
-            title="新建会话"
-          >
-            ＋ 新建
-          </button>
-        </div>
-
-        <div className="cc-scroll">
-          <div className="cc-section">好友</div>
-          <button className="cc-item is-static" title="你">
-            <span className="cc-ava is-user">{USER_SPEAKER.emoji}</span>
-            <span className="cc-name">你</span>
-          </button>
-          <button className="cc-item is-static" title="主代理（替你和子代理对接）">
-            <span className="cc-ava is-main">{MAIN_SPEAKER.emoji}</span>
-            <span className="cc-name">主代理</span>
-          </button>
-          {candidates.map((c) => {
-            const inGroup = roster.some((m) => m.id === c.id)
-            return (
-              <button
-                key={c.id}
-                className={`cc-item${inGroup ? ' in-group' : ''}`}
-                title={
-                  inGroup
-                    ? `${c.name} 在群里 —— 点一下请出群`
-                    : `点一下把 ${c.name} 拉进群聊`
-                }
-                onClick={() => toggleMember(c.id, 'agent', c.name || c.id)}
-              >
-                <span className="cc-ava">{c.emoji || '🤖'}</span>
-                <span className="cc-name">{c.name}</span>
-                {inGroup && <span className="cc-badge">群</span>}
-              </button>
-            )
-          })}
-          {humanSeats.map((m) => (
-            <button
-              key={m.id}
-              className="cc-item in-group is-kind-human"
-              title={`${m.name}（真人席位）—— 点一下请出群`}
-              onClick={() => toggleMember(m.id, 'human', m.name)}
-            >
-              <span className="cc-ava">{GROUP_KIND_ICON.human}</span>
-              <span className="cc-name">{m.name}</span>
-              <span className="cc-badge">人</span>
-            </button>
-          ))}
-
-          <div className="cc-section">
-            会话<span className="cc-count">{sessions.length}</span>
-          </div>
-          {sessions.length === 0 && <div className="cc-empty">暂无会话</div>}
-          {sessions.map((s) => {
-            const ws = s.folderId
-              ? workspaces.find((w) => w.id === s.folderId)
-              : undefined
-            return (
-              <button
-                key={s.id}
-                className={`cc-item${s.id === activeSessionId ? ' active' : ''}`}
-                title={ws ? `${ws.name} · ${s.title}` : s.title}
-                onClick={() => onChangeSession(s.id)}
-              >
-                <span className="cc-ava">{ws ? '📁' : '💬'}</span>
-                <span className="cc-name">{s.title}</span>
-                {ws && <span className="cc-badge">{ws.name}</span>}
-              </button>
-            )
-          })}
-        </div>
-      </aside>
-
       <section className="chat-main">
         <div className="chat-topbar">
           <div className="picker" ref={pickerRef}>

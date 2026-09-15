@@ -30,6 +30,8 @@ const TAIL_NAV: NavItem[] = [
 ]
 
 const MANAGE_STORAGE_KEY = 'openminis:nav-manage'
+// 「聊天」折叠组同理：点开向下弹出会话列表，记住开关状态。
+const CHAT_STORAGE_KEY = 'openminis:nav-chat'
 
 interface SidebarProps {
   view: ViewId
@@ -67,6 +69,14 @@ export function Sidebar(props: SidebarProps) {
   const [manageOpen, setManageOpen] = useState<boolean>(() => {
     try {
       return localStorage.getItem(MANAGE_STORAGE_KEY) === '1'
+    } catch {
+      return false
+    }
+  })
+  // 「聊天」折叠组：与「管理」同款 —— 点聊天向下弹出会话列表，再点收起。
+  const [chatOpen, setChatOpen] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem(CHAT_STORAGE_KEY) === '1'
     } catch {
       return false
     }
@@ -151,6 +161,22 @@ export function Sidebar(props: SidebarProps) {
         localStorage.setItem(MANAGE_STORAGE_KEY, next ? '1' : '0')
       } catch {
         /* 隐私模式下 localStorage 可能不可用，忽略 */
+      }
+      return next
+    })
+  }
+
+  // 「聊天」组的展开开关；与「管理」一样，当前页在组里时强制展开。
+  const chatActive = props.view === 'chat'
+  const chatExpanded = chatOpen || chatActive
+
+  const toggleChat = () => {
+    setChatOpen((v) => {
+      const next = !v
+      try {
+        localStorage.setItem(CHAT_STORAGE_KEY, next ? '1' : '0')
+      } catch {
+        /* 忽略 */
       }
       return next
     })
@@ -270,16 +296,52 @@ export function Sidebar(props: SidebarProps) {
       <nav className="nav-list">
         {TOP_NAV.map((n) => {
           if (n.id === 'chat') {
+            // 「聊天」= 折叠组（与「管理」同款）：点头向下弹出会话列表，
+            // 不再弹第二栏；当前页在聊天时强制展开。
             return (
-              <button
+              <div
                 key={n.id}
-                className={`nav-item ${props.view === 'chat' ? 'active' : ''}`}
-                onClick={() => props.onChangeView('chat')}
-                title="跳到最近一个会话"
+                className={`nav-group ${chatExpanded ? 'open' : ''}`}
               >
-                <span className="ic">{n.icon === '＋' ? '＋' : n.icon}</span>
-                <span>{n.label}</span>
-              </button>
+                <button
+                  className={`nav-item nav-group-head ${chatActive ? 'active' : ''}`}
+                  onClick={() => {
+                    toggleChat()
+                    props.onChangeView('chat')
+                  }}
+                  title={chatExpanded ? '收起会话列表' : '展开会话列表'}
+                >
+                  <span className="caret">{chatExpanded ? '⌄' : '›'}</span>
+                  <span className="ic">{n.icon}</span>
+                  <span className="lbl">{n.label}</span>
+                  <span className="badge">{totalCount}</span>
+                </button>
+                {chatExpanded && (
+                  <div className="nav-sublist">
+                    {sessions.length === 0 && (
+                      <button className="nav-item sub" disabled>
+                        暂无会话
+                      </button>
+                    )}
+                    {sessions.map((s) => (
+                      <button
+                        key={s.id}
+                        className={`nav-item sub ${
+                          props.activeSessionId === s.id ? 'active' : ''
+                        }`}
+                        onClick={() => {
+                          props.onSelectSession(s.id)
+                          props.onChangeView('chat')
+                        }}
+                        title={s.title}
+                      >
+                        <span className="ic">💬</span>
+                        <span className="lbl">{s.title}</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
             )
           }
           return (
