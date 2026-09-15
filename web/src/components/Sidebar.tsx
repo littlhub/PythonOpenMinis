@@ -161,6 +161,8 @@ export function Sidebar(props: SidebarProps) {
     if (manageActive) setLastManageView(props.view)
   }, [manageActive, props.view])
 
+  /** 点「管理」头：与「聊天」同款 —— 抽屉开合 + 跳到上次的管理页
+   *  （默认「助理」；人已在某管理页时跳转是空操作）。 */
   const toggleManage = () => {
     const willExpand = !manageOpen
     setManageOpen(willExpand)
@@ -169,11 +171,9 @@ export function Sidebar(props: SidebarProps) {
     } catch {
       /* 隐私模式下 localStorage 可能不可用，忽略 */
     }
-    if (willExpand) {
-      props.onChangeView(
-        manageActive ? props.view : lastManageView || 'workspaces',
-      )
-    }
+    props.onChangeView(
+      manageActive ? props.view : lastManageView || 'workspaces',
+    )
   }
 
   // 「聊天」组的展开开关；抽屉是纯开关（不再被「当前页」强制展开 ——
@@ -181,7 +181,8 @@ export function Sidebar(props: SidebarProps) {
   const chatActive = props.view === 'chat'
   const chatExpanded = chatOpen
 
-  /** 点「聊天」头：收起状态 → 展开抽屉 + 跳到聊天；已展开 → 只收抽屉。 */
+  /** 点「聊天」头：抽屉开合 + 始终跳到聊天（人已在聊天页时，跳转是空操作
+   *  —— 效果就是「只折叠抽屉」）。 */
   const toggleChat = () => {
     const willExpand = !chatOpen
     setChatOpen(willExpand)
@@ -190,7 +191,7 @@ export function Sidebar(props: SidebarProps) {
     } catch {
       /* 忽略 */
     }
-    if (willExpand) props.onChangeView('chat')
+    props.onChangeView('chat')
   }
 
   const reloadWorkspaces = useCallback(async () => {
