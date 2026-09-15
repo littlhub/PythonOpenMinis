@@ -50,6 +50,49 @@ export type ServerFrame =
       /** 本次调用新生成、可直接预览的图片（本地绝对路径）—— 生图自动预览用。 */
       images?: string[]
     }
+  // ---------------------------------------------------------------------
+  // 群聊可视化：子代理跑起来时后端把它的过程单独推过来（`id` = 外层那次
+  // `subagent_delegate` 调用的 id，前端据此把子代理气泡归到对应的工具卡）。
+  // ---------------------------------------------------------------------
+  | {
+      type: 'subagentStart'
+      id: string
+      subagentId: string
+      name: string
+      emoji: string
+      model?: string
+      task: string
+      /** 这个成员被分配到的项目目录（绝对路径）；没分配时为空。 */
+      project?: string
+    }
+  | { type: 'subagentDelta'; id: string; subagentId: string; text: string }
+  | {
+      type: 'subagentToolStart'
+      id: string
+      subagentId: string
+      callId: string
+      name: string
+      input: Record<string, unknown>
+    }
+  | {
+      type: 'subagentToolEnd'
+      id: string
+      subagentId: string
+      callId: string
+      name: string
+      ok: boolean
+      output: string
+      /** 子代理本次调用新生成的图片（绝对路径）—— 与主代理同样自动预览。 */
+      images?: string[]
+    }
+  | {
+      type: 'subagentEnd'
+      id: string
+      subagentId: string
+      ok: boolean
+      text: string
+      stopReason?: string
+    }
   | {
       type: 'usage'
       inputTokens: number
@@ -75,6 +118,18 @@ export interface ChatMessageInfo {
   role: 'user' | 'assistant'
   text: string
   createdAt: number
+}
+
+/** 群聊里的一个「发言人」（主代理 / 子代理 / 你）。 */
+export interface Speaker {
+  /** 唯一 id：`user` / `main` / 子代理实例 id。 */
+  id: string
+  name: string
+  emoji: string
+  /** `main` = 主代理；`sub` = 子代理；`user` = 用户。 */
+  kind: 'user' | 'main' | 'sub'
+  /** 该发言人被分配到的项目目录（绝对路径），没分配时不填。 */
+  project?: string
 }
 
 // ---------------------------------------------------------------------------

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from typing import Any
 
 from ..core.logging import get_logger
@@ -42,6 +43,7 @@ __all__ = [
     "plan_subagent",
     "run_subagent",
     "find_vision_subagent",
+    "group_block",
 ]
 
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
@@ -427,6 +429,39 @@ def SettingsStore_get():
 
 
 # ---------------------------------------------------------------------------
+# 群聊成员 —— 用户把子代理「拉进群」后，主代理要认识这些同事。
+# ---------------------------------------------------------------------------
+def group_block(store, ids: list[str]) -> str:
+    """把「拉进群的子代理」写成一段系统提示。
+
+    用户在聊天页把子代理拉进群聊后，主代理得知道这些同事在场、各自擅长什么，
+    才会在合适的时候委派 —— 否则「拉群」只是个摆设。只列**真实存在**的 id
+    （前端可能带着陈旧或编造的 id），并把 id 原样写清楚，模型才能直接拿去
+    ``subagent_delegate(subagent="…")``。
+    """
+    rows: list[str] = []
+    for raw in ids:
+        cfg = get_subagent(store, str(raw))
+        if cfg is None:
+            continue
+        bits = [f"- `{cfg.get('id')}`（{cfg.get('name') or cfg.get('id')}"
+                f"{cfg.get('emoji') or ''}）"]
+        desc = (cfg.get("description") or "").strip()
+        if desc:
+            bits.append(f"：{desc}")
+        rows.append("".join(bits))
+    if not rows:
+        return ""
+    return (
+        "\n\n【群聊成员】用户把下面这些子代理拉进了本会话，它们是你可以委派的同事：\n"
+        + "\n".join(rows)
+        + "\n需要它们的专长时用 `subagent_delegate` 指派（`subagent` 填上面的 id）；"
+        "任务是它们自己的活儿、与主线无关时不要硬派。用户的提问若是直接点名某位成员，"
+        "就委派给那一位。"
+    )
+
+
+# ---------------------------------------------------------------------------
 # 运行子代理 —— 主 agent 的 subagent_delegate 工具与后端「识图」都走这里。
 # ---------------------------------------------------------------------------
 async def run_subagent(
@@ -470,7 +505,84 @@ async def run_subagent(
     }
     persona = cfg.get("persona") or f"你是「{cfg.get('name', subagent_id)}」。用中文回复。"
 
-    runtime = AgentRuntime(tools=inner_tools)  # 内层循环静默，不往外推流
+    # ── 群聊可视化：把内层循环的过程接出去 ─────────────────────────────────
+    # 前端把每个子代理当作群聊里的一个「发言人」。没有听众时（测试/CLI/子代理
+    # 内部的识图链路）整套事件是空操作，内层循环照旧静默。
+    from .subagent_events import active as _events_active
+    from .subagent_events import current_tool_use, emit as emit_event, project_for
+    from .repeat_guard import looks_like_image_generation
+
+    emit_events = _events_active()
+    #: 这次委派挂在哪个外层工具调用下面（前端据此归到那张工具卡）。
+    room = current_tool_use().get("id") or f"sub-{subagent_id}-{int(time.time() * 1000)}"
+
+    # 「分配项目」：这个成员被指定了项目 → 它的 shell root 到那个目录，
+    # 而不是会话默认的工作空间 —— 群聊里每个成员可以各写各的项目目录。
+    project_dir = project_for(subagent_id)
+    if project_dir:
+        try:
+            from pathlib import Path
+
+            from ..tools.shell_execute_tool import get_coordinator
+
+            get_coordinator().set_session_cwd(
+                f"{session_id}:sub:{subagent_id}", Path(project_dir)
+            )
+        except Exception:  # pragma: no cover - 分配失败不该打断委派
+            logger.debug("subagent project cwd failed", exc_info=True)
+
+    speaker = {
+        "id": room,
+        "subagentId": cfg.get("id") or subagent_id,
+        "name": cfg.get("name") or subagent_id,
+        "emoji": cfg.get("emoji") or "🤖",
+        "model": conf.get("model", ""),
+        "project": project_dir or "",
+    }
+
+    inner_sink = None
+    if emit_events:
+        #: 子代理自己的生图调用也要能自动预览 —— 与主代理同一条规矩：脚本只打印
+        #: 文件名，模型又常忘记写 `![](路径)`，光靠它自觉用户就看不到图。
+        sub_args: dict[str, dict] = {}
+        sub_started: dict[str, float] = {}
+
+        async def inner_sink(chunk: object) -> None:  # type: ignore[misc]
+            if isinstance(chunk, LLMStreamChunk.Text):
+                await emit_event({**speaker, "type": "subagentDelta",
+                                  "text": chunk.text})
+            elif isinstance(chunk, LLMStreamChunk.ToolCallComplete):
+                sub_args[chunk.id] = chunk.args or {}
+                sub_started[chunk.id] = time.time()
+                await emit_event({**speaker, "type": "subagentToolStart",
+                                  "callId": chunk.id, "name": chunk.name,
+                                  "input": chunk.args or {}})
+            elif isinstance(chunk, LLMStreamChunk.ToolResult):
+                body = chunk.content or ""
+                if len(body) > 4000:
+                    body = body[:4000] + "\n…(输出过长已截断)"
+                event = {**speaker, "type": "subagentToolEnd",
+                         "callId": chunk.id, "name": chunk.name,
+                         "ok": not chunk.is_error, "output": body}
+                args = sub_args.pop(chunk.id, None)
+                started = sub_started.pop(chunk.id, None)
+                if not chunk.is_error and looks_like_image_generation(
+                    chunk.name, args
+                ):
+                    # 延迟 import：media_scan 住在 server 包，顶层 import 会造成
+                    # agent → server → agent 的循环。
+                    from ..server.media_scan import collect_recent_images
+
+                    images = collect_recent_images(since=started)
+                    if images:
+                        event["images"] = images
+                await emit_event(event)
+
+        await emit_event({**speaker, "type": "subagentStart", "task": task})
+
+    # 内层循环：默认静默；有听众时把过程推出去（子代理自己不会再委派 ——
+    # ``subagent_delegate`` 已在上面被剔掉）。
+    runtime = AgentRuntime(tools=inner_tools, chunk_sink=inner_sink)
     messages: list[LLMMessage] = [LLMMessage(LLMMessage.Role.USER, task)]
     try:
         # 子代理里的 ``read_image`` 与主对话走**同一条路**：识图槽转文字描述。
@@ -503,6 +615,10 @@ async def run_subagent(
             if isinstance(text, str) and text.strip():
                 parts.append(text)
     body = "\n\n".join(parts).strip()
+    if emit_events:
+        await emit_event({**speaker, "type": "subagentEnd",
+                          "ok": bool(body), "text": body,
+                          "stopReason": stop_reason or ""})
     return body or f"(subagent 未产出文字，stop_reason={stop_reason})"
 
 

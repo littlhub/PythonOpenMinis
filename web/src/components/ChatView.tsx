@@ -15,6 +15,8 @@ import type {
   ChatMessageInfo,
   ChatSessionInfo,
   ServerFrame,
+  Speaker,
+  SubagentInfo,
   WorkspaceInfo,
 } from '../types'
 import { RightPanel } from './RightPanel'
@@ -34,6 +36,119 @@ interface UiMessage {
   /** 本轮由工具**自动产出的图片**（后端随 toolEnd 帧推来的绝对路径）。
    *  模型不写 `![](路径)` 时，界面也要能自动把它们预览出来。 */
   generated?: string[]
+  /** 群聊发言人。子代理消息才有；主代理/用户消息不填（＝主代理）。 */
+  speaker?: Speaker
+  /** 子代理房间 = 外层那次 `subagent_delegate` 调用的 id。 */
+  roomId?: string
+  /** 子代理交给它的任务（subagentStart 帧带上来，显示在气泡头部）。 */
+  subTask?: string
+  /** 子代理在自己循环里调的工具（与主代理的 toolCalls 分开渲染）。 */
+  subTools?: ToolCallCard[]
+  /** 子代理是否已收尾（收尾后折叠它的工具过程）。 */
+  subDone?: boolean
+}
+
+/** 主代理在群聊里的固定身份（用户是「你」，子代理各自有名字）。 */
+const MAIN_SPEAKER: Speaker = {
+  id: 'main',
+  name: '主代理',
+  emoji: '🧭',
+  kind: 'main',
+}
+const USER_SPEAKER: Speaker = {
+  id: 'user',
+  name: '你',
+  emoji: '🙋',
+  kind: 'user',
+}
+/** 「显示子代理过程」开关 —— 群聊里子代理的发言/工具是否展开。 */
+const SHOW_SUB_KEY = 'openminis:group:showSub'
+
+/** 群成员名单按会话存本地（刷新/切回同一个会话仍在群里）。 */
+function groupKey(sessionId: string): string {
+  return `openminis:group:members:${sessionId}`
+}
+function loadGroup(sessionId: string | null): string[] {
+  if (!sessionId) return []
+  try {
+    const raw = localStorage.getItem(groupKey(sessionId))
+    const parsed = raw ? JSON.parse(raw) : []
+    return Array.isArray(parsed) ? parsed.filter((x) => typeof x === 'string') : []
+  } catch {
+    return []
+  }
+}
+function saveGroup(sessionId: string | null, ids: string[]): void {
+  if (!sessionId) return
+  try {
+    localStorage.setItem(groupKey(sessionId), JSON.stringify(ids))
+  } catch {
+    /* 隐私模式下写不了，忽略 */
+  }
+}
+
+/** 「分配项目」：成员 id → 工作空间 id。 */
+function memberProjectsKey(sessionId: string): string {
+  return `openminis:group:projects:${sessionId}`
+}
+function loadMemberProjects(sessionId: string | null): Record<string, string> {
+  if (!sessionId) return {}
+  try {
+    const raw = localStorage.getItem(memberProjectsKey(sessionId))
+    const parsed = raw ? JSON.parse(raw) : {}
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {}
+    const out: Record<string, string> = {}
+    for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+      if (typeof v === 'string' && v) out[k] = v
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+function saveMemberProjects(
+  sessionId: string | null,
+  mapping: Record<string, string>,
+): void {
+  if (!sessionId) return
+  try {
+    localStorage.setItem(memberProjectsKey(sessionId), JSON.stringify(mapping))
+  } catch {
+    /* 忽略 */
+  }
+}
+
+/** 找最后一条**主代理**消息的下标（子代理消息不该被主代理的工具结果污染）。 */
+function lastMainIndex(list: UiMessage[]): number {
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const m = list[i]
+    if (m.role === 'assistant' && !m.speaker) return i
+  }
+  return -1
+}
+
+/** 找某个子代理房间里的最后一条气泡（同一个子代理可能被委派多次）。 */
+function lastSubIndex(
+  list: UiMessage[],
+  roomId: string,
+  subagentId: string,
+): number {
+  for (let i = list.length - 1; i >= 0; i -= 1) {
+    const m = list[i]
+    if (m.speaker?.kind === 'sub' && m.roomId === roomId && m.speaker.id === subagentId) {
+      return i
+    }
+  }
+  return -1
+}
+
+function newMainMessage(): UiMessage {
+  return {
+    id: `tmp-${Date.now()}`,
+    role: 'assistant',
+    text: '',
+    toolCalls: [],
+  }
 }
 
 interface ToolCallCard {
@@ -163,6 +278,30 @@ export function ChatView({
   // 存在 settings.agent.loopMode，聊天页顶部可直接切换（下一轮对话生效）。
   const [loopMode, setLoopMode] = useState<'react' | 'kt'>('react')
 
+  // ── 群聊 ────────────────────────────────────────────────────────────────
+  // 主代理与被拉进群的子代理在同一个聊天框里说话：子代理的发言、它自己调的
+  // 工具都由后端的 subagent* 系列帧推来。`seen` 是**实际出现过的**子代理
+  // （比名单更真实 —— 模型自己委派出去的也算），名单则是用户手动拉进来的。
+  const [roster, setRoster] = useState<string[]>([])
+  const [seen, setSeen] = useState<Speaker[]>([])
+  const [candidates, setCandidates] = useState<SubagentInfo[]>([])
+  const [groupOpen, setGroupOpen] = useState(false)
+  const [showSub, setShowSub] = useState(true)
+  /** 「分配项目」：成员 id → 工作空间 id（子代理各写各的项目目录）。 */
+  const [memberProjects, setMemberProjects] = useState<Record<string, string>>({})
+  const [projectOpen, setProjectOpen] = useState(false)
+  const memberProjectsRef = useRef<Record<string, string>>({})
+  const projectRef = useRef<HTMLDivElement | null>(null)
+  const groupRef = useRef<HTMLDivElement | null>(null)
+  const rosterRef = useRef<string[]>([])
+  const seenRef = useRef<Speaker[]>([])
+  // 新增的子代理/工具结果只在**本轮**内有效；换会话时清空。
+  const rememberSub = useCallback((sp: Speaker) => {
+    if (seenRef.current.some((s) => s.id === sp.id)) return
+    seenRef.current = [...seenRef.current, sp]
+    setSeen(seenRef.current)
+  }, [])
+
   const socketRef = useRef<OpenSocketHandle | null>(null)
   const [socketState, setSocketState] = useState<SocketState>('connecting')
   const activeIdRef = useRef<string | null>(activeSessionId)
@@ -197,6 +336,113 @@ export function ChatView({
     }
   }, [])
 
+  // -- 群聊：可拉进来的子代理清单（助理页配好的那些）-----------------------
+  useEffect(() => {
+    let alive = true
+    api
+      .subagentsList()
+      .then((r) => {
+        if (alive) setCandidates(r.subagents ?? [])
+      })
+      .catch(() => {
+        /* 助理页还没配过子代理，或读不到 —— 群聊就只剩主代理 */
+      })
+    return () => {
+      alive = false
+    }
+  }, [])
+
+  // 子代理过程的展开开关（全局偏好，存本地）。
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(SHOW_SUB_KEY)
+      if (raw === '0') setShowSub(false)
+    } catch {
+      /* 隐私模式 */
+    }
+  }, [])
+  const toggleShowSub = useCallback(() => {
+    setShowSub((v) => {
+      const next = !v
+      try {
+        localStorage.setItem(SHOW_SUB_KEY, next ? '1' : '0')
+      } catch {
+        /* 忽略 */
+      }
+      return next
+    })
+  }, [])
+
+  // 换会话 → 载入该会话的群成员名单与「分配项目」，并清掉上一会话看到的子代理。
+  useEffect(() => {
+    const ids = loadGroup(activeSessionId)
+    rosterRef.current = ids
+    setRoster(ids)
+    const projects = loadMemberProjects(activeSessionId)
+    memberProjectsRef.current = projects
+    setMemberProjects(projects)
+    seenRef.current = []
+    setSeen([])
+    setGroupOpen(false)
+    setProjectOpen(false)
+  }, [activeSessionId])
+
+  const toggleMember = useCallback(
+    (id: string) => {
+      const cur = rosterRef.current
+      const next = cur.includes(id)
+        ? cur.filter((x) => x !== id)
+        : [...cur, id]
+      rosterRef.current = next
+      setRoster(next)
+      saveGroup(activeSessionId, next)
+      // 请出群的人顺带清掉它的项目分配，免得下次拉回来还带着旧目录。
+      if (!next.includes(id)) setMemberProject(id, '')
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [activeSessionId],
+  )
+
+  /** 给某个成员分配项目（``folderId`` 传空字符串 = 取消分配）。 */
+  const setMemberProject = useCallback(
+    (memberId: string, folderId: string) => {
+      const next = { ...memberProjectsRef.current }
+      if (folderId) next[memberId] = folderId
+      else delete next[memberId]
+      memberProjectsRef.current = next
+      setMemberProjects(next)
+      saveMemberProjects(activeSessionId, next)
+    },
+    [activeSessionId],
+  )
+
+  /** 群（会话）自己的项目 —— 就是会话所属的工作空间，改了立刻持久化。 */
+  // （实现在 reloadSessions/reloadWorkspaces 之后 —— 它俩要先声明。）
+
+  // 点开群成员浮层时，点空白处收起。
+  useEffect(() => {
+    if (!groupOpen) return
+    const onDoc = (e: MouseEvent) => {
+      if (groupRef.current && !groupRef.current.contains(e.target as Node)) {
+        setGroupOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', onDoc)
+    return () => document.removeEventListener('mousedown', onDoc)
+  }, [groupOpen])
+
+  // 项目浮层同理。
+  useEffect(() => {
+    if (!projectOpen) return
+    const onDoc = (e: MouseEvent) => {
+      if (projectRef.current && !projectRef.current.contains(e.target as Node)) {
+        setProjectOpen(false)
+      }
+    }
+    document.addEventListener('mousedown', onDoc)
+    return () => document.removeEventListener('mousedown', onDoc)
+  }, [projectOpen])
+
   // -- reload helpers --------------------------------------------------------
   const reloadSessions = useCallback(async () => {
     try {
@@ -220,6 +466,23 @@ export function ChatView({
     void reloadSessions()
     void reloadWorkspaces()
   }, [reloadSessions, reloadWorkspaces])
+
+  /** 群（会话）自己的项目 —— 就是会话所属的工作空间，改了立刻持久化。
+   *  落库后沙箱目录、右侧「项目文件」根都会跟着这个项目走。 */
+  const setGroupProject = useCallback(
+    async (folderId: string | null) => {
+      if (!activeSessionId) return
+      try {
+        await api.chatMove(activeSessionId, folderId)
+        await reloadSessions()
+        await reloadWorkspaces()
+        setProjectOpen(false)
+      } catch (e) {
+        setError(String((e as Error).message))
+      }
+    },
+    [activeSessionId, reloadSessions, reloadWorkspaces],
+  )
 
   // -- load messages when active session changes ----------------------------
   useEffect(() => {
@@ -262,7 +525,18 @@ export function ChatView({
       return
     }
     setBusy(true)
-    ws.send(JSON.stringify({ type: 'chat', text, sessionId: sid }))
+    // 把「群成员」随消息一起带上：后端据此把它们写进系统提示，主代理才知道
+    // 群里有这些同事、可以委派给谁。
+    ws.send(
+      JSON.stringify({
+        type: 'chat',
+        text,
+        sessionId: sid,
+        participants: rosterRef.current,
+        // 「分配项目」：成员 → 工作空间 id（后端解析成目录当它的工作目录）。
+        memberProjects: memberProjectsRef.current,
+      }),
+    )
   }, [])
 
   /** 本轮结束后把排队的第一条发出去（一次一条，发完再等 done）。 */
@@ -296,13 +570,10 @@ export function ChatView({
         setMessages((prev) => {
           const list = [...prev]
           let tail = list[list.length - 1]
-          if (!tail || tail.role !== 'assistant') {
-            tail = {
-              id: `tmp-${Date.now()}`,
-              role: 'assistant',
-              text: '',
-              toolCalls: [],
-            }
+          // 子代理刚发过言时，最后一条是**它**的气泡 —— 主代理的下一段文字
+          // 要另起一条，群聊才读得顺（否则会追到子代理气泡上）。
+          if (!tail || tail.role !== 'assistant' || tail.speaker) {
+            tail = newMainMessage()
             list.push(tail)
           }
           list[list.length - 1] = {
@@ -317,17 +588,13 @@ export function ChatView({
         if (!sid) break
         setMessages((prev) => {
           const list = [...prev]
-          let tail = list[list.length - 1]
-          if (!tail || tail.role !== 'assistant') {
-            tail = {
-              id: `tmp-${Date.now()}`,
-              role: 'assistant',
-              text: '',
-              toolCalls: [],
-            }
-            list.push(tail)
+          let i = lastMainIndex(list)
+          if (i < 0) {
+            list.push(newMainMessage())
+            i = list.length - 1
           }
-          list[list.length - 1] = {
+          const tail = list[i]
+          list[i] = {
             ...tail,
             toolCalls: [
               ...(tail.toolCalls ?? []),
@@ -342,8 +609,9 @@ export function ChatView({
         if (!sid) break
         setMessages((prev) => {
           const list = [...prev]
-          const tail = list[list.length - 1]
-          if (!tail) return list
+          const i = lastMainIndex(list)
+          if (i < 0) return list
+          const tail = list[i]
           const cards = (tail.toolCalls ?? []).map((c) =>
             c.id === frame.id
               ? { ...c, ok: frame.ok, output: frame.output }
@@ -355,7 +623,101 @@ export function ChatView({
           const generated = incoming.length
             ? Array.from(new Set([...(tail.generated ?? []), ...incoming]))
             : tail.generated
-          list[list.length - 1] = { ...tail, toolCalls: cards, generated }
+          list[i] = { ...tail, toolCalls: cards, generated }
+          return list
+        })
+        break
+      }
+      // ── 群聊：子代理开麦 ─────────────────────────────────────────────
+      case 'subagentStart': {
+        if (!sid) break
+        const sp: Speaker = {
+          id: frame.subagentId,
+          name: frame.name || frame.subagentId,
+          emoji: frame.emoji || '🤖',
+          kind: 'sub',
+          project: frame.project || undefined,
+        }
+        rememberSub(sp)
+        setMessages((prev) => [
+          ...prev,
+          {
+            id: `sub-${frame.id}-${frame.subagentId}`,
+            role: 'assistant',
+            text: '',
+            speaker: sp,
+            roomId: frame.id,
+            subTask: frame.task,
+            subTools: [],
+          },
+        ])
+        break
+      }
+      case 'subagentDelta': {
+        if (!sid) break
+        setMessages((prev) => {
+          const list = [...prev]
+          const i = lastSubIndex(list, frame.id, frame.subagentId)
+          if (i < 0) return list
+          list[i] = { ...list[i], text: list[i].text + frame.text }
+          return list
+        })
+        break
+      }
+      case 'subagentToolStart': {
+        if (!sid) break
+        setMessages((prev) => {
+          const list = [...prev]
+          const i = lastSubIndex(list, frame.id, frame.subagentId)
+          if (i < 0) return list
+          const cur = list[i]
+          list[i] = {
+            ...cur,
+            subTools: [
+              ...(cur.subTools ?? []),
+              { id: frame.callId, name: frame.name, input: frame.input ?? {} },
+            ],
+          }
+          return list
+        })
+        break
+      }
+      case 'subagentToolEnd': {
+        if (!sid) break
+        setMessages((prev) => {
+          const list = [...prev]
+          const i = lastSubIndex(list, frame.id, frame.subagentId)
+          if (i < 0) return list
+          const cur = list[i]
+          // 子代理自己生的图也自动预览（脚本只打印文件名，模型常忘记写链接）
+          const incoming = frame.images ?? []
+          list[i] = {
+            ...cur,
+            subTools: (cur.subTools ?? []).map((c) =>
+              c.id === frame.callId
+                ? { ...c, ok: frame.ok, output: frame.output }
+                : c,
+            ),
+            generated: incoming.length
+              ? Array.from(new Set([...(cur.generated ?? []), ...incoming]))
+              : cur.generated,
+          }
+          return list
+        })
+        break
+      }
+      case 'subagentEnd': {
+        if (!sid) break
+        setMessages((prev) => {
+          const list = [...prev]
+          for (let i = list.length - 1; i >= 0; i -= 1) {
+            const m = list[i]
+            if (m.roomId !== frame.id || m.speaker?.id !== frame.subagentId) continue
+            // 流式没接到文字（网关只给最终文本）时用收尾文本兜底。
+            const text = m.text.trim() ? m.text : frame.text || m.text
+            list[i] = { ...m, text, subDone: true }
+            break
+          }
           return list
         })
         break
@@ -381,7 +743,7 @@ export function ChatView({
       default:
         break
     }
-  }, [flushQueue, onChangeSession, reloadSessions])
+  }, [flushQueue, onChangeSession, reloadSessions, rememberSub])
 
   useEffect(() => {
     const ws = openSocket(handleFrame, { onStateChange: setSocketState })
@@ -456,6 +818,32 @@ export function ChatView({
         ? workspaces.find((w) => w.id === activeSession.folderId) ?? null
         : null,
     [activeSession, workspaces],
+  )
+
+  // 群成员条要显示的人：名单里的（用户拉进来的）+ 本轮实际出现过的
+  // （模型自己委派出去的也算 —— 否则「群里冒出一个陌生名字」）。
+  const memberSpeakers = useMemo<Speaker[]>(() => {
+    const out: Speaker[] = []
+    for (const id of roster) {
+      const cfg = candidates.find((c) => c.id === id)
+      out.push({
+        id,
+        name: cfg?.name || id,
+        emoji: cfg?.emoji || '🤖',
+        kind: 'sub',
+      })
+    }
+    for (const sp of seen) {
+      if (!out.some((m) => m.id === sp.id)) out.push(sp)
+    }
+    return out
+  }, [roster, candidates, seen])
+
+  // 折叠子代理过程时只把它们的发言/工具摘出去 —— `messages` 本身不动，
+  // 主代理的流式拼接不受影响。
+  const visibleMessages = useMemo(
+    () => (showSub ? messages : messages.filter((m) => m.speaker?.kind !== 'sub')),
+    [messages, showSub],
   )
 
   // -- render --------------------------------------------------------------
@@ -553,6 +941,177 @@ export function ChatView({
           </button>
         </div>
 
+        {/* 群聊成员条：主代理 + 被拉进群的子代理。子代理实际开麦时会把名字
+            挂在这里，用户可以随时把成员拉进来 / 请出去。 */}
+        <div className="chat-groupbar" ref={groupRef}>
+          <div className="group-members" title="本会话的群成员">
+            <span className="group-chip is-user" title="你">
+              <span className="group-ava">{USER_SPEAKER.emoji}</span>
+              {USER_SPEAKER.name}
+            </span>
+            <span className="group-chip is-main" title="主代理（替你和子代理对接）">
+              <span className="group-ava">{MAIN_SPEAKER.emoji}</span>
+              {MAIN_SPEAKER.name}
+            </span>
+            {memberSpeakers.map((m) => {
+              const projId = memberProjects[m.id]
+              const proj = projId
+                ? workspaces.find((w) => w.id === projId)
+                : undefined
+              return (
+                <span
+                  key={m.id}
+                  className={`group-chip is-sub${
+                    seen.some((s) => s.id === m.id) ? ' is-active' : ''
+                  }`}
+                  title={
+                    seen.some((s) => s.id === m.id)
+                      ? `${m.name}（本轮已参与）`
+                      : `${m.name}（已拉进群，还没被委派）`
+                  }
+                >
+                  <span className="group-ava">{m.emoji}</span>
+                  {m.name}
+                  {proj && (
+                    <span className="group-proj-tag" title={proj.path || '沙箱目录'}>
+                      📁 {proj.name}
+                    </span>
+                  )}
+                  <button
+                    type="button"
+                    className="group-x"
+                    title="请出群"
+                    onClick={() => toggleMember(m.id)}
+                  >
+                    ×
+                  </button>
+                </span>
+              )
+            })}
+          </div>
+
+          <div className="group-actions">
+            <div className="group-picker" ref={projectRef}>
+              <button
+                type="button"
+                className="group-add group-proj"
+                onClick={() => setProjectOpen((v) => !v)}
+                title="给整个群指定工作项目（主代理的目录）；成员可在「拉子代理进群」里单独分配"
+              >
+                📁 项目：{activeWorkspace ? activeWorkspace.name : '未指定'}
+              </button>
+              {projectOpen && (
+                <div className="group-pop">
+                  <div className="group-pop-title">群项目 —— 主代理的工作目录</div>
+                  <ul className="group-pop-list">
+                    <li
+                      className={!activeSession?.folderId ? 'on' : ''}
+                      onClick={() => void setGroupProject(null)}
+                    >
+                      <span className="group-ava">🌐</span>
+                      <span className="group-pop-name">不指定（用默认沙箱目录）</span>
+                      <span className="group-pop-check">
+                        {!activeSession?.folderId ? '✓' : ''}
+                      </span>
+                    </li>
+                    {workspaces.map((w) => (
+                      <li
+                        key={w.id}
+                        className={activeSession?.folderId === w.id ? 'on' : ''}
+                        onClick={() => void setGroupProject(w.id)}
+                        title={w.path || '未绑定电脑目录（用沙箱目录）'}
+                      >
+                        <span className="group-ava">📁</span>
+                        <span className="group-pop-name">
+                          {w.name}
+                          {w.path && (
+                            <span className="group-pop-id">{w.path}</span>
+                          )}
+                        </span>
+                        <span className="group-pop-check">
+                          {activeSession?.folderId === w.id ? '✓' : ''}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                  {workspaces.length === 0 && (
+                    <div className="muted empty-line">
+                      还没有工作空间 —— 先去「工作空间」页建一个
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="group-picker">
+              <button
+                type="button"
+                className="group-add"
+                onClick={() => setGroupOpen((v) => !v)}
+                title="把子代理拉进群聊（主代理会认识它们并按需委派）"
+              >
+                ＋ 拉子代理进群
+              </button>
+              {groupOpen && (
+                <div className="group-pop">
+                  <div className="group-pop-title">
+                    助理页配置的子代理（可单独分配项目）
+                  </div>
+                  {candidates.length === 0 && (
+                    <div className="muted empty-line">
+                      还没有子代理 —— 先去「助理」页创建一个
+                    </div>
+                  )}
+                  <ul className="group-pop-list">
+                    {candidates.map((c) => (
+                      <li
+                        key={c.id}
+                        className={roster.includes(c.id) ? 'on' : ''}
+                        onClick={() => toggleMember(c.id)}
+                      >
+                        <span className="group-ava">{c.emoji || '🤖'}</span>
+                        <span className="group-pop-name">
+                          {c.name}
+                          <span className="group-pop-id">{c.id}</span>
+                        </span>
+                        {roster.includes(c.id) && workspaces.length > 0 && (
+                          <select
+                            className="group-pop-proj"
+                            value={memberProjects[c.id] ?? ''}
+                            title="给这个成员分配项目目录"
+                            onClick={(e) => e.stopPropagation()}
+                            onChange={(e) =>
+                              setMemberProject(c.id, e.target.value)
+                            }
+                          >
+                            <option value="">跟随群项目</option>
+                            {workspaces.map((w) => (
+                              <option key={w.id} value={w.id}>
+                                📁 {w.name}
+                              </option>
+                            ))}
+                          </select>
+                        )}
+                        <span className="group-pop-check">
+                          {roster.includes(c.id) ? '✓' : '＋'}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+            <button
+              type="button"
+              className={`group-toggle${showSub ? ' on' : ''}`}
+              onClick={toggleShowSub}
+              title="显示/隐藏子代理的发言与工具过程"
+            >
+              {showSub ? '👥 子代理过程 显示中' : '👥 子代理过程 已折叠'}
+            </button>
+          </div>
+        </div>
+
         {configWarning && (
           <div className="config-banner">
             <span>{configWarning}</span>
@@ -562,8 +1121,9 @@ export function ChatView({
           </div>
         )}
         <MessageList
-          messages={messages}
+          messages={visibleMessages}
           sessionId={activeSessionId}
+          showSub={showSub}
           onDeleted={(mid) =>
             setMessages((prev) => prev.filter((m) => m.id !== mid))
           }
@@ -618,10 +1178,12 @@ export function ChatView({
 function MessageList({
   messages,
   sessionId,
+  showSub,
   onDeleted,
 }: {
   messages: UiMessage[]
   sessionId: string | null
+  showSub: boolean
   onDeleted: (messageId: string) => void
 }) {
   const scrollerRef = useRef<HTMLDivElement | null>(null)
@@ -629,6 +1191,9 @@ function MessageList({
     const el = scrollerRef.current
     if (el) el.scrollTop = el.scrollHeight
   }, [messages])
+  const foldedSubs = showSub
+    ? 0
+    : messages.filter((m) => m.speaker?.kind === 'sub').length
   return (
     <div className="chat-scroll" ref={scrollerRef}>
       {messages.length === 0 && (
@@ -637,6 +1202,11 @@ function MessageList({
       {messages.map((m) => (
         <Bubble key={m.id} msg={m} sessionId={sessionId} onDeleted={onDeleted} />
       ))}
+      {foldedSubs > 0 && (
+        <div className="group-folded-note">
+          👥 已折叠 {foldedSubs} 条子代理发言（点上方「子代理过程」展开）
+        </div>
+      )}
     </div>
   )
 }
@@ -653,6 +1223,8 @@ function Bubble({
   const { text, images, files } = useMemo(() => splitAttachments(msg.text), [msg.text])
   const [copied, setCopied] = useState(false)
   const [deleting, setDeleting] = useState(false)
+  /** 子代理的气泡：群聊里单独一种样式，且不参与「复制/删除」。 */
+  const isSub = msg.speaker?.kind === 'sub'
 
   // 本轮工具自动产出的图片（后端随 toolEnd 推来）——正文里已经写过的剔除，
   // 避免模型自己写了 `![](路径)` 时重复展示一遍。
@@ -682,29 +1254,59 @@ function Bubble({
     }
   }
   return (
-    <div className={`bubble ${msg.role}`}>
+    <div className={`bubble ${msg.role}${isSub ? ' is-sub' : ''}`}>
       <div className="bubble-head">
         <div className="bubble-role">
-          {msg.role === 'user' ? '你' : '助手'}
+          {isSub ? (
+            <>
+              <span className="bubble-ava">{msg.speaker?.emoji || '🤖'}</span>
+              <span className="bubble-speaker">{msg.speaker?.name}</span>
+              <span className="bubble-tag">
+                子代理{msg.subDone ? '' : ' · 进行中'}
+              </span>
+              {msg.speaker?.project && (
+                <span
+                  className="bubble-tag bubble-tag-proj"
+                  title={`项目目录: ${msg.speaker.project}`}
+                >
+                  📁{' '}
+                  {msg.speaker.project.split(/[\\/]/).filter(Boolean).pop()}
+                </span>
+              )}
+            </>
+          ) : msg.role === 'user' ? (
+            '你'
+          ) : (
+            '助手'
+          )}
         </div>
-        <div className="bubble-actions">
-          <button
-            className="bubble-act"
-            title="复制"
-            onClick={() => void copyText()}
-          >
-            {copied ? '已复制' : '复制'}
-          </button>
-          <button
-            className="bubble-act bubble-act-danger"
-            title={sessionId ? '删除（下一轮对话不再带上它）' : '删除'}
-            disabled={!sessionId || deleting}
-            onClick={() => void deleteMsg()}
-          >
-            {deleting ? '删除中…' : '删除'}
-          </button>
-        </div>
+        {/* 子代理气泡是**本轮实时**的，落库的只有主代理回复 —— 所以不给
+            复制/删除按钮（删了也只会从界面上消失）。 */}
+        {!isSub && (
+          <div className="bubble-actions">
+            <button
+              className="bubble-act"
+              title="复制"
+              onClick={() => void copyText()}
+            >
+              {copied ? '已复制' : '复制'}
+            </button>
+            <button
+              className="bubble-act bubble-act-danger"
+              title={sessionId ? '删除（下一轮对话不再带上它）' : '删除'}
+              disabled={!sessionId || deleting}
+              onClick={() => void deleteMsg()}
+            >
+              {deleting ? '删除中…' : '删除'}
+            </button>
+          </div>
+        )}
       </div>
+      {isSub && msg.subTask && (
+        <div className="bubble-subtask" title={msg.subTask}>
+          📋 {clampLine(msg.subTask)}
+        </div>
+      )}
       {text && (
         <div className="bubble-text">
           {text.split('\n').map((line, i) => (
@@ -796,6 +1398,15 @@ function Bubble({
       {msg.toolCalls && msg.toolCalls.length > 0 && (
         <div className="tool-stack">
           {msg.toolCalls.map((tc) => (
+            <ToolCard key={tc.id} call={tc} />
+          ))}
+        </div>
+      )}
+      {/* 子代理在自己的循环里调的工具（read_image / shell / 检索…）——
+          让「它到底干了什么」可见，而不是只有一个最终答复。 */}
+      {isSub && msg.subTools && msg.subTools.length > 0 && (
+        <div className="tool-stack">
+          {msg.subTools.map((tc) => (
             <ToolCard key={tc.id} call={tc} />
           ))}
         </div>

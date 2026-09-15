@@ -774,6 +774,41 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
         await _safe_send(client_id, {"type": "error", "error": str(e)})
         return
 
+    # 「拉进群」的子代理：前端把成员 id 随消息带上来，这里把它们写进系统提示，
+    # 主代理才知道群里有这些同事、可以委派给谁（否则拉了群也是摆设）。
+    participants = [str(p).strip() for p in (msg.get("participants") or [])]
+    participants = [p for p in participants if p]
+    if participants:
+        try:
+            from ..agent.subagents import group_block
+
+            block = group_block(store, participants)
+            if block:
+                options.system_prompt = (options.system_prompt or "") + block
+        except Exception:  # pragma: no cover - 群成员只影响提示，不该打断对话
+            logger.debug("group block build failed", exc_info=True)
+
+    # 「分配项目」：前端把「成员 id → 工作空间 id」带上来，这里解析成真实目录，
+    # 交给子代理的 shell 当工作目录（每个成员可以各写各的项目）。
+    member_projects = msg.get("memberProjects") or {}
+    if isinstance(member_projects, dict) and member_projects:
+        try:
+            from ..agent.subagent_events import set_projects
+
+            resolved: dict[str, str] = {}
+            for member_id, folder_id in member_projects.items():
+                if not folder_id:
+                    continue
+                path = await workspaces.dir_for_workspace(
+                    str(folder_id), suffix=f"sub-{member_id}"
+                )
+                if path is not None:
+                    resolved[str(member_id)] = str(path)
+            if resolved:
+                set_projects(resolved)
+        except Exception:  # pragma: no cover - 分配失败退回默认目录
+            logger.debug("member projects resolve failed", exc_info=True)
+
     # [T-token-attribution-snapshot] Freeze which model is serving THIS turn
     # into the message row, and open a meter for the run. Without the snapshot
     # the Usage page had to join sessions.model_id — one mutable column, so a
@@ -885,12 +920,21 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
             logger.debug("sandbox dir override failed for %s", sid)
 
     try:
-        await runtime.run(
-            provider,
-            messages,
-            session_id=f"db-{sid}",
-            options=options,
-        )
+        # 群聊可视化：把「子代理活动」接到同一条推流上。装在这里（而不是 sink
+        # 里）是因为 agent 派生的工具任务会继承**当前任务**的 contextvars ——
+        # 于是 subagents.run_subagent 不用改签名就能把过程推出去。
+        from ..agent.subagent_events import reset_emitter, set_emitter
+
+        emitter_token = set_emitter(lambda ev: _safe_send(client_id, ev))
+        try:
+            await runtime.run(
+                provider,
+                messages,
+                session_id=f"db-{sid}",
+                options=options,
+            )
+        finally:
+            reset_emitter(emitter_token)
         # persist the final assistant text (intermediate tool rounds live only
         # in the in-process transcript cache)
         tail = messages[-1] if messages else None
@@ -931,6 +975,14 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
         await _safe_send(client_id, {"type": "error", "error": f"对话出错: {e}"}
         )
     finally:
+        # 「分配项目」是**本轮**的，收工必须清掉 —— 否则同一个上下文里跑下一轮
+        # 时会带着上一轮的项目目录（contextvar 只保证跨任务隔离，不保证跨轮）。
+        try:
+            from ..agent.subagent_events import set_projects
+
+            set_projects(None)
+        except Exception:  # pragma: no cover - 清理失败不该影响收尾
+            logger.debug("member projects clear failed", exc_info=True)
         close = getattr(provider, "aclose", None)
         if callable(close):
             try:

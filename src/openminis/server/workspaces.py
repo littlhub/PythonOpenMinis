@@ -280,6 +280,35 @@ async def sandbox_dir_for_session(session_id: str) -> Path | None:
     return target
 
 
+async def dir_for_workspace(folder_id: str, *, suffix: str = "") -> Path | None:
+    """工作空间 → 真实工作目录（子代理/群聊「分配项目」用）。
+
+    与 :func:`sandbox_dir_for_session` 同一套偏好：先用户配置的 ``path``，
+    再退回 ``external_files_dir/workspaces/<slug(name)>``（按需创建）。
+    ``suffix`` 用来给同一工作空间里的不同角色分一个子目录，避免互相踩文件。
+    """
+    await chat_store.ensure_db()
+    async with chat_store._get_db().session() as s:  # noqa: SLF001
+        dao = ChatDao(s)
+        folder = await dao.get_folder(folder_id)
+        if folder is None:
+            return None
+        name = folder.name or "工作空间"
+    user_path = get_workspace_path(folder_id)
+    if user_path:
+        candidate = Path(user_path)
+        if candidate.is_dir():
+            return candidate
+    base = app_context().external_files_dir / "workspaces" / _slug(name)
+    if suffix:
+        base = base / suffix
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    return base
+
+
 # -----------------------------------------------------------------------
 # FastAPI router
 # -----------------------------------------------------------------------

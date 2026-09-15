@@ -200,6 +200,11 @@ class AgentRuntime:
             return ToolExecutionResult(f"Unknown tool: {tu.name}", False,
                                        tool_title=tu.name)
         started = time.monotonic()
+        # 记下「现在跑的是哪一次外层工具调用」—— 子代理（subagent_delegate）
+        # 要靠它把自己挂到对应的工具卡上，前端才能把子代理气泡归到正确的位置。
+        from .subagent_events import push_tool_use, reset_tool_use
+
+        tool_use_token = push_tool_use(tu.id, tu.name)
         try:
             result = await executor.executor(
                 args_json, session_id,
@@ -212,6 +217,8 @@ class AgentRuntime:
                 f"[tool error: {type(exc).__name__}] {exc}", False,
                 tool_title=tu.name,
             )
+        finally:
+            reset_tool_use(tool_use_token)
         # 每个工具的耗时单独打点：整轮慢时能立刻分清是哪个工具（网络/模型）
         # 慢，而不是模型慢。
         logger.info("tool_ms name=%s ms=%s ok=%s",
