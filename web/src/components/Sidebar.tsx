@@ -81,6 +81,8 @@ export function Sidebar(props: SidebarProps) {
       return false
     }
   })
+  // 上次访问的管理页（点头「管理」时跳回它 —— 和点「聊天」跳聊天一致）。
+  const [lastManageView, setLastManageView] = useState<ViewId>('workspaces')
 
   // -- 用户按钮：进入页面的访问密码 -------------------------------------
   const [userOpen, setUserOpen] = useState(false)
@@ -150,36 +152,45 @@ export function Sidebar(props: SidebarProps) {
     }
   }
 
-  // 当前页正好在分组里时自动展开，避免"看不到自己在哪"。
+  // 当前页正好在分组里时自动高亮（展开与否交给用户点头的开关）。
   const manageActive = MANAGE_NAV.some((n) => n.id === props.view)
-  const manageExpanded = manageOpen || manageActive
+  const manageExpanded = manageOpen
+
+  // 记住上次访问的管理页（点头「管理」展开时跳回它）。
+  useEffect(() => {
+    if (manageActive) setLastManageView(props.view)
+  }, [manageActive, props.view])
 
   const toggleManage = () => {
-    setManageOpen((v) => {
-      const next = !v
-      try {
-        localStorage.setItem(MANAGE_STORAGE_KEY, next ? '1' : '0')
-      } catch {
-        /* 隐私模式下 localStorage 可能不可用，忽略 */
-      }
-      return next
-    })
+    const willExpand = !manageOpen
+    setManageOpen(willExpand)
+    try {
+      localStorage.setItem(MANAGE_STORAGE_KEY, willExpand ? '1' : '0')
+    } catch {
+      /* 隐私模式下 localStorage 可能不可用，忽略 */
+    }
+    if (willExpand) {
+      props.onChangeView(
+        manageActive ? props.view : lastManageView || 'workspaces',
+      )
+    }
   }
 
-  // 「聊天」组的展开开关；与「管理」一样，当前页在组里时强制展开。
+  // 「聊天」组的展开开关；抽屉是纯开关（不再被「当前页」强制展开 ——
+  // 否则人在聊天页时点「聊天」收不起来）。
   const chatActive = props.view === 'chat'
-  const chatExpanded = chatOpen || chatActive
+  const chatExpanded = chatOpen
 
+  /** 点「聊天」头：收起状态 → 展开抽屉 + 跳到聊天；已展开 → 只收抽屉。 */
   const toggleChat = () => {
-    setChatOpen((v) => {
-      const next = !v
-      try {
-        localStorage.setItem(CHAT_STORAGE_KEY, next ? '1' : '0')
-      } catch {
-        /* 忽略 */
-      }
-      return next
-    })
+    const willExpand = !chatOpen
+    setChatOpen(willExpand)
+    try {
+      localStorage.setItem(CHAT_STORAGE_KEY, willExpand ? '1' : '0')
+    } catch {
+      /* 忽略 */
+    }
+    if (willExpand) props.onChangeView('chat')
   }
 
   const reloadWorkspaces = useCallback(async () => {
@@ -305,10 +316,7 @@ export function Sidebar(props: SidebarProps) {
               >
                 <button
                   className={`nav-item nav-group-head ${chatActive ? 'active' : ''}`}
-                  onClick={() => {
-                    toggleChat()
-                    props.onChangeView('chat')
-                  }}
+                  onClick={toggleChat}
                   title={chatExpanded ? '收起会话列表' : '展开会话列表'}
                 >
                   <span className="caret">{chatExpanded ? '⌄' : '›'}</span>
@@ -356,7 +364,8 @@ export function Sidebar(props: SidebarProps) {
           )
         })}
 
-        {/* 「管理」折叠分组：记忆 / 技能 / 广场 / 通道 / 定时 */}
+        {/* 「管理」折叠分组：与「聊天」同款抽屉 —— 收起时点头展开+跳回
+            上次的管理页（默认「助理」），已展开时点头只收抽屉。 */}
         <div className={`nav-group ${manageExpanded ? 'open' : ''}`}>
           <button
             className={`nav-item nav-group-head ${manageActive ? 'active' : ''}`}
