@@ -5530,3 +5530,72 @@ dl.facts.usage-detail {
     max-width: calc(100vw - 20px);
   }
 }
+
+/* ---- 移动端聊天页：压缩顶栏、群成员条单行滚动、给 ☰ 让位 ---- */
+@media (max-width: 768px) {
+  /* ☰ 浮钮固定在左下角 —— 输入栏整体右移，附件按钮不再被盖住 */
+  .composer {
+    padding-left: 64px;
+  }
+
+  /* 顶栏收紧：会话选择器限宽，模式徽标变小 */
+  .chat-topbar {
+    padding: 6px 10px;
+    gap: 6px;
+  }
+
+  .chat-topbar .picker-trigger {
+    max-width: 44vw;
+  }
+
+  .chat-topbar .picker-label {
+    max-width: 36vw;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .chat-topbar .cap-chip {
+    padding: 3px 8px;
+    font-size: 11px;
+  }
+
+  .topbar-ws-tag {
+    max-width: 24vw;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  /* 群成员条（好友栏）压成单行横向滚动：不再换行叠三层，
+     成员头像 + 项目/拉人/子代理开关都在，滑动可达 */
+  .chat-groupbar {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    gap: 6px;
+    padding: 4px 8px;
+    scrollbar-width: none;
+  }
+
+  .chat-groupbar::-webkit-scrollbar {
+    display: none;
+  }
+
+  .group-members {
+    flex-wrap: nowrap;
+    flex-shrink: 0;
+  }
+
+  .group-actions {
+    flex-wrap: nowrap;
+    flex-shrink: 0;
+    gap: 4px;
+    margin-left: 0;
+  }
+
+  .group-add,
+  .group-toggle {
+    font-size: 11px;
+    padding: 3px 8px;
+    white-space: nowrap;
+  }
+}
