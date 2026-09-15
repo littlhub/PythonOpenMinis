@@ -5443,3 +5443,90 @@ dl.facts.usage-detail {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* ============================================================
+ * 移动端适配（≤768px，与 App.tsx 的 isNarrow() 断点一致）
+ * 侧边栏变悬浮抽屉：收起时整个滑出屏幕，靠 ☰ 浮钮唤出；
+ * 展开时盖在内容上，点遮罩 / ❮ 收起。桌面端一切照旧。
+ * ============================================================ */
+.mobile-rail-btn {
+  display: none;
+}
+
+.rail-backdrop {
+  display: none;
+}
+
+@media (max-width: 768px) {
+  /* 主区域占满整屏，不再被侧边栏挤压 */
+  .app,
+  .app.rail-collapsed {
+    grid-template-columns: 1fr;
+  }
+
+  .app-main {
+    width: 100%;
+  }
+
+  .pane {
+    padding: 14px 12px 96px;
+  }
+
+  /* 侧边栏：悬浮抽屉 */
+  .nav-rail {
+    position: fixed;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: min(78vw, 280px);
+    z-index: 80;
+    transform: translateX(0);
+    transition: transform 0.2s ease;
+    box-shadow: 0 0 32px rgba(0, 0, 0, 0.18);
+  }
+
+  .nav-rail.is-collapsed {
+    transform: translateX(-103%);
+    box-shadow: none;
+    pointer-events: none;
+  }
+
+  /* 折叠箭头常显 —— 手机没有 hover，之前根本找不到折叠按钮 */
+  .nav-brand .brand-toggle {
+    opacity: 1;
+  }
+
+  /* 抽屉展开时的遮罩 */
+  .app:not(.rail-collapsed) .rail-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 79;
+    background: rgba(0, 0, 0, 0.32);
+  }
+
+  /* 抽屉收起后的 ☰ 唯一入口（左下角，拇指好够） */
+  .app.rail-collapsed .mobile-rail-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: fixed;
+    left: 10px;
+    bottom: 18px;
+    width: 44px;
+    height: 44px;
+    z-index: 70;
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--panel);
+    color: var(--text);
+    font-size: 18px;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.14);
+    cursor: pointer;
+  }
+
+  /* 右弹面板别超出屏幕 */
+  .nav-flyout {
+    max-width: calc(100vw - 20px);
+  }
+}

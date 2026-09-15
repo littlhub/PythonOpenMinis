@@ -63,8 +63,14 @@ export default function App() {
     if (savedSession) setActiveId(savedSession)
     if (localStorage.getItem('openminis:rail-collapsed') === '1') {
       setRailCollapsed(true)
+    } else if (isNarrow()) {
+      // 手机/窄屏默认收起（移动端侧边栏是悬浮抽屉，展开会盖住内容）。
+      setRailCollapsed(true)
     }
   }, [])
+
+  /** 窄屏判定（手机浏览器）—— 与 CSS 的断点保持一致。 */
+  const isNarrow = () => window.matchMedia('(max-width: 768px)').matches
 
   // 背景偏好来自后端 config（不是 localStorage）—— 它跟着数据目录走，
   // 同一份配置换个浏览器打开外观一致。设置页改完发事件即时生效，不必刷新。
@@ -93,6 +99,15 @@ export default function App() {
       localStorage.setItem('openminis:rail-collapsed', next ? '1' : '0')
       return next
     })
+  }, [])
+
+  /** 换页统一入口：窄屏下选完导航自动收起侧边栏抽屉（不然盖着内容）。 */
+  const handleViewChange = useCallback((v: ViewId) => {
+    setView(v)
+    if (isNarrow()) {
+      setRailCollapsed(true)
+      localStorage.setItem('openminis:rail-collapsed', '1')
+    }
   }, [])
 
   // listen for "focus session" events from sibling views
@@ -152,12 +167,23 @@ export default function App() {
   return (
     <div className={`app app-${view}${railCollapsed ? ' rail-collapsed' : ''}`}>
       <ImageLightbox />
+      {/* 移动端浮钮：侧边栏抽屉收起后唯一入口（桌面端由 CSS 隐藏）。 */}
+      <button
+        type="button"
+        className="mobile-rail-btn"
+        onClick={toggleRail}
+        aria-label="打开导航菜单"
+      >
+        ☰
+      </button>
+      {/* 移动端抽屉展开时的遮罩：点一下收起（桌面端由 CSS 隐藏）。 */}
+      <div className="rail-backdrop" onClick={toggleRail} />
       <Sidebar
         view={view}
         activeSessionId={activeId}
         collapsed={railCollapsed}
         onToggleCollapsed={toggleRail}
-        onChangeView={setView}
+        onChangeView={handleViewChange}
         onSelectSession={selectSession}
         onCreateSession={createSession}
         onDeleteSession={deleteSession}
