@@ -59,7 +59,6 @@ export function Sidebar(props: SidebarProps) {
   const [sessions, setSessions] = useState<ChatSessionInfo[]>([])
   const [wsOpen, setWsOpen] = useState<Set<string>>(new Set()) // workspace ids expanded
   const [allOpen, setAllOpen] = useState(true)
-  const [flatOpen, setFlatOpen] = useState(true)
   const [unfiledOpen, setUnfiledOpen] = useState(true)
   const [showNewWs, setShowNewWs] = useState(false)
   const [newName, setNewName] = useState('')
@@ -83,6 +82,34 @@ export function Sidebar(props: SidebarProps) {
   })
   // 上次访问的管理页（点头「管理」时跳回它 —— 和点「聊天」跳聊天一致）。
   const [lastManageView, setLastManageView] = useState<ViewId>('workspaces')
+
+  // 折叠态右弹抽屉：左边栏收成窄条时，点「聊天」/「管理」图标从图标右侧
+  // 弹出悬浮面板（好友栏 = 会话列表 / 管理项），点空白处收起。
+  const [flyout, setFlyout] = useState<null | {
+    kind: 'chat' | 'manage'
+    top: number
+    left: number
+  }>(null)
+
+  // 展开左边栏时右弹抽屉自然作废。
+  useEffect(() => {
+    if (!props.collapsed) setFlyout(null)
+  }, [props.collapsed])
+
+  /** 折叠态：以被点图标为锚，在它右侧开一个悬浮抽屉。 */
+  const openFlyout = (
+    kind: 'chat' | 'manage',
+    e: React.MouseEvent<HTMLButtonElement>,
+  ) => {
+    const r = e.currentTarget.getBoundingClientRect()
+    setFlyout({
+      kind,
+      top: Math.max(8, Math.min(r.top, window.innerHeight - 360)),
+      left: r.right + 6,
+    })
+  }
+
+  const closeFlyout = () => setFlyout(null)
 
   // -- 用户按钮：进入页面的访问密码 -------------------------------------
   const [userOpen, setUserOpen] = useState(false)
@@ -317,8 +344,10 @@ export function Sidebar(props: SidebarProps) {
               >
                 <button
                   className={`nav-item nav-group-head ${chatActive ? 'active' : ''}`}
-                  onClick={toggleChat}
-                  title={chatExpanded ? '收起会话列表' : '展开会话列表'}
+                  onClick={(e) =>
+                    props.collapsed ? openFlyout('chat', e) : toggleChat()
+                  }
+                  title={props.collapsed ? '弹出会话列表' : chatExpanded ? '收起会话列表' : '展开会话列表'}
                 >
                   <span className="caret">{chatExpanded ? '⌄' : '›'}</span>
                   <span className="ic">{n.icon}</span>
@@ -370,8 +399,10 @@ export function Sidebar(props: SidebarProps) {
         <div className={`nav-group ${manageExpanded ? 'open' : ''}`}>
           <button
             className={`nav-item nav-group-head ${manageActive ? 'active' : ''}`}
-            onClick={toggleManage}
-            title={manageExpanded ? '收起管理菜单' : '展开管理菜单'}
+            onClick={(e) =>
+              props.collapsed ? openFlyout('manage', e) : toggleManage()
+            }
+            title={props.collapsed ? '弹出管理菜单' : manageExpanded ? '收起管理菜单' : '展开管理菜单'}
           >
             <span className="caret">{manageExpanded ? '⌄' : '›'}</span>
             <span className="ic">🗂</span>
@@ -405,6 +436,69 @@ export function Sidebar(props: SidebarProps) {
           </button>
         ))}
       </nav>
+
+      {/* 折叠态右弹抽屉：好友栏（会话列表）/ 管理项，fixed 定位不受
+          nav-rail overflow:hidden 裁剪；点遮罩收起。 */}
+      {flyout && (
+        <>
+          <div className="nav-flyout-backdrop" onClick={closeFlyout} />
+          <div
+            className="nav-flyout"
+            style={{ top: flyout.top, left: flyout.left }}
+          >
+            {flyout.kind === 'chat' ? (
+              <>
+                <div className="nav-flyout-title">
+                  会话<span className="badge">{totalCount}</span>
+                </div>
+                <div className="nav-flyout-list">
+                  {sessions.length === 0 && (
+                    <div className="nav-flyout-empty">暂无会话</div>
+                  )}
+                  {sessions.map((s) => (
+                    <button
+                      key={s.id}
+                      className={`nav-item sub ${
+                        props.activeSessionId === s.id ? 'active' : ''
+                      }`}
+                      onClick={() => {
+                        props.onSelectSession(s.id)
+                        props.onChangeView('chat')
+                        closeFlyout()
+                      }}
+                      title={s.title}
+                    >
+                      <span className="ic">💬</span>
+                      <span className="lbl">{s.title}</span>
+                    </button>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="nav-flyout-title">管理</div>
+                <div className="nav-flyout-list">
+                  {MANAGE_NAV.map((n) => (
+                    <button
+                      key={n.id}
+                      className={`nav-item sub ${
+                        props.view === n.id ? 'active' : ''
+                      }`}
+                      onClick={() => {
+                        props.onChangeView(n.id)
+                        closeFlyout()
+                      }}
+                    >
+                      <span className="ic">{n.icon}</span>
+                      <span className="lbl">{n.label}</span>
+                    </button>
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
+        </>
+      )}
 
       {/* space group header */}
       <div className="nav-section">
@@ -462,54 +556,6 @@ export function Sidebar(props: SidebarProps) {
 
         {allOpen && (
           <ul className="ws-tree">
-            {/* 全部: 平铺所有会话（点标题行折叠/展开） */}
-            <li className="ws-row all">
-              <button
-                className={`ws-row-head ${!props.activeSessionId ? 'active' : ''}`}
-                onClick={() => setFlatOpen((v) => !v)}
-                title={flatOpen ? '收起全部会话' : '展开全部会话'}
-              >
-                <span className="caret">{flatOpen ? '⌄' : '›'}</span>
-                <span className="ic ic-folder">📁</span>
-                <span className="lbl">全部</span>
-                <span className="badge">{totalCount}</span>
-              </button>
-              {flatOpen && (
-                <ul className="sess-tree">
-                  {sessions.length === 0 && (
-                    <li className="sess-empty">暂无会话</li>
-                  )}
-                  {sessions.map((s) => (
-                    <li
-                      key={s.id}
-                      className={`sess-item ${
-                        props.activeSessionId === s.id ? 'active' : ''
-                      }`}
-                    >
-                      <button
-                        className="sess-row"
-                        onClick={() => {
-                          props.onSelectSession(s.id)
-                          props.onChangeView('chat')
-                        }}
-                        title={s.title}
-                      >
-                        <span className="ic">💬</span>
-                        <span className="lbl">{s.title}</span>
-                      </button>
-                      <button
-                        className="sess-x"
-                        title="删除"
-                        onClick={() => void handleDeleteSess(s.id)}
-                      >
-                        ×
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </li>
-
             {/* 未分组 */}
             {(() => {
               const us = sessionsByWs.get(null) ?? []
