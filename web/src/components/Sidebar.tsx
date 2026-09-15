@@ -535,7 +535,7 @@ export function Sidebar(props: SidebarProps) {
                   {sessions.map((s) => (
                     <button
                       key={s.id}
-                      className={`nav-item sub ${
+                      className={`flyout-friend ${
                         props.activeSessionId === s.id ? 'active' : ''
                       }`}
                       onClick={() => {
@@ -543,10 +543,17 @@ export function Sidebar(props: SidebarProps) {
                         props.onChangeView('chat')
                         closeFlyout()
                       }}
-                      title={s.title}
+                      title={`${s.title}${s.lastMessage ? `\n${s.lastMessage}` : ''}`}
                     >
                       <span className="ic">💬</span>
-                      <span className="lbl">{s.title}</span>
+                      <span className="flyout-friend-txt">
+                        <b>{s.title || '未命名会话'}</b>
+                        <i>
+                          {s.lastMessage
+                            ? s.lastMessage.slice(0, 48)
+                            : '（还没有消息）'}
+                        </i>
+                      </span>
                     </button>
                   ))}
                 </div>

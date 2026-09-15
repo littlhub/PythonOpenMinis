@@ -5369,6 +5369,12 @@ dl.facts.usage-detail {
   gap: 1px;
 }
 
+/* 弹出面板不受折叠态「只留图标」规则连坐（面板虽是 rail 子节点，
+   但内容必须完整显示标题/描述）。 */
+.nav-rail.is-collapsed .nav-flyout .nav-item > span:not(.ic):not(.caret) {
+  display: inline;
+}
+
 .nav-flyout .nav-item.sub {
   padding: 6px 10px;
   border-radius: 7px;
