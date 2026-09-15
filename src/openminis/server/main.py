@@ -774,15 +774,31 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
         await _safe_send(client_id, {"type": "error", "error": str(e)})
         return
 
-    # 「拉进群」的子代理：前端把成员 id 随消息带上来，这里把它们写进系统提示，
-    # 主代理才知道群里有这些同事、可以委派给谁（否则拉了群也是摆设）。
-    participants = [str(p).strip() for p in (msg.get("participants") or [])]
-    participants = [p for p in participants if p]
-    if participants:
+    # 「拉进群」的成员：前端把成员对象（``{id, kind, name}``）随消息带上来，这里
+    # 把它们写进系统提示，主代理才知道群里有这些同事、可以委派给谁（否则拉了群
+    # 也是摆设）。``kind == "human"`` 的只是真人席位 —— 标注清楚「是人、别委派」。
+    # 兼容老格式（纯 id 字符串数组，那时进群的都是子代理）。
+    raw_parts = msg.get("participants") or []
+    sub_ids: list[str] = []
+    human_names: list[str] = []
+    for raw in raw_parts:
+        if isinstance(raw, str):
+            pid = raw.strip()
+            if pid:
+                sub_ids.append(pid)
+        elif isinstance(raw, dict):
+            pid = str(raw.get("id") or "").strip()
+            if not pid:
+                continue
+            if str(raw.get("kind") or "agent") == "human":
+                human_names.append(str(raw.get("name") or pid).strip() or pid)
+            else:
+                sub_ids.append(pid)
+    if sub_ids or human_names:
         try:
             from ..agent.subagents import group_block
 
-            block = group_block(store, participants)
+            block = group_block(store, sub_ids, human_names)
             if block:
                 options.system_prompt = (options.system_prompt or "") + block
         except Exception:  # pragma: no cover - 群成员只影响提示，不该打断对话

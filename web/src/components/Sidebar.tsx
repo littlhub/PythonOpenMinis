@@ -34,6 +34,9 @@ const MANAGE_STORAGE_KEY = 'openminis:nav-manage'
 interface SidebarProps {
   view: ViewId
   activeSessionId: string | null
+  /** 左边栏是否折叠成窄条（点 OpenMinis 图标切换）。 */
+  collapsed: boolean
+  onToggleCollapsed: () => void
   onChangeView: (v: ViewId) => void
   onSelectSession: (id: string) => void
   onCreateSession: (folderId?: string | null) => Promise<void>
@@ -233,13 +236,27 @@ export function Sidebar(props: SidebarProps) {
   const totalCount = sessions.length
 
   return (
-    <aside className="nav-rail">
-      {/* top brand + main actions */}
-      <div className="nav-brand">
-        <span className="brand-name">
-          Open<span className="brand-accent">Minis</span>
+    <aside className={`nav-rail${props.collapsed ? ' is-collapsed' : ''}`}>
+      {/* 品牌区同时是折叠开关：点 OpenMinis 就把左边栏收成窄条，再点展开。
+          折叠后只留 nav 图标 + 会话列表让位（会话在聊天页顶部仍有切换器）。 */}
+      <button
+        type="button"
+        className="nav-brand"
+        onClick={props.onToggleCollapsed}
+        title={props.collapsed ? '展开左边栏' : '收起左边栏'}
+        aria-expanded={!props.collapsed}
+      >
+        {props.collapsed ? (
+          <span className="brand-mark">OM</span>
+        ) : (
+          <span className="brand-name">
+            Open<span className="brand-accent">Minis</span>
+          </span>
+        )}
+        <span className="brand-toggle" aria-hidden="true">
+          {props.collapsed ? '❯' : '❮'}
         </span>
-      </div>
+      </button>
 
       <button
         className="nav-pri"

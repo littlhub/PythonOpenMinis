@@ -659,13 +659,147 @@ body {
   color: #c0392b;
 }
 
-/* ---------- chat (single main area + collapsible right) ---------- */
+/* ---------- chat (contacts rail + main area + collapsible right) ---------- */
+/* 微信式：好友栏 | 对话栏 | 右侧工具栏（可折叠）。 */
 .chat.chat-with-rail {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   grid-template-rows: minmax(0, 1fr);
   height: 100%;
   gap: 0;
+}
+
+/* ---------- 好友栏（微信式左列） ---------- */
+.chat-contacts {
+  width: 220px;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+  background: var(--panel, rgba(127, 127, 127, 0.04));
+  min-height: 0;
+}
+.cc-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+}
+.cc-back {
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 4px 6px;
+  border-radius: 6px;
+}
+.cc-back:hover {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.cc-new {
+  margin-left: auto;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  padding: 4px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.cc-new:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.cc-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px;
+}
+.cc-section {
+  font-size: 11px;
+  color: var(--muted);
+  padding: 8px 6px 4px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.cc-count {
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-radius: 8px;
+  padding: 0 6px;
+  font-size: 10px;
+}
+.cc-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--text);
+  font-size: 13px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  cursor: pointer;
+  text-align: left;
+}
+.cc-item:hover {
+  background: var(--accent-soft);
+}
+.cc-item.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.cc-item.is-static {
+  cursor: default;
+}
+.cc-item.is-static:hover {
+  background: transparent;
+}
+.cc-ava {
+  position: relative;
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  background: var(--accent-soft);
+  font-size: 14px;
+}
+.cc-ava.is-user {
+  background: rgba(255, 170, 60, 0.18);
+}
+.cc-ava.is-main {
+  background: rgba(90, 160, 255, 0.18);
+}
+.cc-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cc-badge {
+  flex-shrink: 0;
+  font-size: 10px;
+  color: var(--muted);
+  background: var(--accent-soft);
+  border-radius: 6px;
+  padding: 1px 5px;
+  max-width: 64px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.cc-empty {
+  color: var(--muted);
+  font-size: 12px;
+  padding: 6px 8px;
 }
 
 h2 {
@@ -1976,6 +2110,29 @@ button.link.danger {
 .tool-card.tool-ok .tool-state { color: #1e7a4f; }
 .tool-card.tool-err .tool-state { color: #b04545; }
 .tool-card.tool-running .tool-state { color: var(--accent); }
+
+/* 缩小显示（默认、全局记住）：只留一行，更紧凑。 */
+.tool-card.is-collapsed .tool-head {
+  padding: 3px 10px;
+  font-size: 12px;
+  gap: 6px;
+}
+.tool-card.is-collapsed .tool-glyph {
+  font-size: 12px;
+}
+.tool-card.is-collapsed .tool-name {
+  font-size: 11.5px;
+  font-weight: 400;
+  opacity: 0.85;
+}
+.tool-card.is-collapsed .tool-state {
+  font-size: 11px;
+}
+.tool-caret {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--muted);
+}
 
 .tool-body {
   border-top: 1px dashed var(--border);
@@ -4839,23 +4996,28 @@ dl.facts.usage-detail {
 .group-chip {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
-  padding: 2px 8px;
-  border: 1px solid var(--border);
+  gap: 2px;
+  padding: 2px 4px;
+  border: 1px solid transparent;
   border-radius: 999px;
   font-size: 12px;
   color: var(--text);
-  background: var(--bg);
+  background: transparent;
   white-space: nowrap;
 }
 
-.group-chip.is-user {
-  color: var(--muted);
+/* 身份用颜色区分（名字进 tooltip，条上只留头像/图标）：
+   agent = 中性、bot = 蓝、human = 橙。 */
+.group-chip.is-kind-agent {
+  border-color: var(--border);
 }
 
-.group-chip.is-main {
-  border-color: var(--accent);
-  background: var(--accent-soft);
+.group-chip.is-kind-bot .group-ava {
+  box-shadow: 0 0 0 1.5px rgba(90, 160, 255, 0.7) inset;
+}
+
+.group-chip.is-kind-human .group-ava {
+  box-shadow: 0 0 0 1.5px rgba(255, 170, 60, 0.8) inset;
 }
 
 .group-chip.is-sub.is-active {
@@ -4864,8 +5026,32 @@ dl.facts.usage-detail {
 }
 
 .group-ava {
-  font-size: 12px;
+  position: relative;
+  font-size: 14px;
   line-height: 1;
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border-radius: 999px;
+  background: var(--bg);
+}
+
+/* 身份角标：Agent 无点、Bot 蓝点、人 橙点 —— 不看名字也认得出。 */
+.group-dot {
+  position: absolute;
+  right: -1px;
+  bottom: -1px;
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  border: 1.5px solid var(--bg);
+}
+.group-dot.is-bot {
+  background: #5aa0ff;
+}
+.group-dot.is-human {
+  background: #ffaa3c;
 }
 
 .group-x {
@@ -4873,7 +5059,7 @@ dl.facts.usage-detail {
   background: transparent;
   color: var(--muted);
   cursor: pointer;
-  padding: 0 0 0 2px;
+  padding: 0 2px;
   font-size: 13px;
   line-height: 1;
 }
@@ -4882,11 +5068,15 @@ dl.facts.usage-detail {
   color: var(--danger);
 }
 
+.group-x.is-add:hover {
+  color: var(--accent);
+}
+
 .group-proj-tag {
   font-size: 11px;
   color: var(--muted);
   border-left: 1px solid var(--border);
-  padding-left: 6px;
+  padding-left: 4px;
   max-width: 160px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -5011,6 +5201,96 @@ dl.facts.usage-detail {
   padding: 2px 4px;
 }
 
+/* 「拉成员进群」浮层：身份说明 + 身份下拉 + 真人席位录入。 */
+.group-pop-legend {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--muted);
+  padding: 0 8px 8px;
+  border-bottom: 1px dashed var(--border);
+}
+
+.group-kind-tag {
+  flex-shrink: 0;
+  font-size: 10px;
+  line-height: 1;
+  padding: 2px 5px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  color: var(--muted);
+}
+.group-kind-tag.is-agent {
+  color: var(--text);
+}
+.group-kind-tag.is-bot {
+  color: #5aa0ff;
+  border-color: rgba(90, 160, 255, 0.5);
+}
+.group-kind-tag.is-human {
+  color: #e08a1e;
+  border-color: rgba(255, 170, 60, 0.6);
+}
+
+.group-pop-kind {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-family: inherit;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 2px 4px;
+}
+
+.group-pop-hit {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+}
+
+.group-pop-sep {
+  font-size: 11px;
+  color: var(--muted);
+  padding: 10px 8px 4px;
+  border-top: 1px dashed var(--border);
+  margin-top: 6px;
+}
+
+.group-pop-humanadd {
+  display: flex;
+  gap: 6px;
+  padding: 4px 8px 8px;
+}
+.group-pop-humanadd input {
+  flex: 1;
+  min-width: 0;
+  font-size: 12px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+}
+.group-pop-humanadd button {
+  flex: 0 0 auto;
+  font-size: 12px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+}
+.group-pop-humanadd button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 .group-folded-note {
   margin: 8px auto;
   font-size: 12px;
@@ -5061,4 +5341,114 @@ dl.facts.usage-detail {
   color: var(--muted);
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* ============================================================
+ * 左边栏折叠 —— 点「OpenMinis」图标切换
+ * 折叠后只留导航图标（会话列表让位），主区域拿回宽度。
+ * ============================================================ */
+.app.rail-collapsed {
+  grid-template-columns: 64px 1fr;
+}
+
+.nav-brand {
+  width: 100%;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  gap: 6px;
+  align-items: center;
+}
+
+.nav-brand:hover .brand-name,
+.nav-brand:hover .brand-mark {
+  color: var(--accent);
+}
+
+.brand-mark {
+  font-size: 15px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--text);
+}
+
+.brand-toggle {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--muted);
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+
+.nav-brand:hover .brand-toggle,
+.nav-rail.is-collapsed .brand-toggle {
+  opacity: 1;
+}
+
+/* 折叠态：窄条 + 只留图标 */
+.nav-rail.is-collapsed .nav-brand {
+  padding: 18px 0 12px;
+  justify-content: center;
+}
+
+.nav-rail.is-collapsed .brand-toggle {
+  display: none;
+}
+
+.nav-rail.is-collapsed .nav-pri {
+  margin: 0 8px 14px;
+  padding: 9px 0;
+  justify-content: center;
+}
+
+.nav-rail.is-collapsed .nav-list {
+  padding: 0 8px;
+}
+
+.nav-rail.is-collapsed .nav-item {
+  justify-content: center;
+  padding: 9px 0;
+}
+
+/* 只留图标：普通 label（无 class）与 .lbl 都藏起来，caret/ic 保留 */
+.nav-rail.is-collapsed .nav-item > span:not(.ic):not(.caret) {
+  display: none;
+}
+
+.nav-rail.is-collapsed .nav-pri > span:not(.ic),
+.nav-rail.is-collapsed .nav-sublist,
+.nav-rail.is-collapsed .nav-section,
+.nav-rail.is-collapsed .nav-error {
+  display: none;
+}
+
+.nav-rail.is-collapsed .nav-foot {
+  margin-top: auto;
+}
+
+.nav-rail.is-collapsed .nav-foot-item,
+.nav-rail.is-collapsed .nav-user {
+  justify-content: center;
+  padding: 8px 0;
+}
+
+.nav-rail.is-collapsed .nav-foot-item > span:not(.ic),
+.nav-rail.is-collapsed .nav-user .user-name {
+  display: none;
+}
+
+/* 折叠时用户只留头像 chip（不要把它一起藏了） */
+.nav-rail.is-collapsed .nav-user {
+  gap: 0;
+}
+
+/* 「管理」分组头折叠时只剩 caret + ic */
+.nav-rail.is-collapsed .nav-group-head {
+  gap: 2px;
+}
+
+.nav-rail.is-collapsed .nav-group-head .caret {
+  display: none;
 }

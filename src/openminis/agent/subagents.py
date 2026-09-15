@@ -431,13 +431,16 @@ def SettingsStore_get():
 # ---------------------------------------------------------------------------
 # 群聊成员 —— 用户把子代理「拉进群」后，主代理要认识这些同事。
 # ---------------------------------------------------------------------------
-def group_block(store, ids: list[str]) -> str:
-    """把「拉进群的子代理」写成一段系统提示。
+def group_block(store, ids: list[str], humans: list[str] | None = None) -> str:
+    """把「拉进群的成员」写成一段系统提示。
 
-    用户在聊天页把子代理拉进群聊后，主代理得知道这些同事在场、各自擅长什么，
+    用户在聊天页把成员拉进群后，主代理得知道这些同事在场、各自擅长什么，
     才会在合适的时候委派 —— 否则「拉群」只是个摆设。只列**真实存在**的 id
     （前端可能带着陈旧或编造的 id），并把 id 原样写清楚，模型才能直接拿去
     ``subagent_delegate(subagent="…")``。
+
+    ``humans`` 是真人席位（只是名字，不是可委派的子代理）—— 明确告诉模型
+    「这些是人、别拿去委派」，否则它可能把「产品经理」也当成一个子代理。
     """
     rows: list[str] = []
     for raw in ids:
@@ -450,15 +453,30 @@ def group_block(store, ids: list[str]) -> str:
         if desc:
             bits.append(f"：{desc}")
         rows.append("".join(bits))
-    if not rows:
+    human_rows: list[str] = []
+    for raw in humans or []:
+        name = str(raw).strip()
+        if name:
+            human_rows.append(f"- {name}（真人）")
+    if not rows and not human_rows:
         return ""
-    return (
-        "\n\n【群聊成员】用户把下面这些子代理拉进了本会话，它们是你可以委派的同事：\n"
-        + "\n".join(rows)
-        + "\n需要它们的专长时用 `subagent_delegate` 指派（`subagent` 填上面的 id）；"
-        "任务是它们自己的活儿、与主线无关时不要硬派。用户的提问若是直接点名某位成员，"
-        "就委派给那一位。"
-    )
+    parts: list[str] = ["\n\n【群聊成员】"]
+    if rows:
+        parts.append(
+            "用户把下面这些子代理拉进了本会话，它们是你可以委派的同事：\n"
+            + "\n".join(rows)
+            + "\n需要它们的专长时用 `subagent_delegate` 指派（`subagent` 填上面的 id）；"
+            "任务是它们自己的活儿、与主线无关时不要硬派。用户的提问若是直接点名某位成员，"
+            "就委派给那一位。"
+        )
+    if human_rows:
+        parts.append(
+            "\n群里还有真人参与者（**不是子代理、不可委派**，"
+            "只是和你一起看这段对话的人）：\n"
+            + "\n".join(human_rows)
+            + "\n提到他们时按「人」对待，绝不要对这些人名调用 `subagent_delegate`。"
+        )
+    return "".join(parts)
 
 
 # ---------------------------------------------------------------------------

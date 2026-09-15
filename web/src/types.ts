@@ -25,9 +25,27 @@ export interface HealthInfo {
 }
 
 /** WebSocket frames — keep in sync with server/main.py. */
+/** 群聊成员的身份标签（与 ChatView 的 GroupKind 一致；只是显示分组，不新增可执行成员）。 */
+export type GroupMemberKind = 'agent' | 'bot' | 'human'
+
+/** 随 chat 帧上报的群成员：``agent``/``bot`` 是子代理，``human`` 是真人席位。 */
+export interface ChatParticipant {
+  id: string
+  kind: GroupMemberKind
+  name?: string
+}
+
 export type ClientFrame =
   | { type: 'ping' }
-  | { type: 'chat'; text: string; sessionId?: string }
+  | {
+      type: 'chat'
+      text: string
+      sessionId?: string
+      /** 本会话的群成员（后端据此把子代理写进系统提示、把真人席位标成「人」）。 */
+      participants?: ChatParticipant[]
+      /** 「分配项目」：成员 id → 工作空间 id。 */
+      memberProjects?: Record<string, string>
+    }
   | { type: 'shell'; command: string }
 
 export type ServerFrame =

@@ -25,7 +25,9 @@ import { openImagePreview } from './ImageLightbox'
 interface ChatViewProps {
   activeSessionId: string | null
   onChangeSession: (id: string) => void
-  onBackToChat?: () => void
+  /** 微信式布局：聊天页有自己的「好友栏」，盖住应用的左边栏；
+   *  点「返回」回到上一个页面（没有上一个页面时不渲染这个按钮）。 */
+  onExitChat?: () => void
 }
 
 interface UiMessage {
@@ -64,24 +66,69 @@ const USER_SPEAKER: Speaker = {
 /** 「显示子代理过程」开关 —— 群聊里子代理的发言/工具是否展开。 */
 const SHOW_SUB_KEY = 'openminis:group:showSub'
 
+/** 群成员的三类身份（**只是身份标签**，不新增可执行成员）：
+ *  * ``agent`` —— 助理页配的子代理，会被委派、可分配项目；
+ *  * ``bot``   —— 同样是子代理，只是标成「机器人」；
+ *  * ``human`` —— 真人席位（只作为发言人进群，不干活）。 */
+type GroupKind = 'agent' | 'bot' | 'human'
+
+interface GroupMember {
+  id: string
+  kind: GroupKind
+  /** 真人席位的名字（子代理用配置里的名字，不存这里）。 */
+  name?: string
+}
+
+const GROUP_KIND_LABEL: Record<GroupKind, string> = {
+  agent: 'Agent',
+  bot: 'Bot',
+  human: '人',
+}
+const GROUP_KIND_ICON: Record<GroupKind, string> = {
+  agent: '🧭',
+  bot: '⚙️',
+  human: '🙋',
+}
+
 /** 群成员名单按会话存本地（刷新/切回同一个会话仍在群里）。 */
 function groupKey(sessionId: string): string {
   return `openminis:group:members:${sessionId}`
 }
-function loadGroup(sessionId: string | null): string[] {
+function loadGroup(sessionId: string | null): GroupMember[] {
   if (!sessionId) return []
   try {
     const raw = localStorage.getItem(groupKey(sessionId))
     const parsed = raw ? JSON.parse(raw) : []
-    return Array.isArray(parsed) ? parsed.filter((x) => typeof x === 'string') : []
+    if (!Array.isArray(parsed)) return []
+    const out: GroupMember[] = []
+    for (const item of parsed) {
+      if (typeof item === 'string' && item) {
+        // 老版本只存子代理 id 数组 —— 那时进群的都是「Agent」。
+        out.push({ id: item, kind: 'agent' })
+      } else if (item && typeof item === 'object') {
+        const rec = item as Record<string, unknown>
+        const id = typeof rec.id === 'string' ? rec.id : ''
+        const kind = rec.kind
+        if (!id) continue
+        out.push({
+          id,
+          kind:
+            kind === 'bot' || kind === 'human' || kind === 'agent'
+              ? kind
+              : 'agent',
+          name: typeof rec.name === 'string' ? rec.name : undefined,
+        })
+      }
+    }
+    return out
   } catch {
     return []
   }
 }
-function saveGroup(sessionId: string | null, ids: string[]): void {
+function saveGroup(sessionId: string | null, members: GroupMember[]): void {
   if (!sessionId) return
   try {
-    localStorage.setItem(groupKey(sessionId), JSON.stringify(ids))
+    localStorage.setItem(groupKey(sessionId), JSON.stringify(members))
   } catch {
     /* 隐私模式下写不了，忽略 */
   }
@@ -259,6 +306,7 @@ function splitAttachments(text: string): {
 export function ChatView({
   activeSessionId,
   onChangeSession,
+  onExitChat,
 }: ChatViewProps) {
   // sessions list (for the small "switch" chip + the new-session button on top)
   const [sessions, setSessions] = useState<ChatSessionInfo[]>([])
@@ -282,10 +330,12 @@ export function ChatView({
   // 主代理与被拉进群的子代理在同一个聊天框里说话：子代理的发言、它自己调的
   // 工具都由后端的 subagent* 系列帧推来。`seen` 是**实际出现过的**子代理
   // （比名单更真实 —— 模型自己委派出去的也算），名单则是用户手动拉进来的。
-  const [roster, setRoster] = useState<string[]>([])
+  const [roster, setRoster] = useState<GroupMember[]>([])
   const [seen, setSeen] = useState<Speaker[]>([])
   const [candidates, setCandidates] = useState<SubagentInfo[]>([])
   const [groupOpen, setGroupOpen] = useState(false)
+  /** 「拉成员进群」浮层里新建真人席位的名字输入。 */
+  const [humanName, setHumanName] = useState('')
   const [showSub, setShowSub] = useState(true)
   /** 「分配项目」：成员 id → 工作空间 id（子代理各写各的项目目录）。 */
   const [memberProjects, setMemberProjects] = useState<Record<string, string>>({})
@@ -293,7 +343,7 @@ export function ChatView({
   const memberProjectsRef = useRef<Record<string, string>>({})
   const projectRef = useRef<HTMLDivElement | null>(null)
   const groupRef = useRef<HTMLDivElement | null>(null)
-  const rosterRef = useRef<string[]>([])
+  const rosterRef = useRef<GroupMember[]>([])
   const seenRef = useRef<Speaker[]>([])
   // 新增的子代理/工具结果只在**本轮**内有效；换会话时清空。
   const rememberSub = useCallback((sp: Speaker) => {
@@ -387,19 +437,54 @@ export function ChatView({
     setProjectOpen(false)
   }, [activeSessionId])
 
+  /** 拉进 / 请出群成员。``kind`` 只是身份标签：agent / bot 都是子代理，
+   *  human 是真人席位（只挂个名字，不干活）。 */
   const toggleMember = useCallback(
-    (id: string) => {
+    (id: string, kind: GroupKind = 'agent', name?: string) => {
       const cur = rosterRef.current
-      const next = cur.includes(id)
-        ? cur.filter((x) => x !== id)
-        : [...cur, id]
+      const exists = cur.some((m) => m.id === id)
+      const next = exists
+        ? cur.filter((m) => m.id !== id)
+        : [...cur, { id, kind, name }]
       rosterRef.current = next
       setRoster(next)
       saveGroup(activeSessionId, next)
       // 请出群的人顺带清掉它的项目分配，免得下次拉回来还带着旧目录。
-      if (!next.includes(id)) setMemberProject(id, '')
+      if (exists) setMemberProject(id, '')
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
+    [activeSessionId],
+  )
+
+  /** 改某个成员的身份标签（agent ⇄ bot）；若它还没进群，顺手拉进来。 */
+  const setMemberKind = useCallback(
+    (id: string, kind: GroupKind, name?: string) => {
+      const cur = rosterRef.current
+      const has = cur.some((m) => m.id === id)
+      const next = has
+        ? cur.map((m) => (m.id === id ? { ...m, kind } : m))
+        : [...cur, { id, kind, name }]
+      rosterRef.current = next
+      setRoster(next)
+      saveGroup(activeSessionId, next)
+    },
+    [activeSessionId],
+  )
+
+  /** 加一个真人席位进群（只是发言人，不新增任何可执行成员）。 */
+  const addHumanSeat = useCallback(
+    (rawName: string) => {
+      const name = rawName.trim()
+      if (!name) return
+      const cur = rosterRef.current
+      // 用自增序号做 id，避免同名冲突；名字存下来给系统提示用。
+      let n = 1
+      while (cur.some((m) => m.id === `human:${n}`)) n += 1
+      const next = [...cur, { id: `human:${n}`, kind: 'human' as GroupKind, name }]
+      rosterRef.current = next
+      setRoster(next)
+      saveGroup(activeSessionId, next)
+    },
     [activeSessionId],
   )
 
@@ -822,22 +907,61 @@ export function ChatView({
 
   // 群成员条要显示的人：名单里的（用户拉进来的）+ 本轮实际出现过的
   // （模型自己委派出去的也算 —— 否则「群里冒出一个陌生名字」）。
-  const memberSpeakers = useMemo<Speaker[]>(() => {
-    const out: Speaker[] = []
-    for (const id of roster) {
-      const cfg = candidates.find((c) => c.id === id)
+  // 每一条都带上「身份标签」（agent / bot / 人）用于分组显示 —— 只是标签，
+  // 不改谁能干活：真人席位永远只是发言人。
+  interface GroupChip {
+    id: string
+    name: string
+    emoji: string
+    groupKind: GroupKind
+    /** 本轮实际开过麦（子代理）。 */
+    active: boolean
+    /** 在名单里（可请出群）；模型临时委派的成员不在此列。 */
+    inRoster: boolean
+  }
+  const groupChips = useMemo<GroupChip[]>(() => {
+    const out: GroupChip[] = []
+    for (const m of roster) {
+      if (m.kind === 'human') {
+        out.push({
+          id: m.id,
+          name: m.name || '真人',
+          emoji: GROUP_KIND_ICON.human,
+          groupKind: 'human',
+          active: false,
+          inRoster: true,
+        })
+        continue
+      }
+      const cfg = candidates.find((c) => c.id === m.id)
       out.push({
-        id,
-        name: cfg?.name || id,
-        emoji: cfg?.emoji || '🤖',
-        kind: 'sub',
+        id: m.id,
+        name: cfg?.name || m.id,
+        emoji: cfg?.emoji || (m.kind === 'bot' ? GROUP_KIND_ICON.bot : '🤖'),
+        groupKind: m.kind,
+        active: seen.some((s) => s.id === m.id),
+        inRoster: true,
       })
     }
     for (const sp of seen) {
-      if (!out.some((m) => m.id === sp.id)) out.push(sp)
+      if (out.some((c) => c.id === sp.id)) continue
+      out.push({
+        id: sp.id,
+        name: sp.name,
+        emoji: sp.emoji,
+        groupKind: 'agent',
+        active: true,
+        inRoster: false,
+      })
     }
     return out
   }, [roster, candidates, seen])
+
+  /** 名单里的真人席位（只是发言人）。 */
+  const humanSeats = useMemo(
+    () => roster.filter((m) => m.kind === 'human'),
+    [roster],
+  )
 
   // 折叠子代理过程时只把它们的发言/工具摘出去 —— `messages` 本身不动，
   // 主代理的流式拼接不受影响。
@@ -849,6 +973,90 @@ export function ChatView({
   // -- render --------------------------------------------------------------
   return (
     <div className="view chat chat-with-rail">
+      {/* 微信式「好友栏」：盖住应用的左边栏 —— 顶部是返回 + 新建，下面是
+          「好友」（群里的人与可拉进群的子代理）和「会话」两段列表。 */}
+      <aside className="chat-contacts">
+        <div className="cc-head">
+          {onExitChat && (
+            <button className="cc-back" onClick={onExitChat} title="返回上一页">
+              ❮ 返回
+            </button>
+          )}
+          <button
+            className="cc-new"
+            onClick={() => void createChatHere(null)}
+            title="新建会话"
+          >
+            ＋ 新建
+          </button>
+        </div>
+
+        <div className="cc-scroll">
+          <div className="cc-section">好友</div>
+          <button className="cc-item is-static" title="你">
+            <span className="cc-ava is-user">{USER_SPEAKER.emoji}</span>
+            <span className="cc-name">你</span>
+          </button>
+          <button className="cc-item is-static" title="主代理（替你和子代理对接）">
+            <span className="cc-ava is-main">{MAIN_SPEAKER.emoji}</span>
+            <span className="cc-name">主代理</span>
+          </button>
+          {candidates.map((c) => {
+            const inGroup = roster.some((m) => m.id === c.id)
+            return (
+              <button
+                key={c.id}
+                className={`cc-item${inGroup ? ' in-group' : ''}`}
+                title={
+                  inGroup
+                    ? `${c.name} 在群里 —— 点一下请出群`
+                    : `点一下把 ${c.name} 拉进群聊`
+                }
+                onClick={() => toggleMember(c.id, 'agent', c.name || c.id)}
+              >
+                <span className="cc-ava">{c.emoji || '🤖'}</span>
+                <span className="cc-name">{c.name}</span>
+                {inGroup && <span className="cc-badge">群</span>}
+              </button>
+            )
+          })}
+          {humanSeats.map((m) => (
+            <button
+              key={m.id}
+              className="cc-item in-group is-kind-human"
+              title={`${m.name}（真人席位）—— 点一下请出群`}
+              onClick={() => toggleMember(m.id, 'human', m.name)}
+            >
+              <span className="cc-ava">{GROUP_KIND_ICON.human}</span>
+              <span className="cc-name">{m.name}</span>
+              <span className="cc-badge">人</span>
+            </button>
+          ))}
+
+          <div className="cc-section">
+            会话<span className="cc-count">{sessions.length}</span>
+          </div>
+          {sessions.length === 0 && <div className="cc-empty">暂无会话</div>}
+          {sessions.map((s) => {
+            const ws = s.folderId
+              ? workspaces.find((w) => w.id === s.folderId)
+              : undefined
+            return (
+              <button
+                key={s.id}
+                className={`cc-item${s.id === activeSessionId ? ' active' : ''}`}
+                title={ws ? `${ws.name} · ${s.title}` : s.title}
+                onClick={() => onChangeSession(s.id)}
+              >
+                <span className="cc-ava">{ws ? '📁' : '💬'}</span>
+                <span className="cc-name">{s.title}</span>
+                {ws && <span className="cc-badge">{ws.name}</span>}
+              </button>
+            )
+          })}
+        </div>
+      </aside>
+
       <section className="chat-main">
         <div className="chat-topbar">
           <div className="picker" ref={pickerRef}>
@@ -941,49 +1149,58 @@ export function ChatView({
           </button>
         </div>
 
-        {/* 群聊成员条：主代理 + 被拉进群的子代理。子代理实际开麦时会把名字
-            挂在这里，用户可以随时把成员拉进来 / 请出去。 */}
+        {/* 群聊成员条：主代理 + 被拉进群的成员。**只显示头像/图标**（名字放
+            tooltip），身份用颜色 + 角标区分，免得占地方。 */}
         <div className="chat-groupbar" ref={groupRef}>
-          <div className="group-members" title="本会话的群成员">
+          <div className="group-members">
             <span className="group-chip is-user" title="你">
               <span className="group-ava">{USER_SPEAKER.emoji}</span>
-              {USER_SPEAKER.name}
             </span>
             <span className="group-chip is-main" title="主代理（替你和子代理对接）">
               <span className="group-ava">{MAIN_SPEAKER.emoji}</span>
-              {MAIN_SPEAKER.name}
             </span>
-            {memberSpeakers.map((m) => {
-              const projId = memberProjects[m.id]
+            {groupChips.map((m) => {
+              // 真人席位不干活，没有「分配项目」这一说。
+              const projId = m.groupKind === 'human' ? '' : memberProjects[m.id]
               const proj = projId
                 ? workspaces.find((w) => w.id === projId)
                 : undefined
+              const kindLabel = GROUP_KIND_LABEL[m.groupKind]
               return (
                 <span
                   key={m.id}
-                  className={`group-chip is-sub${
-                    seen.some((s) => s.id === m.id) ? ' is-active' : ''
+                  className={`group-chip is-sub is-kind-${m.groupKind}${
+                    m.active ? ' is-active' : ''
                   }`}
                   title={
-                    seen.some((s) => s.id === m.id)
-                      ? `${m.name}（本轮已参与）`
-                      : `${m.name}（已拉进群，还没被委派）`
+                    m.groupKind === 'human'
+                      ? `${m.name}（人 · 真人席位，只是发言人，不干活）`
+                      : m.active
+                        ? `${m.name}（${kindLabel} · 本轮已参与）`
+                        : `${m.name}（${kindLabel} · 已拉进群，还没被委派）`
                   }
                 >
-                  <span className="group-ava">{m.emoji}</span>
-                  {m.name}
+                  <span className="group-ava">
+                    {m.emoji}
+                    {/* 身份角标：Agent 无点、Bot 蓝点、人 橙点（图不看名字也认得出）。 */}
+                    {m.groupKind !== 'agent' && (
+                      <i className={`group-dot is-${m.groupKind}`} />
+                    )}
+                  </span>
                   {proj && (
                     <span className="group-proj-tag" title={proj.path || '沙箱目录'}>
-                      📁 {proj.name}
+                      📁
                     </span>
                   )}
                   <button
                     type="button"
-                    className="group-x"
-                    title="请出群"
-                    onClick={() => toggleMember(m.id)}
+                    className={`group-x${m.inRoster ? '' : ' is-add'}`}
+                    title={m.inRoster ? '请出群' : '拉进群'}
+                    onClick={() =>
+                      toggleMember(m.id, m.groupKind === 'human' ? 'human' : 'agent', m.name)
+                    }
                   >
-                    ×
+                    {m.inRoster ? '×' : '＋'}
                   </button>
                 </span>
               )
@@ -1048,14 +1265,22 @@ export function ChatView({
                 type="button"
                 className="group-add"
                 onClick={() => setGroupOpen((v) => !v)}
-                title="把子代理拉进群聊（主代理会认识它们并按需委派）"
+                title="拉成员进群：Agent / Bot（子代理）或真人席位"
               >
-                ＋ 拉子代理进群
+                ＋ 拉成员进群
               </button>
               {groupOpen && (
                 <div className="group-pop">
                   <div className="group-pop-title">
-                    助理页配置的子代理（可单独分配项目）
+                    拉成员进群 —— Agent / Bot / 人
+                  </div>
+                  <div className="group-pop-legend">
+                    身份只是标签：
+                    <span className="group-kind-tag is-agent">Agent</span>
+                    <span className="group-kind-tag is-bot">Bot</span>
+                    都是子代理，可被委派；
+                    <span className="group-kind-tag is-human">人</span>
+                    只作为发言人进群，不干活。
                   </div>
                   {candidates.length === 0 && (
                     <div className="muted empty-line">
@@ -1063,41 +1288,113 @@ export function ChatView({
                     </div>
                   )}
                   <ul className="group-pop-list">
-                    {candidates.map((c) => (
-                      <li
-                        key={c.id}
-                        className={roster.includes(c.id) ? 'on' : ''}
-                        onClick={() => toggleMember(c.id)}
-                      >
-                        <span className="group-ava">{c.emoji || '🤖'}</span>
-                        <span className="group-pop-name">
-                          {c.name}
-                          <span className="group-pop-id">{c.id}</span>
-                        </span>
-                        {roster.includes(c.id) && workspaces.length > 0 && (
+                    {candidates.map((c) => {
+                      const entry = roster.find((m) => m.id === c.id)
+                      const kind: GroupKind =
+                        entry && entry.kind !== 'human' ? entry.kind : 'agent'
+                      const label = c.name || c.id
+                      return (
+                        <li key={c.id} className={entry ? 'on' : ''}>
+                          <span
+                            className="group-pop-hit"
+                            onClick={() => toggleMember(c.id, kind, label)}
+                          >
+                            <span className="group-ava">{c.emoji || '🤖'}</span>
+                            <span className="group-pop-name">
+                              {c.name}
+                              <span className="group-pop-id">{c.id}</span>
+                            </span>
+                          </span>
                           <select
-                            className="group-pop-proj"
-                            value={memberProjects[c.id] ?? ''}
-                            title="给这个成员分配项目目录"
+                            className="group-pop-kind"
+                            value={kind}
+                            title="身份标签：Agent 或 Bot（都还是子代理）"
                             onClick={(e) => e.stopPropagation()}
                             onChange={(e) =>
-                              setMemberProject(c.id, e.target.value)
+                              setMemberKind(c.id, e.target.value as GroupKind, label)
                             }
                           >
-                            <option value="">跟随群项目</option>
-                            {workspaces.map((w) => (
-                              <option key={w.id} value={w.id}>
-                                📁 {w.name}
-                              </option>
-                            ))}
+                            <option value="agent">🧭 Agent</option>
+                            <option value="bot">⚙️ Bot</option>
                           </select>
-                        )}
-                        <span className="group-pop-check">
-                          {roster.includes(c.id) ? '✓' : '＋'}
-                        </span>
-                      </li>
-                    ))}
+                          {entry && workspaces.length > 0 && (
+                            <select
+                              className="group-pop-proj"
+                              value={memberProjects[c.id] ?? ''}
+                              title="给这个成员分配项目目录"
+                              onClick={(e) => e.stopPropagation()}
+                              onChange={(e) =>
+                                setMemberProject(c.id, e.target.value)
+                              }
+                            >
+                              <option value="">跟随群项目</option>
+                              {workspaces.map((w) => (
+                                <option key={w.id} value={w.id}>
+                                  📁 {w.name}
+                                </option>
+                              ))}
+                            </select>
+                          )}
+                          <span
+                            className="group-pop-check"
+                            onClick={() => toggleMember(c.id, kind, label)}
+                          >
+                            {entry ? '✓' : '＋'}
+                          </span>
+                        </li>
+                      )
+                    })}
                   </ul>
+
+                  <div className="group-pop-sep">真人席位</div>
+                  <div className="group-pop-humanadd">
+                    <input
+                      value={humanName}
+                      placeholder="名字，如「产品经理」"
+                      onChange={(e) => setHumanName(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') {
+                          addHumanSeat(humanName)
+                          setHumanName('')
+                        }
+                      }}
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        addHumanSeat(humanName)
+                        setHumanName('')
+                      }}
+                    >
+                      添加
+                    </button>
+                  </div>
+                  {humanSeats.length > 0 && (
+                    <ul className="group-pop-list">
+                      {humanSeats.map((m) => (
+                        <li key={m.id} className="on">
+                          <span
+                            className="group-pop-hit"
+                            onClick={() => toggleMember(m.id, 'human', m.name)}
+                          >
+                            <span className="group-ava">
+                              {GROUP_KIND_ICON.human}
+                            </span>
+                            <span className="group-pop-name">
+                              {m.name}
+                              <span className="group-pop-id">{m.id}</span>
+                            </span>
+                          </span>
+                          <span
+                            className="group-pop-check"
+                            onClick={() => toggleMember(m.id, 'human', m.name)}
+                          >
+                            ×
+                          </span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
                 </div>
               )}
             </div>
@@ -1415,21 +1712,51 @@ function Bubble({
   )
 }
 
+/**
+ * 工具卡片的展开状态 —— **全局持久化**的纯 UI 偏好。
+ *
+ * 默认「缩小显示」（只留一行：图标 + 工具名 + 状态），点开头行才展开调用参数
+ * 与输出。这个开关只写 localStorage，**绝不随 chat 帧进后端、也不进模型上下文** ——
+ * 工具结果该给的照给，这里改的只是「用户想不想看细节」。
+ */
+const TOOL_OPEN_KEY = 'openminis:tool-open'
+
+function readToolOpen(): boolean {
+  try {
+    return localStorage.getItem(TOOL_OPEN_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+function writeToolOpen(open: boolean): void {
+  try {
+    localStorage.setItem(TOOL_OPEN_KEY, open ? '1' : '0')
+  } catch {
+    /* 隐私模式下写不了，忽略 */
+  }
+}
+
 function ToolCard({ call }: { call: ToolCallCard }) {
-  const [open, setOpen] = useState(false)
+  const [open, setOpen] = useState<boolean>(() => readToolOpen())
   const state =
     call.ok === undefined ? 'running' : call.ok ? 'ok' : 'err'
+  const toggle = () =>
+    setOpen((v) => {
+      const next = !v
+      writeToolOpen(next)
+      return next
+    })
   return (
-    <div className={`tool-card tool-${state}`}>
-      <button
-        className="tool-head"
-        onClick={() => setOpen((v) => !v)}
-        type="button"
-      >
+    <div className={`tool-card tool-${state}${open ? ' is-open' : ' is-collapsed'}`}>
+      <button className="tool-head" onClick={toggle} type="button">
         <span className="tool-glyph">{iconFor(call.name)}</span>
         <span className="tool-name">{call.name}</span>
         <span className="tool-state">
           {state === 'running' ? '执行中…' : state === 'ok' ? '✓' : '✗'}
+        </span>
+        <span className="tool-caret" aria-hidden="true">
+          {open ? '⌃' : '⌄'}
         </span>
       </button>
       {open && (

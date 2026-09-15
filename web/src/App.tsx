@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { ChatView } from './components/ChatView'
 import { Sidebar, type ViewId } from './components/Sidebar'
 import { SandboxView } from './components/SandboxView'
@@ -25,6 +25,12 @@ export default function App() {
   const [view, setView] = useState<ViewId>('chat')
   const [activeId, setActiveId] = useState<string | null>(null)
   const [, setWorkspaces] = useState<WorkspaceInfo[]>([])
+  // 左边栏折叠：点「OpenMinis」图标切换（存本地，下次打开保持）。
+  const [railCollapsed, setRailCollapsed] = useState(false)
+  // 微信式聊天布局：聊天页有自己的「好友栏」盖住展开的左边栏，左边栏
+  // 在聊天页只留 64px 图标条；「返回」回到进入聊天前的那个页面。
+  const [prevView, setPrevView] = useState<ViewId | null>(null)
+  const viewRef = useRef<ViewId>('chat')
 
   // 访问闸门：设了「进入密码」且未解锁时，整个界面换成锁屏 —— 用户明确要求
   // 「锁了就该只看到输入框」。'checking' 期间也不渲染界面，避免先漏一眼内容。
@@ -57,8 +63,14 @@ export default function App() {
   useEffect(() => {
     const savedView = localStorage.getItem('openminis:view') as ViewId | null
     const savedSession = localStorage.getItem('openminis:active-session')
-    if (savedView) setView(savedView)
+    if (savedView) {
+      viewRef.current = savedView
+      setView(savedView)
+    }
     if (savedSession) setActiveId(savedSession)
+    if (localStorage.getItem('openminis:rail-collapsed') === '1') {
+      setRailCollapsed(true)
+    }
   }, [])
 
   // 背景偏好来自后端 config（不是 localStorage）—— 它跟着数据目录走，
@@ -82,13 +94,36 @@ export default function App() {
     else localStorage.removeItem('openminis:active-session')
   }, [activeId])
 
+  const toggleRail = useCallback(() => {
+    setRailCollapsed((v) => {
+      const next = !v
+      localStorage.setItem('openminis:rail-collapsed', next ? '1' : '0')
+      return next
+    })
+  }, [])
+
+  // 统一的换页入口：进聊天前记住「从哪来」，返回键才有的放矢。
+  const changeView = useCallback((v: ViewId) => {
+    if (viewRef.current !== 'chat' && v === 'chat') {
+      setPrevView(viewRef.current)
+    }
+    viewRef.current = v
+    setView(v)
+  }, [])
+
+  const exitChat = useCallback(() => {
+    const target = prevView ?? 'projects'
+    viewRef.current = target
+    setView(target)
+  }, [prevView])
+
   // listen for "focus session" events from sibling views
   useEffect(() => {
     const onFocus = (e: Event) => {
       const sid = (e as CustomEvent<string>).detail
       if (sid) {
         setActiveId(sid)
-        setView('chat')
+        changeView('chat')
       }
     }
     window.addEventListener('openminis:focus-session', onFocus as EventListener)
@@ -97,7 +132,7 @@ export default function App() {
         'openminis:focus-session',
         onFocus as EventListener,
       )
-  }, [])
+  }, [changeView])
 
   const selectSession = useCallback((id: string) => {
     setActiveId(id)
@@ -137,12 +172,15 @@ export default function App() {
   }
 
   return (
-    <div className={`app app-${view}`}>
+    <div className={`app app-${view}${railCollapsed ? ' rail-collapsed' : ''}`}>
       <ImageLightbox />
       <Sidebar
         view={view}
         activeSessionId={activeId}
-        onChangeView={setView}
+        // 微信式：聊天页只留 64px 图标条（好友栏顶替了展开的列表）。
+        collapsed={railCollapsed || view === 'chat'}
+        onToggleCollapsed={toggleRail}
+        onChangeView={changeView}
         onSelectSession={selectSession}
         onCreateSession={createSession}
         onDeleteSession={deleteSession}
@@ -155,7 +193,7 @@ export default function App() {
           <ChatView
             activeSessionId={activeId}
             onChangeSession={selectSession}
-            onBackToChat={() => setView('chat')}
+            onExitChat={exitChat}
           />
         )}
         {view === 'knowledge' && (
