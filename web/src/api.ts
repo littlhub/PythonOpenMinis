@@ -467,6 +467,10 @@ export interface OpenSocketOptions {
    *  setters from here — they're invoked synchronously from the browser event
    *  loop. */
   onStateChange?: (s: SocketState) => void
+  /** 断线后**重新**连上的那一刻回调一次（首次连接不算）。
+   *  断线期间的流式帧是发给旧连接的，收不回来了 —— 调用方据此重拉历史、
+   *  清掉「在跑」标记，否则界面会一直卡在生成中，只能刷新页面。 */
+  onReconnect?: () => void
 }
 
 export interface OpenSocketHandle {
@@ -481,69 +485,14 @@ export interface OpenSocketHandle {
   state: SocketState
 }
 
-/** Standalone helper: creates a WebSocket with auto-reconnect.
- * Kept separate from openSocket so the function is hoisted above its call site,
- * avoiding a TDZ error under module: ESNext + isolatedModules. */
-function makeSocket(
-  onFrame: (frame: ServerFrame) => void,
-  opts: OpenSocketOptions,
-  getState: () => SocketState,
-  setState: (s: SocketState) => void,
-  pendingRef: { current: string[] },
-  backoffRef: { current: number },
-  closedRef: { current: boolean },
-  closingRef: { current: boolean },
-): WebSocket {
-  setState('connecting')
-  const sock = new WebSocket(WS_URL)
-  sock.onmessage = (event) => {
-    try {
-      onFrame(JSON.parse(event.data as string) as ServerFrame)
-    } catch {
-      onFrame({ type: 'error', error: 'bad frame from server' })
-    }
-  }
-  sock.onopen = () => {
-    backoffRef.current = 1000
-    for (const m of pendingRef.current) sock.send(m)
-    pendingRef.current = []
-    setState('open')
-  }
-  sock.onclose = (event) => {
-    // 4401 = 服务端因「页面已锁定」拒绝握手（WS 不走 /api/，闸门单独判定）。
-    // 这种情况别重连 —— 广播出去让 App 换成锁屏。
-    if (event.code === 4401) {
-      closedRef.current = true
-      setState('closed')
-      window.dispatchEvent(new CustomEvent('openminis:locked'))
-      return
-    }
-    if (closedRef.current || closingRef.current) {
-      setState('closed')
-      return
-    }
-    setState('connecting')
-    const wait = backoffRef.current
-    backoffRef.current = Math.min(backoffRef.current * 2, 30_000)
-    setTimeout(() => {
-      if (closedRef.current || closingRef.current) return
-      try {
-        makeSocket(onFrame, opts, getState, setState, pendingRef, backoffRef, closedRef, closingRef)
-      } catch {
-        /* ignore */
-      }
-    }, wait)
-  }
-  sock.onerror = () => {
-    try {
-      sock.close()
-    } catch {
-      /* ignore */
-    }
-  }
-  return sock
-}
-
+/** Creates a WebSocket with auto-reconnect, heartbeat and wake-up resume.
+ *
+ *  2026-09 修复：以前重连出来的新 socket **没有写回** ``ws`` 变量 —— 老连接
+ *  一断，``handle.send`` / ``readyState`` 就永远盯着那把已经死掉的 socket，
+ *  于是重连虽然悄悄成功，消息却全塞进队列发不出去（只有下次重连的 onopen
+ *  才会 flush）。用户侧的体感就是「断线后怎么点都没反应，只能刷新页面」。
+ *  现在当前连接存在闭包里，每次 (重) 连都覆盖它，并顺手加上心跳探活。
+ */
 export function openSocket(
   onFrame: (frame: ServerFrame) => void,
   opts: OpenSocketOptions = {},
@@ -553,6 +502,18 @@ export function openSocket(
   let closing = false
   let backoff = 1000
   const pending: string[] = []
+  /** 当前这把连接。重连会换成新的，必须换掉这个引用（见上面的注释）。 */
+  let ws: WebSocket | null = null
+  let retryTimer: ReturnType<typeof setTimeout> | null = null
+  let beatTimer: ReturnType<typeof setInterval> | null = null
+  /** 最近一次收到服务端帧（含 pong）的时间 —— 用来判链路是不是已经死了。 */
+  let lastSeen = 0
+  /** 是否成功连上过：用来区分「首次连接」和「断线重连」。 */
+  let everOpened = false
+
+  const HEARTBEAT_MS = 20_000
+  /** 这么久没有任何回包就当作链路已死（休眠/切网/NAT 超时都不会发 FIN）。 */
+  const STALE_MS = 55_000
 
   const emit = () => opts.onStateChange?.(state)
 
@@ -562,29 +523,155 @@ export function openSocket(
     emit()
   }
 
-  // makeSocket is defined above; calling it here is safe.
-  let ws: WebSocket = makeSocket(onFrame, opts, () => state, setState, { current: pending }, { current: backoff }, { current: closed }, { current: closing })
+  function stopBeat() {
+    if (beatTimer !== null) {
+      clearInterval(beatTimer)
+      beatTimer = null
+    }
+  }
+
+  function scheduleRetry() {
+    if (closed || closing || retryTimer !== null) return
+    setState('connecting')
+    const wait = backoff
+    backoff = Math.min(backoff * 2, 30_000)
+    retryTimer = setTimeout(() => {
+      retryTimer = null
+      connect()
+    }, wait)
+  }
+
+  /** 立刻（重）连 —— 退避重连、心跳判死、页面重新可见都走这里。 */
+  function connect() {
+    if (closed || closing) return
+    if (retryTimer !== null) {
+      clearTimeout(retryTimer)
+      retryTimer = null
+    }
+    setState('connecting')
+    let sock: WebSocket
+    try {
+      sock = new WebSocket(WS_URL)
+    } catch {
+      scheduleRetry()
+      return
+    }
+    ws = sock
+    sock.onmessage = (event) => {
+      lastSeen = Date.now()
+      let frame: ServerFrame
+      try {
+        frame = JSON.parse(event.data as string) as ServerFrame
+      } catch {
+        onFrame({ type: 'error', error: 'bad frame from server' })
+        return
+      }
+      // 心跳回包只用来探活，不进业务帧流。
+      if ((frame as { type?: string }).type === 'pong') return
+      onFrame(frame)
+    }
+    sock.onopen = () => {
+      backoff = 1000
+      lastSeen = Date.now()
+      const queued = pending.splice(0, pending.length)
+      for (const m of queued) {
+        try {
+          sock.send(m)
+        } catch {
+          pending.push(m)
+        }
+      }
+      setState('open')
+      if (everOpened) opts.onReconnect?.()
+      everOpened = true
+      stopBeat()
+      beatTimer = setInterval(() => {
+        if (ws !== sock || sock.readyState !== WebSocket.OPEN) return
+        if (Date.now() - lastSeen > STALE_MS) {
+          // 发得出去、收不回来 = 链路已死：主动关掉交给 onclose 重连，
+          // 比等 TCP 自己超时（可能几分钟）快得多。
+          try {
+            sock.close()
+          } catch {
+            /* ignore */
+          }
+          return
+        }
+        try {
+          sock.send(JSON.stringify({ type: 'ping' }))
+        } catch {
+          /* ignore */
+        }
+      }, HEARTBEAT_MS)
+    }
+    sock.onclose = (event) => {
+      stopBeat()
+      // 4401 = 服务端因「页面已锁定」拒绝握手（WS 不走 /api/，闸门单独判定）。
+      // 这种情况别重连 —— 广播出去让 App 换成锁屏。
+      if (event.code === 4401) {
+        closed = true
+        setState('closed')
+        window.dispatchEvent(new CustomEvent('openminis:locked'))
+        return
+      }
+      if (closed || closing) {
+        setState('closed')
+        return
+      }
+      scheduleRetry()
+    }
+    sock.onerror = () => {
+      try {
+        sock.close()
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  /** 页面重新可见 / 网络恢复 / 从缓存恢复：不等退避，立刻试一次。 */
+  function kick() {
+    if (closed || closing) return
+    if (ws && ws.readyState === WebSocket.OPEN) return
+    connect()
+  }
+
+  const onWake = () => {
+    if (document.visibilityState === 'visible') kick()
+  }
+  document.addEventListener('visibilitychange', onWake)
+  window.addEventListener('online', kick)
+  window.addEventListener('pageshow', kick)
+
+  connect()
 
   const handle: OpenSocketHandle = {
     send: (data: string) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(data)
-      } else {
-        pending.push(data)
-      }
+      const sock = ws
+      if (sock && sock.readyState === WebSocket.OPEN) sock.send(data)
+      // 断网期间先排队，重连的 onopen 会一次性 flush；给个上限免得撑爆内存。
+      else if (pending.length < 200) pending.push(data)
     },
     close: () => {
       closed = true
       closing = true
+      if (retryTimer !== null) {
+        clearTimeout(retryTimer)
+        retryTimer = null
+      }
+      stopBeat()
+      document.removeEventListener('visibilitychange', onWake)
+      window.removeEventListener('online', kick)
+      window.removeEventListener('pageshow', kick)
       setState('closing')
       try {
-        ws.close()
+        ws?.close()
       } catch {
         /* ignore */
       }
     },
     get readyState() {
-      return ws.readyState
+      return ws ? ws.readyState : WebSocket.CLOSED
     },
     get state() {
       return state

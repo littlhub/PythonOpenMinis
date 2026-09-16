@@ -17,6 +17,8 @@ build/
 # Frontend
 web/node_modules/
 web/*.tsbuildinfo
+# npm run check:ws 的中间产物
+web/scripts/.ws-check.mjs
 
 # Scratch / local temp (never tracked)
 tmp/

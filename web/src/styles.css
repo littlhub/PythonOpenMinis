@@ -5453,6 +5453,11 @@ dl.facts.usage-detail {
   display: none;
 }
 
+/* 右栏收起后的边缘把手：同样只在手机出现（窄屏规则见下）。 */
+.mobile-toolbar-btn {
+  display: none;
+}
+
 .rail-backdrop {
   display: none;
 }
@@ -5538,18 +5543,33 @@ dl.facts.usage-detail {
     padding-left: 64px;
   }
 
-  /* 顶栏收紧：会话选择器限宽，模式徽标变小 */
+  /* 顶栏收紧：会话选择器吃掉剩余宽度，右侧的「工具栏」开关绝不被挤掉 */
   .chat-topbar {
     padding: 6px 10px;
     gap: 6px;
+    flex-wrap: nowrap;
+    overflow: hidden;
+  }
+
+  /* 占位符换成"选择器自适应" —— 原来两边各撑一份 flex，窄屏下右上角的
+     按钮就被推出屏幕（用户反馈「工具栏按钮被顶栏挡住了」）。 */
+  .topbar-spacer {
+    display: none;
+  }
+
+  .chat-topbar .picker {
+    flex: 1 1 auto;
+    min-width: 0;
   }
 
   .chat-topbar .picker-trigger {
-    max-width: 44vw;
+    width: 100%;
+    max-width: none;
   }
 
   .chat-topbar .picker-label {
-    max-width: 36vw;
+    flex: 1 1 auto;
+    max-width: none;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -5560,29 +5580,66 @@ dl.facts.usage-detail {
     font-size: 11px;
   }
 
+  /* 项目名在群成员条的「📁 项目」里也有，窄屏先从顶栏撤掉 */
   .topbar-ws-tag {
-    max-width: 24vw;
-    overflow: hidden;
-    text-overflow: ellipsis;
+    display: none;
   }
 
-  /* 群成员条（好友栏）压成单行横向滚动：不再换行叠三层，
-     成员头像 + 项目/拉人/子代理开关都在，滑动可达 */
+  /* 「收起/展开工具栏」按钮窄屏只剩箭头 —— 文字省下的宽度留给会话名 */
+  .rp-toggle-edge {
+    flex: 0 0 auto;
+    font-size: 0;
+    padding: 6px 11px;
+  }
+
+  .rp-toggle-edge .rp-arrow {
+    font-size: 14px;
+    font-weight: 400;
+  }
+
+  /* 右栏收起后的展开入口：贴着屏幕右缘的把手（拇指够得到，
+     也不跟右下角的发送按钮打架） */
+  .mobile-toolbar-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: fixed;
+    right: 0;
+    top: 38%;
+    width: 30px;
+    height: 58px;
+    z-index: 70;
+    border: 1px solid var(--border);
+    border-right: 0;
+    border-radius: 10px 0 0 10px;
+    background: var(--panel);
+    color: var(--text);
+    font-size: 15px;
+    box-shadow: -4px 0 14px rgba(0, 0, 0, 0.14);
+    cursor: pointer;
+  }
+
+  /* 群成员条（好友栏）：成员头像那截横向滚动，操作按钮钉在右侧。
+     ⚠ chat-groupbar 本身**不能**是滚动容器 —— 「拉成员进群」「切换项目」
+     两个浮层是 absolute 定位的子元素，被 overflow 裁掉之后就成了
+     「点了没反应」（竖屏上尤其明显）。滚动交给 .group-members。 */
   .chat-groupbar {
     flex-wrap: nowrap;
-    overflow-x: auto;
-    gap: 6px;
+    overflow: visible;
+    gap: 8px;
     padding: 4px 8px;
-    scrollbar-width: none;
-  }
-
-  .chat-groupbar::-webkit-scrollbar {
-    display: none;
   }
 
   .group-members {
     flex-wrap: nowrap;
-    flex-shrink: 0;
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .group-members::-webkit-scrollbar {
+    display: none;
   }
 
   .group-actions {
@@ -5595,8 +5652,82 @@ dl.facts.usage-detail {
   .group-add,
   .group-toggle {
     font-size: 11px;
-    padding: 3px 8px;
+    padding: 5px 8px;
     white-space: nowrap;
+  }
+
+  /* 浮层：改成贴底的 sheet。原来 absolute + right:0 跟着按钮走，而按钮在
+     横向滚动的操作区里、右边还有「子代理过程」，300px 宽的浮层会直接顶出
+     屏幕左缘（看起来就是「点了没反应」）。改成 fixed 之后跟着屏幕走，
+     位置与按钮停在哪无关，拇指也够得到。 */
+  .group-pop {
+    position: fixed;
+    left: 8px;
+    right: 8px;
+    top: auto;
+    bottom: 8px;
+    min-width: 0;
+    max-width: none;
+    max-height: min(64vh, 520px);
+    z-index: 92;
+    border-radius: 16px;
+    box-shadow: 0 -10px 34px rgba(0, 0, 0, 0.26);
+  }
+
+  .group-pop-list li {
+    flex-wrap: wrap;
+    row-gap: 6px;
+    padding: 8px;
+    min-height: 40px;
+  }
+
+  .group-pop-hit {
+    flex: 1 1 55%;
+  }
+
+  .group-pop-kind,
+  .group-pop-proj {
+    flex: 1 1 auto;
+    min-width: 0;
+    max-width: none;
+  }
+
+  .group-pop-check {
+    padding: 4px 6px;
+  }
+
+  .group-pop-humanadd input,
+  .group-pop-humanadd button {
+    font-size: 13px;
+    padding: 7px 10px;
+  }
+}
+
+/* ---- 移动端：右侧工具栏（项目文件/历史提问）改成抽屉 + 边缘把手 ----
+ * 它固定 300px 宽，竖屏放进网格会把聊天区挤成一条缝；改成覆盖层后聊天区
+ * 始终满宽。收起时整列不占位，展开入口是右缘那个把手（手机没有 hover，
+ * 之前折叠后找不到任何按钮）。 */
+@media (max-width: 768px) {
+  .rp-col.collapsed {
+    display: none;
+  }
+
+  .rp-col:not(.collapsed) {
+    position: fixed;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: min(86vw, 340px);
+    z-index: 88;
+    background: var(--panel);
+    box-shadow: -10px 0 30px rgba(0, 0, 0, 0.22);
+  }
+
+  /* 展开时左缘也要留着把手 —— 那是收起（关闭）的入口 */
+  .rp-col .rp-toggle {
+    display: block;
+    width: 28px;
+    font-size: 15px;
   }
 }
 

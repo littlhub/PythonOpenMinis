@@ -74,6 +74,17 @@ const USER_SPEAKER: Speaker = {
 /** 「显示子代理过程」开关 —— 群聊里子代理的发言/工具是否展开。 */
 const SHOW_SUB_KEY = 'openminis:group:showSub'
 
+/** 右侧「工具栏」（项目文件 / 历史提问）的展开状态 —— 桌面记用户的选择。 */
+const RIGHT_OPEN_KEY = 'openminis:right-open'
+
+/** 手机竖屏：窄屏 + 竖屏方向。凑齐时右侧工具栏默认收起 —— 它固定 300px
+ *  宽，在竖屏手机上会把聊天区压成一条缝；要看再点展开即可。 */
+const PHONE_PORTRAIT = '(max-width: 768px) and (orientation: portrait)'
+
+function phonePortrait(): boolean {
+  return window.matchMedia(PHONE_PORTRAIT).matches
+}
+
 /** 群成员的三类身份（**只是身份标签**，不新增可执行成员）：
  *  * ``agent`` —— 助理页配的子代理，会被委派、可分配项目；
  *  * ``bot``   —— 同样是子代理，只是标成「机器人」；
@@ -387,7 +398,30 @@ export function ChatView({
   }, [])
   const [configWarning, setConfigWarning] = useState<string | null>(null)
   const [pickerOpen, setPickerOpen] = useState(false)
-  const [rightOpen, setRightOpen] = useState(true)
+  // 手机竖屏一律先收起（300px 固定宽会把聊天区压成一条缝）；其余情况用记住的
+  // 偏好，默认展开。展开后随时能点顶栏/右缘的按钮再打开。
+  const [rightOpen, setRightOpen] = useState(
+    () => !phonePortrait() && localStorage.getItem(RIGHT_OPEN_KEY) !== '0',
+  )
+  /** 切右侧工具栏（点按钮/点面板里的关闭）。 */
+  const toggleRight = useCallback((next?: boolean) => {
+    setRightOpen((v) => {
+      const nv = next ?? !v
+      localStorage.setItem(RIGHT_OPEN_KEY, nv ? '1' : '0')
+      return nv
+    })
+  }, [])
+
+  // 转成手机竖屏（横屏→竖屏、或者把窗口拉窄）→ 右侧工具栏收起，
+  // 不然它的固定宽度会立刻把聊天区挤成一条缝。
+  useEffect(() => {
+    const mq = window.matchMedia(PHONE_PORTRAIT)
+    const onChange = (e: MediaQueryListEvent) => {
+      if (e.matches) setRightOpen(false)
+    }
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
   // Agent 循环模式：react=增强版（同参重复立刻拦 + 空转自动收尾）/ kt=KT 原版。
   // 存在 settings.agent.loopMode，聊天页顶部可直接切换（下一轮对话生效）。
   const [loopMode, setLoopMode] = useState<'react' | 'kt'>('react')
@@ -641,15 +675,13 @@ export function ChatView({
   // -- load messages when active session changes ----------------------------
   // 并行时别的会话可能正在后台流式输出；切回来不能把本地攒下的内容冲掉，
   // 所以「加载过就保留本地」—— 本地那份还带着工具卡与子代理过程，比历史更全。
-  useEffect(() => {
-    activeIdRef.current = activeSessionId
-    if (!activeSessionId || msgsRef.current[activeSessionId]) return
-    const sid = activeSessionId
-    let cancelled = false
-    void (async () => {
+  // ``force`` 用于重连后对齐：那会儿本地流式状态已经不可信了，以服务端为准。
+  const loadSessionMessages = useCallback(
+    async (sid: string, force = false) => {
+      if (!force && msgsRef.current[sid]) return
       try {
         const data = await api.chatMessages(sid)
-        if (cancelled || msgsRef.current[sid]) return
+        if (!force && msgsRef.current[sid]) return
         patchMsgs(sid, () =>
           data.messages.map<UiMessage>((m: ChatMessageInfo) => ({
             id: m.id,
@@ -659,13 +691,17 @@ export function ChatView({
           })),
         )
       } catch (e) {
-        if (!cancelled) setError(String((e as Error).message))
+        setError(String((e as Error).message), sid)
       }
-    })()
-    return () => {
-      cancelled = true
-    }
-  }, [activeSessionId, patchMsgs, setError])
+    },
+    [patchMsgs, setError],
+  )
+
+  useEffect(() => {
+    activeIdRef.current = activeSessionId
+    if (!activeSessionId) return
+    void loadSessionMessages(activeSessionId)
+  }, [activeSessionId, loadSessionMessages])
 
   // -- 发送 / 排队 / 暂停 --------------------------------------------------
   const dispatch = useCallback(
@@ -936,8 +972,48 @@ export function ChatView({
     ],
   )
 
+  /** 断线重连之后的对齐。
+   *
+   *  流式帧只发给"当时那条连接"，断线期间的输出收不回来了 —— 所以：
+   *  1) 清掉「在跑」标记（否则界面永远卡在生成中，连暂停按钮都是死的）；
+   *  2) 丢掉这些会话的本地缓存，改为重新拉服务端历史 —— 本轮若已落库，
+   *     回答会补回来（这也是以前"只能刷新页面"才能恢复的原因）；
+   *  3) 把断线时排队没发出去的消息补发，用户不用再打一遍。
+   */
+  const resyncAfterReconnect = useCallback(async () => {
+    const wasRunning = [...runningRef.current]
+    for (const sid of wasRunning) markRunning(sid, false)
+    if (wasRunning.length > 0) {
+      const next = { ...msgsRef.current }
+      for (const sid of wasRunning) delete next[sid]
+      msgsRef.current = next
+      setMsgsBySid(next)
+    }
+    await reloadSessions()
+    const sid = activeIdRef.current
+    if (sid) await loadSessionMessages(sid, true)
+    const queued = Object.entries(queuesRef.current).filter(
+      ([, list]) => list.length > 0,
+    )
+    for (const [qsid, list] of queued) {
+      patchQueue(qsid, () => [])
+      for (const text of list) dispatch(text, qsid)
+    }
+  }, [
+    dispatch,
+    loadSessionMessages,
+    markRunning,
+    patchQueue,
+    reloadSessions,
+  ])
+
   useEffect(() => {
-    const ws = openSocket(handleFrame, { onStateChange: setSocketState })
+    const ws = openSocket(handleFrame, {
+      onStateChange: setSocketState,
+      // 重连成功 → 拉一次真实状态。断线期间的流收不回来，不这么做就会卡在
+      // 「生成中」，用户只能刷新页面（老 bug）。
+      onReconnect: () => void resyncAfterReconnect(),
+    })
     socketRef.current = ws
     return () => {
       ws.close()
@@ -1085,6 +1161,19 @@ export function ChatView({
   // -- render --------------------------------------------------------------
   return (
     <div className="view chat chat-with-rail">
+      {/* 手机：右栏收起后的展开把手（桌面端由 CSS 隐藏）。折叠后总得有
+          个看得见、够得到的按钮，不然只能靠猜「从边上滑出来」。 */}
+      {!rightOpen && (
+        <button
+          type="button"
+          className="mobile-toolbar-btn"
+          title="展开工具栏（项目文件 / 历史提问）"
+          aria-label="展开工具栏"
+          onClick={() => toggleRight(true)}
+        >
+          ❮
+        </button>
+      )}
       <section className="chat-main">
         <div className="chat-topbar">
           <div className="picker" ref={pickerRef}>
@@ -1171,9 +1260,17 @@ export function ChatView({
           <button
             className="rp-toggle-edge"
             title={rightOpen ? '收起右侧栏' : '展开右侧栏'}
-            onClick={() => setRightOpen((v) => !v)}
+            onClick={() => toggleRight()}
           >
-            {rightOpen ? '收起工具栏 ❯' : '❮ 展开工具栏'}
+            {rightOpen ? (
+              <>
+                收起工具栏 <b className="rp-arrow">❯</b>
+              </>
+            ) : (
+              <>
+                <b className="rp-arrow">❮</b> 展开工具栏
+              </>
+            )}
           </button>
         </div>
 
@@ -1487,14 +1584,14 @@ export function ChatView({
           className="rp-toggle"
           title={rightOpen ? '收起右侧栏' : '展开右侧栏'}
           aria-label="切换右侧栏"
-          onClick={() => setRightOpen((v) => !v)}
+          onClick={() => toggleRight()}
         >
           {rightOpen ? '❯' : '❮'}
         </button>
         <RightPanel
           activeSessionId={activeSessionId}
           activeWorkspaceId={activeSession?.folderId ?? null}
-          onClose={() => setRightOpen(false)}
+          onClose={() => toggleRight(false)}
           onPickHistory={(sid) => onChangeSession(sid)}
         />
       </div>

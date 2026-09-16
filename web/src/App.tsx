@@ -72,6 +72,20 @@ export default function App() {
   /** 窄屏判定（手机浏览器）—— 与 CSS 的断点保持一致。 */
   const isNarrow = () => window.matchMedia('(max-width: 768px)').matches
 
+  // 竖屏/窄屏变化（转屏、把窗口缩到手机宽度）→ 自动收起侧栏抽屉：
+  // 窄屏下它是覆盖层，展开着会挡内容。用户手动展开后不再干预。
+  useEffect(() => {
+    const mq = window.matchMedia('(max-width: 768px)')
+    const onChange = (e: MediaQueryListEvent) => {
+      if (e.matches) {
+        setRailCollapsed(true)
+        localStorage.setItem('openminis:rail-collapsed', '1')
+      }
+    }
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
+
   // 背景偏好来自后端 config（不是 localStorage）—— 它跟着数据目录走，
   // 同一份配置换个浏览器打开外观一致。设置页改完发事件即时生效，不必刷新。
   useEffect(() => {
