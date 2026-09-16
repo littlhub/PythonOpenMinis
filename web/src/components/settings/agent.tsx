@@ -6,6 +6,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api } from '../../api'
 import type {
+  AgentConfig,
   Attribution,
   CustomIdentityDraft,
   CustomModelType,
@@ -1290,20 +1291,7 @@ export function SkillsPage(props: { onBack: () => void; go: (id: SetPageId) => v
 // 对话参数 (AgentConfig) — 上下文预算 / 记忆轮次 / 工具步数 / 深度思考
 // ---------------------------------------------------------------------------
 export function AgentConfigPage(props: { onBack: () => void }) {
-  const [cfg, setCfg] = useState<{
-    maxContextTokens: number
-    maxMemoryRounds: number
-    maxToolSteps: number
-    deepThinking: boolean
-    subagentEnabled?: boolean
-    imageContextMode?: 'path' | 'inline'
-    imageVisionSubagent?: boolean
-    imageMaxEdge?: number
-    loopMode?: 'react' | 'kt'
-    memoryOrganizeEvery?: number
-    /** LLM 兜底模型链：主模型限流/超时/5xx 时按顺序自动切下一个。 */
-    fallbackModels?: { instance: string; model: string }[]
-  } | null>(null)
+  const [cfg, setCfg] = useState<AgentConfig | null>(null)
   /** 可选的厂商实例（配兜底模型时挑「用哪个实例的哪个模型」）。 */
   const [providers, setProviders] = useState<ProviderInfo[]>([])
   const [loading, setLoading] = useState(true)
@@ -1331,15 +1319,38 @@ export function AgentConfigPage(props: { onBack: () => void }) {
     }
   }, [])
 
+  /** 兜底链在服务端只保留「实例 + 模型都填了」的项。保存前先拦下没填完的行，
+   *  否则点了保存看着成功、回头却少一条 —— 分不清是自己没填完还是没存上。 */
+  const incompleteFallback = (c: AgentConfig): number =>
+    (c.fallbackModels ?? []).findIndex((m) => !m.instance || !m.model)
+
   const save = async () => {
     if (!cfg) return
+    const bad = incompleteFallback(cfg)
+    if (bad >= 0) {
+      setSaved(null)
+      setError(`第 ${bad + 1} 个兜底模型还没填完整（厂商实例和模型 id 都要填），补上再保存。`)
+      return
+    }
     setSaving(true)
     setError(null)
     setSaved(null)
     try {
-      await api.settingsPut({ agent: cfg })
-      setSaved('已保存 ✓')
-      setTimeout(() => setSaved(null), 2000)
+      const res = await api.settingsPut({ agent: cfg })
+      // 以服务端返回为准回填：真正没存上的项会立刻从界面消失，
+      // 而不是留在界面上让人以为已经生效了。
+      const want = (cfg.fallbackModels ?? []).length
+      const back = (res.agent?.fallbackModels ?? []).length
+      if (res.agent) setCfg({ ...res.agent })
+      if (want !== back) {
+        setError(
+          `兜底模型没能写进服务端（应有 ${want} 条，服务端只认 ${back} 条）。` +
+            '正在跑的后端可能还是旧版本 —— 停掉重启一次（stop.bat → run.bat）再保存。',
+        )
+      } else {
+        setSaved('已保存 ✓')
+        setTimeout(() => setSaved(null), 2000)
+      }
     } catch (e) {
       setError((e as Error).message)
     } finally {
@@ -1426,6 +1437,7 @@ export function AgentConfigPage(props: { onBack: () => void }) {
               主模型被限流（429）、超时或网关 5xx 时，按下面的顺序自动换模型重试。
               只在**这一轮还没吐出内容**时才换（已经流到界面上的文字撤不回来）。
               并行跑多个会话时尤其管用 —— 并发一高，网关限流是常态。
+              每一行都要填「厂商实例 + 模型 id」才存得下来，没填完的行会标红。
             </Note>
             <div className="fallback-list">
               {(cfg.fallbackModels ?? []).length === 0 && (
@@ -1441,7 +1453,16 @@ export function AgentConfigPage(props: { onBack: () => void }) {
                   setCfg({ ...cfg, fallbackModels: list })
                 }
                 return (
-                  <div className="fallback-row" key={`fb-row-${i}`}>
+                  <div
+                    className="fallback-row"
+                    key={`fb-row-${i}`}
+                    data-incomplete={!m.instance || !m.model ? '1' : undefined}
+                    title={
+                      !m.instance || !m.model
+                        ? '还没填完：厂商实例和模型 id 都要填，否则保存时这一条会被丢掉'
+                        : undefined
+                    }
+                  >
                     <span className="fallback-idx" title="第几个兜底">
                       {i + 1}
                     </span>

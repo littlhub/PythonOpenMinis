@@ -5677,6 +5677,17 @@ dl.facts.usage-detail {
   padding: 4px 8px;
 }
 
+/* 没填完的兜底行（缺厂商实例或模型 id）—— 存不下来，先在界面上标出来。 */
+.fallback-row[data-incomplete] .fallback-idx {
+  background: var(--danger-soft, rgba(220, 80, 80, 0.16));
+  color: var(--danger, #d05050);
+}
+
+.fallback-row[data-incomplete] select,
+.fallback-row[data-incomplete] input {
+  border-color: var(--danger, #d05050);
+}
+
 .fallback-del {
   flex: 0 0 auto;
   border: 0;

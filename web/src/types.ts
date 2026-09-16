@@ -383,8 +383,14 @@ export interface AgentConfig {
   imageContextMode?: 'path' | 'inline'
   /** 读图/送图前缩放的最大边长(px),用来压住图片的上下文开销. */
   imageMaxEdge?: number
+  /** 看图走哪条路:false(默认)=read_image 走「识图」槽;true=委派识图子代理. */
+  imageVisionSubagent?: boolean
   /** Agent 循环模式:react=增强版(同参重复立刻拦 + 空转自动收尾) / kt=KT 原版四策略. */
   loopMode?: 'react' | 'kt'
+  /** 每多少条用户提问后把每日记忆蒸馏进长期记忆(0=关闭). */
+  memoryOrganizeEvery?: number
+  /** LLM 兜底模型链:主模型限流/超时/5xx 时按顺序自动切下一个. */
+  fallbackModels?: { instance: string; model: string }[]
 }
 
 export interface FetchModelsRequest {
