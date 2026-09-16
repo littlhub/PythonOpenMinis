@@ -1300,6 +1300,7 @@ export function AgentConfigPage(props: { onBack: () => void }) {
     imageVisionSubagent?: boolean
     imageMaxEdge?: number
     loopMode?: 'react' | 'kt'
+    memoryOrganizeEvery?: number
   } | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -1387,6 +1388,28 @@ export function AgentConfigPage(props: { onBack: () => void }) {
                 />
                 <span className="muted" style={{ fontSize: 12 }}>
                   一问一答为一轮,超过后会智能压缩处理
+                </span>
+              </label>
+              <label className="wide">
+                <span>记忆自动整理间隔</span>
+                <input
+                  type="number"
+                  min={0}
+                  max={1000}
+                  value={cfg.memoryOrganizeEvery ?? 10}
+                  onChange={(e) =>
+                    setCfg({
+                      ...cfg,
+                      memoryOrganizeEvery: Math.max(
+                        0,
+                        Number(e.target.value) || 0,
+                      ),
+                    })
+                  }
+                />
+                <span className="muted" style={{ fontSize: 12 }}>
+                  每多少条用户提问后自动把每日记忆蒸馏进长期记忆（后台执行，
+                  不挡对话）；填 0 关闭
                 </span>
               </label>
             </div>

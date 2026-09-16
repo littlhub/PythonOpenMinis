@@ -176,3 +176,73 @@ def test_legacy_layout_is_migrated(env):
     assert "旧知识内容" in (env / "knowledge" / "旧主题.md").read_text("utf-8")
     assert not (mem / "wiki").exists()
     assert not (mem / "GLOBAL.md").exists()
+
+
+# ---------------------------------------------------------------------------
+# 自动整理：提问数触发 + 时间兜底
+# ---------------------------------------------------------------------------
+def test_note_user_message_counts_and_resets(env):
+    """每条提问计数 +1；整理盖戳后计数清零。"""
+    _write_daily(env, "2026-09-01", "## 09:00\n\n保持简洁\n")
+    assert memory_organizer.note_user_message() == 1
+    assert memory_organizer.note_user_message() == 2
+    assert memory_organizer.message_organize_due(3) is False
+    assert memory_organizer.note_user_message() == 3
+    assert memory_organizer.message_organize_due(3) is True
+    # 到点整理一次：计数归零，四类文件写出
+    result = _organize(StubProvider(REPLY))
+    assert result.applied
+    memory_organizer.mark_organized()
+    assert memory_organizer.message_organize_due(3) is False
+
+
+def test_message_organize_disabled_when_zero(env):
+    """memoryOrganizeEvery = 0 表示关闭，永远不会到点。"""
+    for _ in range(50):
+        memory_organizer.note_user_message()
+    assert memory_organizer.message_organize_due(0) is False
+
+
+def test_auto_organize_due_time_throttle(env, monkeypatch):
+    """时间兜底：没日志不跑；有日志且没盖戳跑一次；20h 内且无新日志不重复跑。"""
+    import os
+    import time as _time
+
+    _write_daily(env, "2026-09-01", "## 09:00\n\n保持简洁\n")
+    assert memory_organizer.auto_organize_due() is True  # 从没整理过
+
+    memory_organizer.mark_organized()
+    assert memory_organizer.auto_organize_due() is False  # 20h 内 + 无新日志
+
+    # 时间兜底是硬节流：日志再新，冷却（20h）没过也不跑（提问数触发不受此限）
+    future = _time.time() + 25 * 3600
+    log = env / "memory" / "daily" / "2026-09-01.md"
+    os.utime(log, (future, future))
+    assert memory_organizer.auto_organize_due() is False
+
+    # 冷却过了 + 日志比上次整理新 → 该跑
+    old = _time.time() - 25 * 3600
+    stamp = env / "memory" / ".last-organize"
+    os.utime(stamp, (old, old))
+    assert memory_organizer.auto_organize_due() is True
+
+    # 没有任何每日日志 → 永远不跑
+    empty = env / "empty-home"
+    empty.mkdir()
+    (empty / "memory" / "daily").mkdir(parents=True)
+    assert memory_organizer.auto_organize_due(empty) is False
+
+
+def test_run_message_organize_failure_keeps_counter(env, monkeypatch):
+    """模型失败（如未配置）时计数保留，下一条提问还会重试。"""
+    _write_daily(env, "2026-09-01", "## 09:00\n\n保持简洁\n")
+    for _ in range(3):
+        memory_organizer.note_user_message()
+
+    async def _boom(provider=None):
+        raise RuntimeError("no provider")
+
+    monkeypatch.setattr(memory_organizer, "organize_memories", _boom)
+    result = asyncio.run(memory_organizer.run_message_organize_if_due(3))
+    assert result is None
+    assert memory_organizer.message_organize_due(3) is True  # 计数还在

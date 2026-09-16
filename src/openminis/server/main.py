@@ -136,8 +136,19 @@ async def lifespan(app: FastAPI):  # noqa: ANN201
     except Exception:  # pragma: no cover - never fail startup over scheduling
         logger.exception("scheduled runner failed to start")
         runner = None
+    # 记忆时间兜底整理：后台循环每 6h 醒一次，有比上次整理更新的每日日志、
+    # 且距上次 ≥20h 才真正调模型（提问数触发为主，这条兜住「很少提问」的用法）。
+    organiser_task: asyncio.Task | None = None
+    try:
+        from .memory_organizer import auto_organize_loop
+
+        organiser_task = asyncio.create_task(auto_organize_loop())
+    except Exception:  # pragma: no cover - never fail startup over memory
+        logger.exception("memory organiser failed to start")
     logger.info("OpenMinis server starting")
     yield
+    if organiser_task is not None:
+        organiser_task.cancel()
     if runner is not None:
         await runner.stop()
     # Provider 连接池是跨轮复用的（省掉每次 TLS 握手），关服时要显式收掉。
@@ -646,6 +657,18 @@ async def _safe_send(client_id: str, payload: dict[str, Any]) -> None:
 #: 否则「暂停」帧要等本轮结束才被读到，按钮就形同虚设。
 _RUNNING_CHATS: dict[str, asyncio.Task[None]] = {}
 
+#: 即发即忘的后台任务（记忆整理等）。asyncio 只持弱引用，不存一份的话
+#: 任务可能在跑完前被 GC 回收。
+_BG_TASKS: set[asyncio.Task[Any]] = set()
+
+
+def _spawn_bg(coro: Any) -> asyncio.Task[Any]:
+    """起一个后台任务并保活引用，跑完自动出清。"""
+    task = asyncio.create_task(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return task
+
 
 async def _handle_stop(client_id: str, msg: dict[str, Any]) -> None:
     """中断某会话正在生成的一轮（前端「暂停」按钮）。"""
@@ -736,6 +759,19 @@ async def _handle_chat(client_id: str, msg: dict[str, Any]) -> None:
     if sid:
         _RUNNING_CHATS[sid] = task
         task.add_done_callback(lambda _t, key=sid: _RUNNING_CHATS.pop(key, None))
+
+
+async def _auto_organize_after_chat(every: int) -> None:
+    """提问数到点后的记忆整理：放后台跑，结果只进日志，失败留给下轮重试。"""
+    try:
+        from .memory_organizer import run_message_organize_if_due
+
+        result = await run_message_organize_if_due(every)
+    except Exception:  # pragma: no cover - 后台任务绝不能炸
+        logger.debug("auto organise after chat failed", exc_info=True)
+        return
+    if result is not None and result.applied:
+        logger.info("memory organised after chat: %s", result.kinds)
 
 
 async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
@@ -986,6 +1022,20 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
                 sid, compacted.compacted, len(compacted.memories),
             )
         await _safe_send(client_id, {"type": "done", "sessionId": sid})
+        # 记忆自动整理（按提问数）：一问计一条，攒够 agent.memoryOrganizeEvery
+        # 条就在后台蒸馏每日记忆进四类长期记忆 —— 不挡已完成的回合，绝不抛错。
+        try:
+            from .memory_organizer import (
+                message_organize_due,
+                note_user_message,
+            )
+
+            every = int(_ag.get("memoryOrganizeEvery") or 0)
+            note_user_message()
+            if every > 0 and message_organize_due(every):
+                _spawn_bg(_auto_organize_after_chat(every))
+        except Exception:  # pragma: no cover - 整理计数绝不能影响收尾
+            logger.debug("memory organise trigger failed", exc_info=True)
     except Exception as e:  # pragma: no cover - defensive
         logger.exception("chat run crashed")
         await _safe_send(client_id, {"type": "error", "error": f"对话出错: {e}"}

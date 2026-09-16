@@ -19,7 +19,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -36,13 +39,32 @@ from ..tools.memory_tools import (
 
 logger = get_logger(__name__)
 
-__all__ = ["OrganizeResult", "organize_memories", "candidate_daily_logs"]
+__all__ = [
+    "OrganizeResult",
+    "organize_memories",
+    "candidate_daily_logs",
+    "note_user_message",
+    "message_organize_due",
+    "run_message_organize_if_due",
+    "mark_organized",
+    "auto_organize_due",
+    "run_auto_organize_once",
+    "auto_organize_loop",
+]
 
 #: How much context the LLM pass ingests before writing the corpus.
 _MAX_SOURCE_CHARS = 40_000
 _MAX_DAILY_LOGS = 30
 _MAX_KIND_CHARS = 8_000
 _MAX_TOKENS = 6_000
+
+#: 自动整理节流：距上次整理至少隔 20h，且此后有新的每日日志才真正调模型。
+#: 检查本身很便宜（只看文件 mtime），后台循环每 6h 醒一次。
+_MIN_INTERVAL_SECONDS = 20 * 3600
+_AUTO_INTERVAL_SECONDS = 6 * 3600
+_STAMP_NAME = ".last-organize"
+#: 按提问数触发的状态文件：记录「自上次整理以来的用户提问数」。
+_STATE_NAME = ".organize-state.json"
 
 #: 整理器负责的四类（每日记忆是输入，不改写）。
 _SECTION_KIND: dict[str, str] = {
@@ -248,3 +270,130 @@ async def organize_memories(provider: Any = None) -> OrganizeResult:
         len(logs), kinds or "(no change)",
     )
     return OrganizeResult(len(logs), kinds)
+
+
+# ---------------------------------------------------------------------------
+# 自动整理：没有它每日日志只会一直堆着，没人点「整理」按钮就永远不蒸馏
+# ---------------------------------------------------------------------------
+def _stamp_path(root: Path | None = None) -> Path:
+    return (Path(root) if root else _memory_dir()) / _STAMP_NAME
+
+
+def auto_organize_due(root: Path | None = None) -> bool:
+    """是否该跑一次整理：有比上次整理更新的每日日志、且距上次 ≥20h。
+
+    没有每日日志时永远不跑（没什么可整理）；从没整理过则第一次必跑。
+    """
+    base = Path(root) if root else _memory_dir()
+    logs = candidate_daily_logs(base)
+    if not logs:
+        return False
+    try:
+        last = _stamp_path(base).stat().st_mtime
+    except OSError:
+        return True  # 从没整理过
+    if time.time() - last < _MIN_INTERVAL_SECONDS:
+        return False
+    newest = max(p.stat().st_mtime for p in logs)
+    return newest > last
+
+
+def mark_organized(root: Path | None = None) -> None:
+    """盖戳：记录这次整理的时间，并把「提问计数」清零（两类触发共用）。"""
+    p = _stamp_path(root)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(
+        datetime.now().isoformat(timespec="seconds") + "\n", encoding="utf-8"
+    )
+    _write_state(root, {"messages_since": 0})
+
+
+def _state_path(root: Path | None = None) -> Path:
+    return (Path(root) if root else _memory_dir()) / _STATE_NAME
+
+
+def _read_state(root: Path | None = None) -> dict[str, Any]:
+    try:
+        data = json.loads(_state_path(root).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_state(root: Path | None, state: dict[str, Any]) -> None:
+    p = _state_path(root)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(
+            json.dumps(state, ensure_ascii=False), encoding="utf-8"
+        )
+    except OSError:  # pragma: no cover - 计数失败不该打断对话
+        logger.debug("organize state write failed", exc_info=True)
+
+
+def note_user_message(root: Path | None = None) -> int:
+    """用户提问计数 +1，返回自上次整理以来的累计提问数。"""
+    state = _read_state(root)
+    count = int(state.get("messages_since", 0)) + 1
+    state["messages_since"] = count
+    _write_state(root, state)
+    return count
+
+
+def message_organize_due(every: int, root: Path | None = None) -> bool:
+    """达到设定提问数（``agent.memoryOrganizeEvery``，0=关闭）就该整理。"""
+    if every <= 0:
+        return False
+    return int(_read_state(root).get("messages_since", 0)) >= every
+
+
+async def run_message_organize_if_due(
+    every: int, root: Path | None = None
+) -> OrganizeResult | None:
+    """提问数触发的一次整理：没到期返回 None；失败保留计数下轮重试。"""
+    if not message_organize_due(every, root):
+        return None
+    try:
+        result = await organize_memories()
+    except Exception:  # pragma: no cover - 取决于模型配置
+        logger.info(
+            "message-triggered memory organise failed", exc_info=True
+        )
+        return None
+    mark_organized(root)
+    return result
+
+
+async def run_auto_organize_once(
+    root: Path | None = None,
+) -> OrganizeResult | None:
+    """到期才整理一次；失败不盖戳，留给下个周期重试。"""
+    if not auto_organize_due(root):
+        return None
+    try:
+        result = await organize_memories()
+    except Exception:  # pragma: no cover - 取决于模型配置，不该打断循环
+        logger.info(
+            "auto memory organise failed; will retry next cycle",
+            exc_info=True,
+        )
+        return None
+    mark_organized(root)
+    return result
+
+
+async def auto_organize_loop(interval_seconds: int = _AUTO_INTERVAL_SECONDS) -> None:
+    """后台循环：启动即查一次，之后每 6h 查一次是否到期。绝不该抛异常。"""
+    while True:
+        try:
+            result = await run_auto_organize_once()
+        except Exception:  # pragma: no cover - 后台循环绝不能死
+            logger.debug("auto organise loop error", exc_info=True)
+        else:
+            if result is not None:
+                logger.info(
+                    "auto memory organise: %d logs -> %s",
+                    result.logs_read,
+                    result.kinds or "(no change)",
+                )
+        await asyncio.sleep(interval_seconds)

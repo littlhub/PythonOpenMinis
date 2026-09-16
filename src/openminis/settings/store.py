@@ -101,6 +101,9 @@ def _defaults() -> dict[str, Any]:
             #                     （阈值 10/20/30），不做额外拦截与自动收尾，
             #                     循环只在模型自己停或 maxToolSteps 用尽时结束。
             "loopMode": "react",
+            # 记忆自动整理：每 N 条用户提问把每日记忆蒸馏进四类长期记忆
+            # （0 = 关闭）。到点后台跑，不挡对话；配合时间兜底（20h+新日志）。
+            "memoryOrganizeEvery": 10,
         },
     }
 
@@ -534,6 +537,18 @@ class SettingsStore:
                         agent["loopMode"] = loop_mode
                     else:
                         errors.append("agent.loopMode 只能是 react 或 kt")
+                if "memoryOrganizeEvery" in raw:
+                    try:
+                        n = int(raw["memoryOrganizeEvery"])
+                    except (TypeError, ValueError):
+                        errors.append("agent.memoryOrganizeEvery 必须是整数")
+                    else:
+                        if 0 <= n <= 1000:
+                            agent["memoryOrganizeEvery"] = n
+                        else:
+                            errors.append(
+                                "agent.memoryOrganizeEvery 需在 0-1000（0=关闭自动整理）"
+                            )
                 data["agent"] = agent
 
         if errors:
