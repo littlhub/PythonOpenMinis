@@ -1301,7 +1301,11 @@ export function AgentConfigPage(props: { onBack: () => void }) {
     imageMaxEdge?: number
     loopMode?: 'react' | 'kt'
     memoryOrganizeEvery?: number
+    /** LLM 兜底模型链：主模型限流/超时/5xx 时按顺序自动切下一个。 */
+    fallbackModels?: { instance: string; model: string }[]
   } | null>(null)
+  /** 可选的厂商实例（配兜底模型时挑「用哪个实例的哪个模型」）。 */
+  const [providers, setProviders] = useState<ProviderInfo[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [saving, setSaving] = useState(false)
@@ -1312,7 +1316,9 @@ export function AgentConfigPage(props: { onBack: () => void }) {
     api
       .settingsGet()
       .then((s) => {
-        if (alive) setCfg({ ...s.agent })
+        if (!alive) return
+        setCfg({ ...s.agent })
+        setProviders(s.providers)
       })
       .catch((e) => {
         if (alive) setError((e as Error).message)
@@ -1412,6 +1418,95 @@ export function AgentConfigPage(props: { onBack: () => void }) {
                   不挡对话）；填 0 关闭
                 </span>
               </label>
+            </div>
+          </SectionCard>
+
+          <SectionCard title="兜底模型">
+            <Note>
+              主模型被限流（429）、超时或网关 5xx 时，按下面的顺序自动换模型重试。
+              只在**这一轮还没吐出内容**时才换（已经流到界面上的文字撤不回来）。
+              并行跑多个会话时尤其管用 —— 并发一高，网关限流是常态。
+            </Note>
+            <div className="fallback-list">
+              {(cfg.fallbackModels ?? []).length === 0 && (
+                <div className="muted" style={{ fontSize: 12, padding: '2px 0' }}>
+                  还没配兜底模型 —— 主模型一被限流，整轮就直接失败了。
+                </div>
+              )}
+              {(cfg.fallbackModels ?? []).map((m, i) => {
+                const inst = providers.find((p) => p.id === m.instance)
+                const patch = (next: { instance: string; model: string }) => {
+                  const list = [...(cfg.fallbackModels ?? [])]
+                  list[i] = next
+                  setCfg({ ...cfg, fallbackModels: list })
+                }
+                return (
+                  <div className="fallback-row" key={`fb-row-${i}`}>
+                    <span className="fallback-idx" title="第几个兜底">
+                      {i + 1}
+                    </span>
+                    <select
+                      value={m.instance}
+                      title="用哪个厂商实例"
+                      onChange={(e) =>
+                        // 换了实例，原来的模型 id 未必存在 —— 清空让用户重选。
+                        patch({ instance: e.target.value, model: '' })
+                      }
+                    >
+                      <option value="">选择厂商实例…</option>
+                      {providers.map((p) => (
+                        <option key={p.id} value={p.id}>
+                          {p.label || p.id}
+                        </option>
+                      ))}
+                    </select>
+                    <input
+                      list={`fb-models-${i}`}
+                      placeholder="模型 id(可直接输入)"
+                      value={m.model}
+                      title="兜底用的模型 id"
+                      onChange={(e) => patch({ ...m, model: e.target.value })}
+                    />
+                    <datalist id={`fb-models-${i}`}>
+                      {(inst?.models ?? []).map((mo) => (
+                        <option key={mo.id} value={mo.id}>
+                          {mo.name || mo.id}
+                        </option>
+                      ))}
+                    </datalist>
+                    <button
+                      type="button"
+                      className="fallback-del"
+                      title="删除这个兜底"
+                      onClick={() =>
+                        setCfg({
+                          ...cfg,
+                          fallbackModels: (cfg.fallbackModels ?? []).filter(
+                            (_, j) => j !== i,
+                          ),
+                        })
+                      }
+                    >
+                      ×
+                    </button>
+                  </div>
+                )
+              })}
+              <button
+                type="button"
+                className="fallback-add"
+                onClick={() =>
+                  setCfg({
+                    ...cfg,
+                    fallbackModels: [
+                      ...(cfg.fallbackModels ?? []),
+                      { instance: '', model: '' },
+                    ],
+                  })
+                }
+              >
+                ＋ 添加兜底模型
+              </button>
             </div>
           </SectionCard>
 

@@ -14,13 +14,22 @@ import {
 import type {
   ChatMessageInfo,
   ChatSessionInfo,
-  ServerFrame,
+  SessionScopedFrame,
   Speaker,
   SubagentInfo,
   WorkspaceInfo,
 } from '../types'
+import { RUNNING_SESSIONS_EVENT as RUNNING_EVENT } from '../types'
 import { RightPanel } from './RightPanel'
 import { openImagePreview } from './ImageLightbox'
+
+// 多会话并行后 messages/seen 都按会话从 map 里取；没有内容时返回同一个空数组，
+// 免得每次渲染新建引用、把子组件全带上重渲。
+const EMPTY_MESSAGES: UiMessage[] = []
+const EMPTY_SPEAKERS: Speaker[] = []
+
+/** 还没有活动会话时的兜底桶（新建会话、连接断开这类跟会话无关的提示）。 */
+const GLOBAL_SID = '__global__'
 
 interface ChatViewProps {
   activeSessionId: string | null
@@ -39,6 +48,8 @@ interface UiMessage {
   speaker?: Speaker
   /** 子代理房间 = 外层那次 `subagent_delegate` 调用的 id。 */
   roomId?: string
+  /** 兜底模型切换提示（不是模型说的话，渲染成一条浅色小条）。 */
+  fallbackNote?: string
   /** 子代理交给它的任务（subagentStart 帧带上来，显示在气泡头部）。 */
   subTask?: string
   /** 子代理在自己循环里调的工具（与主代理的 toolCalls 分开渲染）。 */
@@ -307,14 +318,73 @@ export function ChatView({
   // sessions list (for the small "switch" chip + the new-session button on top)
   const [sessions, setSessions] = useState<ChatSessionInfo[]>([])
   const [workspaces, setWorkspaces] = useState<WorkspaceInfo[]>([])
-  const [messages, setMessages] = useState<UiMessage[]>([])
-  const [busy, setBusy] = useState(false)
-  // 生成中还可以继续输入：这些消息先排队，本轮结束后自动发下一条。
-  const queueRef = useRef<string[]>([])
-  const [queuedCount, setQueuedCount] = useState(0)
-  // 「暂停」后的提示（下一条消息发出时清掉）。
-  const [stoppedNote, setStoppedNote] = useState(false)
-  const [error, setError] = useState<string | null>(null)
+  // ── 多会话并行 ──────────────────────────────────────────────────────────
+  // 消息、运行态、排队都按**会话**分桶：A 会话在跑的时候切到 B，B 照常发消息、
+  // 照常跑，两边互不干扰（后端本来就按会话 id 隔离，见 _RUNNING_CHATS）。
+  const [msgsBySid, setMsgsBySid] = useState<Record<string, UiMessage[]>>({})
+  /** 与 msgsBySid 同步的权威副本：不触发重渲，用来判断「这个会话加载过没有」。 */
+  const msgsRef = useRef<Record<string, UiMessage[]>>({})
+  const [runningSids, setRunningSids] = useState<string[]>([])
+  const runningRef = useRef<Set<string>>(new Set())
+  /** 生成中还可以继续输入：这些消息先按会话排队，本轮结束后自动发下一条。 */
+  const queuesRef = useRef<Record<string, string[]>>({})
+  const [queues, setQueues] = useState<Record<string, string[]>>({})
+  const messages =
+    (activeSessionId ? msgsBySid[activeSessionId] : undefined) ?? EMPTY_MESSAGES
+  const busy = !!activeSessionId && runningSids.includes(activeSessionId)
+  const queuedCount = activeSessionId
+    ? (queues[activeSessionId]?.length ?? 0)
+    : 0
+  // 「暂停」后的提示与错误也按会话记，免得 A 会话的报错挂在 B 的界面上。
+  const [stoppedBySid, setStoppedBySid] = useState<Record<string, boolean>>({})
+  const [errorsBySid, setErrorsBySid] = useState<Record<string, string | null>>({})
+  const stoppedNote = !!stoppedBySid[activeSessionId ?? GLOBAL_SID]
+  const error = errorsBySid[activeSessionId ?? GLOBAL_SID] ?? null
+
+  /** 改某个会话的消息列表（帧一律走它，不再直接动"当前会话"）。 */
+  const patchMsgs = useCallback(
+    (sid: string, fn: (prev: UiMessage[]) => UiMessage[]) => {
+      const next = { ...msgsRef.current, [sid]: fn(msgsRef.current[sid] ?? []) }
+      msgsRef.current = next
+      setMsgsBySid(next)
+    },
+    [],
+  )
+
+  /** 标记某个会话「在跑 / 跑完」，并广播给侧边栏。 */
+  const markRunning = useCallback((sid: string, on: boolean) => {
+    const next = new Set(runningRef.current)
+    if (on) next.add(sid)
+    else next.delete(sid)
+    runningRef.current = next
+    const list = [...next]
+    setRunningSids(list)
+    window.dispatchEvent(new CustomEvent(RUNNING_EVENT, { detail: list }))
+  }, [])
+
+  /** 改某个会话的排队列表。 */
+  const patchQueue = useCallback((sid: string, fn: (prev: string[]) => string[]) => {
+    const cur = queuesRef.current[sid] ?? []
+    queuesRef.current = { ...queuesRef.current, [sid]: fn(cur) }
+    setQueues({ ...queuesRef.current })
+  }, [])
+
+  /** 写错误/暂停提示：不传 sid 就落到当前会话（新建会话失败等场景落全局桶）。 */
+  const setError = useCallback((msg: string | null, sid?: string) => {
+    const key = sid ?? activeIdRef.current ?? GLOBAL_SID
+    setErrorsBySid((prev) => ({ ...prev, [key]: msg }))
+  }, [])
+  const setStoppedNote = useCallback((on: boolean, sid?: string) => {
+    const key = sid ?? activeIdRef.current ?? GLOBAL_SID
+    setStoppedBySid((prev) => ({ ...prev, [key]: on }))
+  }, [])
+
+  // 广播"谁在跑"给侧边栏（会话行上的运行中小圆点）。卸载时清空。
+  useEffect(() => {
+    return () => {
+      window.dispatchEvent(new CustomEvent(RUNNING_EVENT, { detail: [] }))
+    }
+  }, [])
   const [configWarning, setConfigWarning] = useState<string | null>(null)
   const [pickerOpen, setPickerOpen] = useState(false)
   const [rightOpen, setRightOpen] = useState(true)
@@ -327,7 +397,9 @@ export function ChatView({
   // 工具都由后端的 subagent* 系列帧推来。`seen` 是**实际出现过的**子代理
   // （比名单更真实 —— 模型自己委派出去的也算），名单则是用户手动拉进来的。
   const [roster, setRoster] = useState<GroupMember[]>([])
-  const [seen, setSeen] = useState<Speaker[]>([])
+  // 实际出现过的子代理也按会话分桶（并行时 A 会话的子代理不该出现在 B 的好友栏）。
+  const [seenBySid, setSeenBySid] = useState<Record<string, Speaker[]>>({})
+  const seen = (activeSessionId ? seenBySid[activeSessionId] : undefined) ?? EMPTY_SPEAKERS
   const [candidates, setCandidates] = useState<SubagentInfo[]>([])
   const [groupOpen, setGroupOpen] = useState(false)
   /** 「拉成员进群」浮层里新建真人席位的名字输入。 */
@@ -340,12 +412,14 @@ export function ChatView({
   const projectRef = useRef<HTMLDivElement | null>(null)
   const groupRef = useRef<HTMLDivElement | null>(null)
   const rosterRef = useRef<GroupMember[]>([])
-  const seenRef = useRef<Speaker[]>([])
-  // 新增的子代理/工具结果只在**本轮**内有效；换会话时清空。
-  const rememberSub = useCallback((sp: Speaker) => {
-    if (seenRef.current.some((s) => s.id === sp.id)) return
-    seenRef.current = [...seenRef.current, sp]
-    setSeen(seenRef.current)
+  const seenRef = useRef<Record<string, Speaker[]>>({})
+  // 某个会话里新露面的子代理（按会话记，换会话不用清 —— 各自独立）。
+  const rememberSub = useCallback((sid: string, sp: Speaker) => {
+    const cur = seenRef.current[sid] ?? []
+    if (cur.some((s) => s.id === sp.id)) return
+    const next = { ...seenRef.current, [sid]: [...cur, sp] }
+    seenRef.current = next
+    setSeenBySid(next)
   }, [])
 
   const socketRef = useRef<OpenSocketHandle | null>(null)
@@ -419,7 +493,8 @@ export function ChatView({
     })
   }, [])
 
-  // 换会话 → 载入该会话的群成员名单与「分配项目」，并清掉上一会话看到的子代理。
+  // 换会话 → 载入该会话的群成员名单与「分配项目」。
+  // （子代理「露过面」的名单按会话独立存放，不必在这里清。）
   useEffect(() => {
     const ids = loadGroup(activeSessionId)
     rosterRef.current = ids
@@ -427,8 +502,6 @@ export function ChatView({
     const projects = loadMemberProjects(activeSessionId)
     memberProjectsRef.current = projects
     setMemberProjects(projects)
-    seenRef.current = []
-    setSeen([])
     setGroupOpen(false)
     setProjectOpen(false)
   }, [activeSessionId])
@@ -566,26 +639,25 @@ export function ChatView({
   )
 
   // -- load messages when active session changes ----------------------------
+  // 并行时别的会话可能正在后台流式输出；切回来不能把本地攒下的内容冲掉，
+  // 所以「加载过就保留本地」—— 本地那份还带着工具卡与子代理过程，比历史更全。
   useEffect(() => {
     activeIdRef.current = activeSessionId
-    if (!activeSessionId) {
-      setMessages([])
-      return
-    }
+    if (!activeSessionId || msgsRef.current[activeSessionId]) return
+    const sid = activeSessionId
     let cancelled = false
     void (async () => {
       try {
-        const data = await api.chatMessages(activeSessionId)
-        if (!cancelled && activeIdRef.current === activeSessionId) {
-          setMessages(
-            data.messages.map<UiMessage>((m: ChatMessageInfo) => ({
-              id: m.id,
-              role: m.role,
-              text: m.text,
-              toolCalls: [],
-            })),
-          )
-        }
+        const data = await api.chatMessages(sid)
+        if (cancelled || msgsRef.current[sid]) return
+        patchMsgs(sid, () =>
+          data.messages.map<UiMessage>((m: ChatMessageInfo) => ({
+            id: m.id,
+            role: m.role,
+            text: m.text,
+            toolCalls: [],
+          })),
+        )
       } catch (e) {
         if (!cancelled) setError(String((e as Error).message))
       }
@@ -593,41 +665,46 @@ export function ChatView({
     return () => {
       cancelled = true
     }
-  }, [activeSessionId])
+  }, [activeSessionId, patchMsgs, setError])
 
   // -- 发送 / 排队 / 暂停 --------------------------------------------------
-  const dispatch = useCallback((text: string, sid: string) => {
-    const ws = socketRef.current
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
-      // keep the user message + busy false — the proxy will queue the
-      // frame and flush on the next open; a tiny pill surfaces the state.
-      setError('连接已断开,正在重连…')
-      setBusy(false)
-      return
-    }
-    setBusy(true)
-    // 把「群成员」随消息一起带上：后端据此把它们写进系统提示，主代理才知道
-    // 群里有这些同事、可以委派给谁。
-    ws.send(
-      JSON.stringify({
-        type: 'chat',
-        text,
-        sessionId: sid,
-        participants: rosterRef.current,
-        // 「分配项目」：成员 → 工作空间 id（后端解析成目录当它的工作目录）。
-        memberProjects: memberProjectsRef.current,
-      }),
-    )
-  }, [])
+  const dispatch = useCallback(
+    (text: string, sid: string) => {
+      const ws = socketRef.current
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        // 消息留在界面上、会话标成没在跑 —— 代理会把这帧排队，等重连后再发；
+        // 顶部那颗状态小药丸负责提示。
+        setError('连接已断开,正在重连…', sid)
+        markRunning(sid, false)
+        return
+      }
+      markRunning(sid, true)
+      // 把「群成员」随消息一起带上：后端据此把它们写进系统提示，主代理才知道
+      // 群里有这些同事、可以委派给谁。
+      ws.send(
+        JSON.stringify({
+          type: 'chat',
+          text,
+          sessionId: sid,
+          participants: rosterRef.current,
+          // 「分配项目」：成员 → 工作空间 id（后端解析成目录当它的工作目录）。
+          memberProjects: memberProjectsRef.current,
+        }),
+      )
+    },
+    [markRunning, setError],
+  )
 
-  /** 本轮结束后把排队的第一条发出去（一次一条，发完再等 done）。 */
-  const flushQueue = useCallback(() => {
-    const next = queueRef.current.shift()
-    setQueuedCount(queueRef.current.length)
-    if (next === undefined) return
-    const sid = activeIdRef.current
-    if (sid) dispatch(next, sid)
-  }, [dispatch])
+  /** 某个会话本轮结束后，把它排队的第一条发出去（一次一条，发完再等 done）。 */
+  const flushQueue = useCallback(
+    (sid: string) => {
+      const next = (queuesRef.current[sid] ?? []).shift()
+      patchQueue(sid, (prev) => prev.slice(1))
+      if (next === undefined) return
+      dispatch(next, sid)
+    },
+    [dispatch, patchQueue],
+  )
 
   /** 「暂停」：中断本轮生成（已排队/已输入内容都不受影响）。 */
   const stop = useCallback(() => {
@@ -638,193 +715,226 @@ export function ChatView({
   }, [])
 
   // -- one shared websocket ------------------------------------------------
-  const handleFrame = useCallback((frame: ServerFrame) => {
-    const sid = activeIdRef.current
+  const handleFrame = useCallback(
+    (frame: SessionScopedFrame) => {
+      // 帧自带会话 id（多会话并行就这么路由回各自的列表）；没有就退回
+      // "当前打开的会话" —— 老后端或非会话流（如 shell）走到这条分支。
+      const sid = frame.sessionId ?? activeIdRef.current
 
-    switch (frame.type) {
-      case 'chatSession':
-        activeIdRef.current = frame.sessionId
-        onChangeSession(frame.sessionId)
-        break
-      case 'delta': {
-        if (!sid) break
-        setMessages((prev) => {
-          const list = [...prev]
-          let tail = list[list.length - 1]
-          // 子代理刚发过言时，最后一条是**它**的气泡 —— 主代理的下一段文字
-          // 要另起一条，群聊才读得顺（否则会追到子代理气泡上）。
-          if (!tail || tail.role !== 'assistant' || tail.speaker) {
-            tail = newMainMessage()
-            list.push(tail)
-          }
-          list[list.length - 1] = {
-            ...tail,
-            text: tail.text + frame.text,
-          }
-          return list
-        })
-        break
-      }
-      case 'toolStart': {
-        if (!sid) break
-        setMessages((prev) => {
-          const list = [...prev]
-          let i = lastMainIndex(list)
-          if (i < 0) {
-            list.push(newMainMessage())
-            i = list.length - 1
-          }
-          const tail = list[i]
-          list[i] = {
-            ...tail,
-            toolCalls: [
-              ...(tail.toolCalls ?? []),
-              { id: frame.id, name: frame.name, input: frame.input ?? {} },
-            ],
-          }
-          return list
-        })
-        break
-      }
-      case 'toolEnd': {
-        if (!sid) break
-        setMessages((prev) => {
-          const list = [...prev]
-          const i = lastMainIndex(list)
-          if (i < 0) return list
-          const tail = list[i]
-          const cards = (tail.toolCalls ?? []).map((c) =>
-            c.id === frame.id
-              ? { ...c, ok: frame.ok, output: frame.output }
-              : c,
-          )
-          // 生图自动预览：后端把本次新生成的图片路径带在 toolEnd 上，
-          // 直接挂到这条 assistant 消息（去重），无需模型写 markdown。
-          const incoming = frame.images ?? []
-          const generated = incoming.length
-            ? Array.from(new Set([...(tail.generated ?? []), ...incoming]))
-            : tail.generated
-          list[i] = { ...tail, toolCalls: cards, generated }
-          return list
-        })
-        break
-      }
-      // ── 群聊：子代理开麦 ─────────────────────────────────────────────
-      case 'subagentStart': {
-        if (!sid) break
-        const sp: Speaker = {
-          id: frame.subagentId,
-          name: frame.name || frame.subagentId,
-          emoji: frame.emoji || '🤖',
-          kind: 'sub',
-          project: frame.project || undefined,
+      switch (frame.type) {
+        case 'chatSession':
+          activeIdRef.current = frame.sessionId
+          onChangeSession(frame.sessionId)
+          break
+        case 'delta': {
+          if (!sid) break
+          patchMsgs(sid, (prev) => {
+            const list = [...prev]
+            let tail = list[list.length - 1]
+            // 子代理刚发过言时，最后一条是**它**的气泡 —— 主代理的下一段文字
+            // 要另起一条，群聊才读得顺（否则会追到子代理气泡上）。
+            if (!tail || tail.role !== 'assistant' || tail.speaker) {
+              tail = newMainMessage()
+              list.push(tail)
+            }
+            list[list.length - 1] = {
+              ...tail,
+              text: tail.text + frame.text,
+            }
+            return list
+          })
+          break
         }
-        rememberSub(sp)
-        setMessages((prev) => [
-          ...prev,
-          {
-            id: `sub-${frame.id}-${frame.subagentId}`,
-            role: 'assistant',
-            text: '',
-            speaker: sp,
-            roomId: frame.id,
-            subTask: frame.task,
-            subTools: [],
-          },
-        ])
-        break
-      }
-      case 'subagentDelta': {
-        if (!sid) break
-        setMessages((prev) => {
-          const list = [...prev]
-          const i = lastSubIndex(list, frame.id, frame.subagentId)
-          if (i < 0) return list
-          list[i] = { ...list[i], text: list[i].text + frame.text }
-          return list
-        })
-        break
-      }
-      case 'subagentToolStart': {
-        if (!sid) break
-        setMessages((prev) => {
-          const list = [...prev]
-          const i = lastSubIndex(list, frame.id, frame.subagentId)
-          if (i < 0) return list
-          const cur = list[i]
-          list[i] = {
-            ...cur,
-            subTools: [
-              ...(cur.subTools ?? []),
-              { id: frame.callId, name: frame.name, input: frame.input ?? {} },
-            ],
-          }
-          return list
-        })
-        break
-      }
-      case 'subagentToolEnd': {
-        if (!sid) break
-        setMessages((prev) => {
-          const list = [...prev]
-          const i = lastSubIndex(list, frame.id, frame.subagentId)
-          if (i < 0) return list
-          const cur = list[i]
-          // 子代理自己生的图也自动预览（脚本只打印文件名，模型常忘记写链接）
-          const incoming = frame.images ?? []
-          list[i] = {
-            ...cur,
-            subTools: (cur.subTools ?? []).map((c) =>
-              c.id === frame.callId
+        case 'toolStart': {
+          if (!sid) break
+          patchMsgs(sid, (prev) => {
+            const list = [...prev]
+            let i = lastMainIndex(list)
+            if (i < 0) {
+              list.push(newMainMessage())
+              i = list.length - 1
+            }
+            const tail = list[i]
+            list[i] = {
+              ...tail,
+              toolCalls: [
+                ...(tail.toolCalls ?? []),
+                { id: frame.id, name: frame.name, input: frame.input ?? {} },
+              ],
+            }
+            return list
+          })
+          break
+        }
+        case 'toolEnd': {
+          if (!sid) break
+          patchMsgs(sid, (prev) => {
+            const list = [...prev]
+            const i = lastMainIndex(list)
+            if (i < 0) return list
+            const tail = list[i]
+            const cards = (tail.toolCalls ?? []).map((c) =>
+              c.id === frame.id
                 ? { ...c, ok: frame.ok, output: frame.output }
                 : c,
-            ),
-            generated: incoming.length
-              ? Array.from(new Set([...(cur.generated ?? []), ...incoming]))
-              : cur.generated,
-          }
-          return list
-        })
-        break
-      }
-      case 'subagentEnd': {
-        if (!sid) break
-        setMessages((prev) => {
-          const list = [...prev]
-          for (let i = list.length - 1; i >= 0; i -= 1) {
-            const m = list[i]
-            if (m.roomId !== frame.id || m.speaker?.id !== frame.subagentId) continue
-            // 流式没接到文字（网关只给最终文本）时用收尾文本兜底。
-            const text = m.text.trim() ? m.text : frame.text || m.text
-            list[i] = { ...m, text, subDone: true }
-            break
-          }
-          return list
-        })
-        break
-      }
-      case 'done': {
-        setBusy(false)
-        if (frame.stopped) setStoppedNote(true)
-        const completed = activeIdRef.current
-        if (queueRef.current.length > 0) {
-          // 还有排队的消息 → 直接接着发（消息已在界面上，不必先刷历史）
-          flushQueue()
-        } else if (completed) {
-          void api.chatMessages(completed).catch(() => undefined)
-          void reloadSessions()
+            )
+            // 生图自动预览：后端把本次新生成的图片路径带在 toolEnd 上，
+            // 直接挂到这条 assistant 消息（去重），无需模型写 markdown。
+            const incoming = frame.images ?? []
+            const generated = incoming.length
+              ? Array.from(new Set([...(tail.generated ?? []), ...incoming]))
+              : tail.generated
+            list[i] = { ...tail, toolCalls: cards, generated }
+            return list
+          })
+          break
         }
-        break
+        // ── 群聊：子代理开麦 ───────────────────────────────────────────
+        case 'subagentStart': {
+          if (!sid) break
+          const sp: Speaker = {
+            id: frame.subagentId,
+            name: frame.name || frame.subagentId,
+            emoji: frame.emoji || '🤖',
+            kind: 'sub',
+            project: frame.project || undefined,
+          }
+          rememberSub(sid, sp)
+          patchMsgs(sid, (prev) => [
+            ...prev,
+            {
+              id: `sub-${frame.id}-${frame.subagentId}`,
+              role: 'assistant',
+              text: '',
+              speaker: sp,
+              roomId: frame.id,
+              subTask: frame.task,
+              subTools: [],
+            },
+          ])
+          break
+        }
+        case 'subagentDelta': {
+          if (!sid) break
+          patchMsgs(sid, (prev) => {
+            const list = [...prev]
+            const i = lastSubIndex(list, frame.id, frame.subagentId)
+            if (i < 0) return list
+            list[i] = { ...list[i], text: list[i].text + frame.text }
+            return list
+          })
+          break
+        }
+        case 'subagentToolStart': {
+          if (!sid) break
+          patchMsgs(sid, (prev) => {
+            const list = [...prev]
+            const i = lastSubIndex(list, frame.id, frame.subagentId)
+            if (i < 0) return list
+            const cur = list[i]
+            list[i] = {
+              ...cur,
+              subTools: [
+                ...(cur.subTools ?? []),
+                { id: frame.callId, name: frame.name, input: frame.input ?? {} },
+              ],
+            }
+            return list
+          })
+          break
+        }
+        case 'subagentToolEnd': {
+          if (!sid) break
+          patchMsgs(sid, (prev) => {
+            const list = [...prev]
+            const i = lastSubIndex(list, frame.id, frame.subagentId)
+            if (i < 0) return list
+            const cur = list[i]
+            // 子代理自己生的图也自动预览（脚本只打印文件名，模型常忘记写链接）
+            const incoming = frame.images ?? []
+            list[i] = {
+              ...cur,
+              subTools: (cur.subTools ?? []).map((c) =>
+                c.id === frame.callId
+                  ? { ...c, ok: frame.ok, output: frame.output }
+                  : c,
+              ),
+              generated: incoming.length
+                ? Array.from(new Set([...(cur.generated ?? []), ...incoming]))
+                : cur.generated,
+            }
+            return list
+          })
+          break
+        }
+        case 'subagentEnd': {
+          if (!sid) break
+          patchMsgs(sid, (prev) => {
+            const list = [...prev]
+            for (let i = list.length - 1; i >= 0; i -= 1) {
+              const m = list[i]
+              if (m.roomId !== frame.id || m.speaker?.id !== frame.subagentId)
+                continue
+              // 流式没接到文字（网关只给最终文本）时用收尾文本兜底。
+              const text = m.text.trim() ? m.text : frame.text || m.text
+              list[i] = { ...m, text, subDone: true }
+              break
+            }
+            return list
+          })
+          break
+        }
+        case 'done': {
+          if (!sid) break
+          markRunning(sid, false)
+          if (frame.stopped) setStoppedNote(true, sid)
+          if ((queuesRef.current[sid] ?? []).length > 0) {
+            // 还有排队的消息 → 直接接着发（消息已在界面上，不必先刷历史）
+            flushQueue(sid)
+          } else {
+            void reloadSessions()
+          }
+          break
+        }
+        case 'fallback': {
+          if (!sid) break
+          // 主模型被限流/超时，后端已切到兜底模型 —— 留一条提示，
+          // 免得用户看到「回复突然换了个语气」却不知道发生了什么。
+          patchMsgs(sid, (prev) => [
+            ...prev,
+            {
+              id: `fb-${Date.now()}-${frame.toModel}`,
+              role: 'assistant',
+              text: '',
+              fallbackNote:
+                `⚠️ ${frame.fromModel} 不可用（${frame.reason}）` +
+                ` → 已自动切换到 ${frame.toModel}`,
+            },
+          ])
+          break
+        }
+        case 'error':
+          if (sid) {
+            setError(frame.error, sid)
+            markRunning(sid, false)
+            if ((queuesRef.current[sid] ?? []).length > 0) flushQueue(sid)
+          }
+          break
+        default:
+          break
       }
-      case 'error':
-        setError(frame.error)
-        setBusy(false)
-        if (queueRef.current.length > 0) flushQueue()
-        break
-      default:
-        break
-    }
-  }, [flushQueue, onChangeSession, reloadSessions, rememberSub])
+    },
+    [
+      flushQueue,
+      markRunning,
+      onChangeSession,
+      patchMsgs,
+      reloadSessions,
+      rememberSub,
+      setError,
+      setStoppedNote,
+    ],
+  )
 
   useEffect(() => {
     const ws = openSocket(handleFrame, { onStateChange: setSocketState })
@@ -849,46 +959,52 @@ export function ChatView({
   }, [pickerOpen])
 
   // -- actions --------------------------------------------------------------
-  const send = useCallback((text: string) => {
-    const t = text.trim()
-    if (!t) return
-    const sid = activeIdRef.current
-    if (!sid) return
-    setError(null)
-    setConfigWarning(null)
-    setStoppedNote(false)
-    setMessages((prev) => [
-      ...prev,
-      { id: `local-${Date.now()}`, role: 'user', text: t, toolCalls: [] },
-    ])
-    if (busy) {
-      // 生成中 → 先排队，本轮 done 后自动发出（消息已显示在界面上）
-      queueRef.current.push(t)
-      setQueuedCount(queueRef.current.length)
-      return
-    }
-    dispatch(t, sid)
-  }, [busy, dispatch])
+  const send = useCallback(
+    (text: string) => {
+      const t = text.trim()
+      if (!t) return
+      const sid = activeIdRef.current
+      if (!sid) return
+      setError(null, sid)
+      setConfigWarning(null)
+      setStoppedNote(false, sid)
+      patchMsgs(sid, (prev) => [
+        ...prev,
+        { id: `local-${Date.now()}`, role: 'user', text: t, toolCalls: [] },
+      ])
+      if (runningRef.current.has(sid)) {
+        // 本会话生成中 → 先排队，本轮 done 后自动发出（消息已显示在界面上）。
+        // 注意只看**本会话**在不在跑：别的会话在跑不影响这里，这正是并行。
+        patchQueue(sid, (prev) => [...prev, t])
+        return
+      }
+      dispatch(t, sid)
+    },
+    [dispatch, patchMsgs, patchQueue, setError, setStoppedNote],
+  )
 
-  const createChatHere = useCallback(async (folderId?: string | null) => {
-    try {
-      const created = await api.chatCreate(folderId ?? undefined)
-      await reloadSessions()
-      onChangeSession(created.id)
-      setMessages([])
-      setError(null)
-      setPickerOpen(false)
-    } catch (e) {
-      setError(String((e as Error).message))
-    }
-  }, [onChangeSession, reloadSessions])
+  const createChatHere = useCallback(
+    async (folderId?: string | null) => {
+      try {
+        const created = await api.chatCreate(folderId ?? undefined)
+        await reloadSessions()
+        onChangeSession(created.id)
+        patchMsgs(created.id, () => [])
+        setError(null)
+        setPickerOpen(false)
+      } catch (e) {
+        setError(String((e as Error).message))
+      }
+    },
+    [onChangeSession, patchMsgs, reloadSessions, setError],
+  )
 
   // -- clear current session messages ---------------------------------------
   const clearSession = useCallback(() => {
     if (!activeSessionId) return
-    setMessages([])
+    patchMsgs(activeSessionId, () => [])
     setError(null)
-  }, [activeSessionId])
+  }, [activeSessionId, patchMsgs, setError])
 
   // -- derived --------------------------------------------------------------
   const activeSession =
@@ -1333,9 +1449,12 @@ export function ChatView({
           messages={visibleMessages}
           sessionId={activeSessionId}
           showSub={showSub}
-          onDeleted={(mid) =>
-            setMessages((prev) => prev.filter((m) => m.id !== mid))
-          }
+          onDeleted={(mid) => {
+            if (!activeSessionId) return
+            patchMsgs(activeSessionId, (prev) =>
+              prev.filter((m) => m.id !== mid),
+            )
+          }}
         />
         {socketState !== 'open' && (
           <div className={`chat-sockpill chat-sockpill--${socketState}`}>
@@ -1461,6 +1580,14 @@ function Bubble({
       console.warn('delete message failed', e)
       setDeleting(false)
     }
+  }
+  // 兜底模型切换提示：一条浅色小条，不是模型说的话，也不该有复制/删除按钮。
+  if (msg.fallbackNote) {
+    return (
+      <div className="bubble-fallback" title={msg.fallbackNote}>
+        {msg.fallbackNote}
+      </div>
+    )
   }
   return (
     <div className={`bubble ${msg.role}${isSub ? ' is-sub' : ''}`}>

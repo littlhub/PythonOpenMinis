@@ -6,6 +6,7 @@ import type {
   SubagentInfo,
   WorkspaceInfo,
 } from '../types'
+import { RUNNING_SESSIONS_EVENT } from '../types'
 
 export type ViewId = 'chat' | 'workspaces' | 'sandbox' | 'settings' | 'projects' | 'knowledge' | 'memory' | 'skills' | 'market' | 'channels' | 'scheduler'
 
@@ -99,6 +100,21 @@ export function Sidebar(props: SidebarProps) {
   })
   // 上次访问的管理页（点头「管理」时跳回它 —— 和点「聊天」跳聊天一致）。
   const [lastManageView, setLastManageView] = useState<ViewId>('workspaces')
+  // 哪些会话正在生成（聊天页广播，见 RUNNING_SESSIONS_EVENT）——
+  // 多会话并行时会话行上点一个「运行中」小圆点，一眼看得出谁在跑。
+  const [running, setRunning] = useState<string[]>([])
+  useEffect(() => {
+    const onRunning = (e: Event) => {
+      const ids = (e as CustomEvent<string[]>).detail
+      setRunning(Array.isArray(ids) ? ids : [])
+    }
+    window.addEventListener(RUNNING_SESSIONS_EVENT, onRunning as EventListener)
+    return () =>
+      window.removeEventListener(
+        RUNNING_SESSIONS_EVENT,
+        onRunning as EventListener,
+      )
+  }, [])
 
   // 折叠态右弹抽屉：左边栏收成窄条时，点「聊天」/「管理」图标从图标右侧
   // 弹出悬浮面板（好友栏 = 好友 + 会话 / 管理项），点空白处收起。
@@ -554,6 +570,9 @@ export function Sidebar(props: SidebarProps) {
                             : '（还没有消息）'}
                         </i>
                       </span>
+                      {running.includes(s.id) && (
+                        <span className="sess-run" title="正在生成…" />
+                      )}
                     </button>
                   ))}
                 </div>
@@ -680,6 +699,9 @@ export function Sidebar(props: SidebarProps) {
                           >
                             <span className="ic">💬</span>
                             <span className="lbl">{s.title}</span>
+                            {running.includes(s.id) && (
+                              <span className="sess-run" title="正在生成…" />
+                            )}
                           </button>
                           <button
                             className="sess-x"
@@ -756,6 +778,9 @@ export function Sidebar(props: SidebarProps) {
                           >
                             <span className="ic">💬</span>
                             <span className="lbl">{s.title}</span>
+                            {running.includes(s.id) && (
+                              <span className="sess-run" title="正在生成…" />
+                            )}
                           </button>
                           <button
                             className="sess-x"

@@ -14,6 +14,7 @@ from ..agent.tool_loop_detector import ToolLoopDetector
 from ..data.model import LLMModel, ThinkingLevel
 from ..data.model.agent_content_part import ToolUse  # noqa: F401  (re-exported for tests)
 from ..provider.anthropic.anthropic_provider import AnthropicProvider
+from ..provider.fallback import FallbackCandidate, FallbackChainProvider
 from ..provider.openai.openai_provider import OpenAIProvider
 from ..settings.catalog import (
     ENGINE_READY,
@@ -378,6 +379,69 @@ async def close_provider_cache() -> None:
     _PROVIDER_CACHE.clear()
 
 
+def _fallback_candidates(
+    store: SettingsStore, agent_cfg: dict[str, Any], active_pid: str
+) -> list[FallbackCandidate]:
+    """把 ``agent.fallbackModels`` 解析成有序候选（跳过无效项与主模型本身）。
+
+    配置形如 ``[{"instance": "<厂商实例 id>", "model": "<模型 id>"}, …]`` ——
+    顺序即兜底顺序：主模型挂了先试第一个，再第二个…… 用户想加几个加几个。
+    """
+    raw = agent_cfg.get("fallbackModels") or []
+    if not isinstance(raw, list):
+        return []
+    instances = {str(p.get("id") or ""): p for p in store.provider_instances()}
+    data = store.load()
+    active_conf = (data.get("providers") or {}).get(active_pid) or {}
+    active_model = str(active_conf.get("model") or "").strip()
+    out: list[FallbackCandidate] = []
+    seen: set[tuple[str, str]] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        pid = str(item.get("instance") or "").strip()
+        mid = str(item.get("model") or "").strip()
+        if not pid or not mid or (pid, mid) in seen:
+            continue
+        inst = instances.get(pid)
+        if inst is None:
+            continue  # 厂商实例已被删掉 —— 静默跳过，别让整轮对话起不来
+        if pid == active_pid and mid == active_model:
+            continue  # 与主模型完全一样，占一个兜底位没意义
+        seen.add((pid, mid))
+        label = f"{inst.get('label') or inst.get('name') or pid} / {mid}"
+        out.append(FallbackCandidate(pid, mid, label))
+    return out
+
+
+def _apply_fallback_chain(
+    store: SettingsStore,
+    provider: Any,
+    agent_cfg: dict[str, Any],
+    active_pid: str,
+    *,
+    on_fallback: Callable[[str, str, str], Any] | None = None,
+):
+    """配了兜底模型就把 provider 包成链，没配就原样返回。"""
+    candidates = _fallback_candidates(store, agent_cfg, active_pid)
+    if not candidates:
+        return provider
+    instances = {str(p.get("id") or ""): p for p in store.provider_instances()}
+
+    def build(cand: FallbackCandidate):  # noqa: ANN202
+        conf = instances.get(cand.instance_id)
+        if conf is None:
+            raise ChatSetupError(f"兜底模型 {cand.label} 的厂商实例不存在")
+        # 复用 build_provider 的连接池缓存；只换 model。
+        return build_provider(cand.instance_id, {**conf, "model": cand.model_id})
+
+    logger.info(
+        "LLM fallback chain enabled: %s",
+        " → ".join(c.label for c in candidates),
+    )
+    return FallbackChainProvider(provider, candidates, build, on_switch=on_fallback)
+
+
 def build_provider(provider_id: str, conf: dict[str, Any]):  # noqa: ANN201
     """Instantiate (or reuse) the LLM provider for a stored provider config.
 
@@ -438,6 +502,7 @@ def build_chat_setup(  # noqa: ANN201
     instance_id: str | None = None,
     model_id: str | None = None,
     session_id: str | None = None,
+    on_fallback: Callable[[str, str, str], Any] | None = None,
 ):
     """Return ``(provider, runtime, options, identity, provider_conf)`` for the
     active provider + identity, or raise :class:`ChatSetupError` with a
@@ -467,6 +532,10 @@ def build_chat_setup(  # noqa: ANN201
     identity = store.active_identity()
     # Agent 对话参数(模型设置):执行步数上限 + 深度思考 + 子代理助理开关。
     agent_cfg = store.agent_config()
+    # 兜底模型链：主模型限流/超时/5xx 时按用户配的顺序自动切下一个。
+    provider = _apply_fallback_chain(
+        store, provider, agent_cfg, pid, on_fallback=on_fallback
+    )
     enabled_ids = list(identity.effective_tools())
     # skill_use 是**能力开关**而不是身份工具：老 settings.json 里存的
     # enabled_tools 早于 skill_use 出现，缺了它「可用技能」清单就成了一句

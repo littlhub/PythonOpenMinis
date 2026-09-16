@@ -5599,3 +5599,113 @@ dl.facts.usage-detail {
     white-space: nowrap;
   }
 }
+
+/* 会话行上的「运行中」小圆点（多会话并行时一眼看出谁在跑） */
+.sess-run {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  margin-left: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: sess-run-pulse 1.4s ease-out infinite;
+}
+
+@keyframes sess-run-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(90, 160, 255, 0.5);
+  }
+  70% {
+    box-shadow: 0 0 0 6px rgba(90, 160, 255, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(90, 160, 255, 0);
+  }
+}
+
+/* 兜底模型切换提示条（主模型限流/超时时自动切模型的说明） */
+.bubble-fallback {
+  align-self: center;
+  max-width: 92%;
+  margin: 6px auto;
+  padding: 5px 12px;
+  border: 1px dashed var(--border);
+  border-radius: 999px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--muted);
+  background: var(--accent-soft);
+  text-align: center;
+}
+
+/* 兜底模型链编辑器（设置 → 对话参数） */
+.fallback-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.fallback-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.fallback-idx {
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 11px;
+}
+
+.fallback-row select,
+.fallback-row input {
+  flex: 1;
+  min-width: 0;
+  font-family: inherit;
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+
+.fallback-del {
+  flex: 0 0 auto;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+
+.fallback-del:hover {
+  color: var(--danger);
+  background: var(--accent-soft);
+}
+
+.fallback-add {
+  align-self: flex-start;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  padding: 4px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.fallback-add:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}

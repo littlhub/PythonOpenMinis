@@ -799,8 +799,26 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
         )
 
     store = SettingsStore.get()
+
+    def _on_fallback(from_label: str, to_label: str, reason: str) -> None:
+        """主模型限流/超时切到兜底模型时通知前端挂一条提示。"""
+        _spawn_bg(
+            _safe_send(
+                client_id,
+                {
+                    "type": "fallback",
+                    "fromModel": from_label,
+                    "toModel": to_label,
+                    "reason": reason,
+                    "sessionId": sid,
+                },
+            )
+        )
+
     try:
-        provider, runtime, options, identity, conf = build_chat_setup(store, session_id=sid)
+        provider, runtime, options, identity, conf = build_chat_setup(
+            store, session_id=sid, on_fallback=_on_fallback
+        )
     except ChatSetupError as e:
         await _safe_send(client_id, {"type": "delta", "text": str(e)})
         await _safe_send(client_id, {"type": "done", "sessionId": sid})
@@ -882,7 +900,9 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
 
     async def sink(chunk: object) -> None:
         if isinstance(chunk, LLMStreamChunk.Text):
-            await _safe_send(client_id, {"type": "delta", "text": chunk.text})
+            await _safe_send(
+                client_id, {"type": "delta", "text": chunk.text, "sessionId": sid}
+            )
         elif isinstance(chunk, LLMStreamChunk.ToolCallComplete):
             # Frontend renders this as a "tool starting" card.
             # 记下参数与开始时间：toolEnd 时要判断这是不是一次生图调用，
@@ -894,6 +914,7 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
                 "id": chunk.id,
                 "name": chunk.name,
                 "input": chunk.args or {},
+                "sessionId": sid,
             })
         elif isinstance(chunk, LLMStreamChunk.ToolResult):
             # Final state of that tool call: success / error + truncated body.
@@ -1038,7 +1059,9 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
             logger.debug("memory organise trigger failed", exc_info=True)
     except Exception as e:  # pragma: no cover - defensive
         logger.exception("chat run crashed")
-        await _safe_send(client_id, {"type": "error", "error": f"对话出错: {e}"}
+        await _safe_send(
+            client_id,
+            {"type": "error", "error": f"对话出错: {e}", "sessionId": sid},
         )
     finally:
         # 「分配项目」是**本轮**的，收工必须清掉 —— 否则同一个上下文里跑下一轮

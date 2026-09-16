@@ -119,6 +119,30 @@ export type ServerFrame =
       cacheRead?: number | null
     }
   | { type: 'error'; error: string; /** 控制台被密码锁住时说一声 */ locked?: boolean }
+  | {
+      /** 主模型限流/超时/5xx，已自动切到兜底模型 —— 界面挂一条提示。 */
+      type: 'fallback'
+      fromModel: string
+      toModel: string
+      reason: string
+    }
+
+/**
+ * 多会话并行：所有流式帧都带上「它属于哪个会话」。
+ *
+ * 后端本来就是按会话 id 隔离运行的（`_RUNNING_CHATS`），但帧过去不带会话信息，
+ * 前端只能一股脑 append 到「当前打开的那个会话」—— 于是 A 会话在跑时切到 B，
+ * A 的流式内容就串进了 B。带上 sessionId 后，前端才能把每段输出路由回各自的
+ * 消息列表，多个会话也就真正能同时跑了。
+ */
+export type SessionScopedFrame = ServerFrame & { sessionId?: string }
+
+/**
+ * 聊天页广播「哪些会话正在生成」用的窗口事件名（detail = 会话 id 数组）。
+ * 侧边栏订阅它，在会话行上点一个「运行中」小圆点 —— 多会话并行时一眼看得出
+ * 谁在跑、谁在闲。
+ */
+export const RUNNING_SESSIONS_EVENT = 'openminis:running-sessions'
 
 // ---------------------------------------------------------------------------
 // chat sessions & messages (设置无关的会话持久化)

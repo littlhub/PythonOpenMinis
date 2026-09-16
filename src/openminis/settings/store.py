@@ -104,6 +104,10 @@ def _defaults() -> dict[str, Any]:
             # 记忆自动整理：每 N 条用户提问把每日记忆蒸馏进四类长期记忆
             # （0 = 关闭）。到点后台跑，不挡对话；配合时间兜底（20h+新日志）。
             "memoryOrganizeEvery": 10,
+            # LLM 兜底模型链：主模型限流(429)/超时/5xx 时按顺序自动切下一个。
+            # 形如 [{"instance": "<厂商实例 id>", "model": "<模型 id>"}, …]，
+            # 顺序即优先级；空数组 = 不启用兜底。
+            "fallbackModels": [],
         },
     }
 
@@ -549,6 +553,23 @@ class SettingsStore:
                             errors.append(
                                 "agent.memoryOrganizeEvery 需在 0-1000（0=关闭自动整理）"
                             )
+                if "fallbackModels" in raw:
+                    # 兜底模型链：有序列表，每项 {instance, model}。非法项直接丢，
+                    # 不做"整体报错"—— 厂商实例被删掉后留个空壳不该堵死设置保存。
+                    cleaned: list[dict[str, str]] = []
+                    fraw = raw["fallbackModels"]
+                    if not isinstance(fraw, list):
+                        errors.append("agent.fallbackModels 必须是列表")
+                    else:
+                        for item in fraw:
+                            if not isinstance(item, dict):
+                                continue
+                            inst = str(item.get("instance") or "").strip()
+                            mid = str(item.get("model") or "").strip()
+                            if not inst or not mid:
+                                continue
+                            cleaned.append({"instance": inst, "model": mid})
+                        agent["fallbackModels"] = cleaned
                 data["agent"] = agent
 
         if errors:
