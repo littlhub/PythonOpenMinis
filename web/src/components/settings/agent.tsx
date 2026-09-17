@@ -1216,7 +1216,8 @@ export function SoulPage(props: { onBack: () => void; go: (id: SetPageId) => voi
 // ---------------------------------------------------------------------------
 // 技能与工具 — 已移植工具目录(只读概览)
 // ---------------------------------------------------------------------------
-const CATEGORY_ORDER = ['Shell', 'Files', 'Vision', 'Browser', 'Memory']
+//: 「Plugin」= 装插件带进来的工具（名字是 <插件id>__<工具id>），单列一组。
+const CATEGORY_ORDER = ['Shell', 'Files', 'Vision', 'Browser', 'Memory', 'Plugin']
 
 export function SkillsPage(props: { onBack: () => void; go: (id: SetPageId) => void }) {
   const [settings, setSettings] = useState<SettingsInfo | null>(null)

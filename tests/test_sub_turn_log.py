@@ -223,10 +223,13 @@ async def test_ws_turn_persists_subagent_process(tmp_path, monkeypatch):
     chat_store.set_database_path(tmp_path / "ws_sub.db")
     try:
         runtime = _SubEmittingRuntime()
+        seen_setup: dict[str, object] = {}
 
-        def fake_setup(store, session_id=None, on_fallback=None):
+        def fake_setup(store, session_id=None, identity_id=None, on_fallback=None, **_kw):
             from openminis.agent.agent_runtime import AgentRuntimeOptions
 
+            seen_setup["session_id"] = session_id
+            seen_setup["identity_id"] = identity_id
             return (object(), runtime, AgentRuntimeOptions(), "你是助手",
                     {"id": "gw", "model": "m1"})
 
@@ -238,7 +241,9 @@ async def test_ws_turn_persists_subagent_process(tmp_path, monkeypatch):
 
         monkeypatch.setattr(server_main, "_safe_send", fake_send)
 
-        await server_main._run_chat("c1", {"text": "查一下新闻"})
+        # 带了 identityId（通道插件指定「由哪个 agent 接待」）就要原样传下去
+        await server_main._run_chat("c1", {"text": "查一下新闻", "identityId": "coder"})
+        assert seen_setup["identity_id"] == "coder"
 
         # 推流照旧（前端实时还是能看到过程）
         kinds = [f["type"] for f in sent]

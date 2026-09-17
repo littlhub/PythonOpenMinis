@@ -37,7 +37,7 @@ from ..scheduled.runner import ScheduledRunner
 from ..soul import SoulStore
 from ..data.model import LLMMessage, LLMStreamChunk
 from ..data.model.agent_content_part import Text
-from ..settings.catalog import MODEL_GROUPS, PROVIDER_TYPES, TOOL_CATALOG
+from ..settings.catalog import MODEL_GROUPS, PROVIDER_TYPES, all_tool_catalog
 from ..settings.model_capability import (
     SLOT_CAPABILITIES,
     SLOT_LABELS,
@@ -69,6 +69,7 @@ from .skills_api import router as skills_router
 from .subagents_api import router as subagents_router
 from .system_api import router as system_router
 from .appearance_api import router as appearance_router
+from .plugins_api import router as plugins_router
 from .upload_api import router as upload_router
 from .usage_api import router as usage_router
 
@@ -147,11 +148,25 @@ async def lifespan(app: FastAPI):  # noqa: ANN201
     except Exception:  # pragma: no cover - never fail startup over memory
         logger.exception("memory organiser failed to start")
     logger.info("OpenMinis server starting")
+    # [T-plugins-manager] 上次启用的插件（QQ 机器人这类通道）自动拉起来 ——
+    # 否则重启服务之后机器人就悄悄掉线了。
+    try:
+        from ..plugins import get_runtime
+
+        await get_runtime().start_enabled()
+    except Exception:  # pragma: no cover - 插件起不来不该拦住服务
+        logger.exception("plugin auto-start failed")
     yield
     if organiser_task is not None:
         organiser_task.cancel()
     if runner is not None:
         await runner.stop()
+    try:
+        from ..plugins import get_runtime
+
+        await get_runtime().stop_all()
+    except Exception:  # pragma: no cover - 关服清理失败不影响退出
+        logger.debug("plugin shutdown failed", exc_info=True)
     # Provider 连接池是跨轮复用的（省掉每次 TLS 握手），关服时要显式收掉。
     try:
         from ..settings.chat_service import close_provider_cache
@@ -184,6 +199,7 @@ app.include_router(system_router)
 app.include_router(skills_router)
 app.include_router(knowledge_router)
 app.include_router(subagents_router)
+app.include_router(plugins_router)
 app.include_router(marketplace_router)
 app.include_router(scheduled_router)
 app.include_router(usage_router)
@@ -522,7 +538,7 @@ def _settings_view(store: SettingsStore | None = None) -> dict[str, Any]:
         "providers": providers,
         "providerTypes": provider_types,
         "identities": identities,
-        "toolCatalog": TOOL_CATALOG,
+        "toolCatalog": all_tool_catalog(),
         "agent": store.agent_config(),
         "capabilities": capabilities_catalog(store.custom_model_types()),
         "customModelTypes": store.custom_model_types(),
@@ -620,6 +636,14 @@ class ConnectionManager:
     def disconnect(self, client_id: str) -> None:
         self.active.pop(client_id, None)
         logger.debug("ws disconnect %s (%d active)", client_id, len(self.active))
+
+    def attach(self, client_id: str, sink: Any) -> None:
+        """挂一个非 WebSocket 的订阅者（只需要有 ``send_json``）。
+
+        [T-plugins-manager] 机器人通道用它接同一条推流：这样 IM 那边也能有
+        流式输出、工具过程、兜底提示，而不是另写一套「跑完再取结果」的旁路。
+        """
+        self.active[client_id] = sink
 
     async def send_json(self, client_id: str, payload: dict[str, Any]) -> None:
         ws = self.active.get(client_id)
@@ -852,9 +876,16 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
             )
         )
 
+    # 「由哪个 agent 接待」：通道插件（QQ 等）把选定的人设带上来 —— 机器人的
+    # 对话不该跟着网页端「当前身份」变脸。网页端不传，照旧用当前身份。
+    identity_id = str(msg.get("identityId") or msg.get("agentId") or "").strip()
+
     try:
         provider, runtime, options, identity, conf = build_chat_setup(
-            store, session_id=sid, on_fallback=_on_fallback
+            store,
+            session_id=sid,
+            identity_id=identity_id or None,
+            on_fallback=_on_fallback,
         )
     except ChatSetupError as e:
         await _safe_send(client_id, {"type": "delta", "text": str(e)})

@@ -1,0 +1,68 @@
+{
+  "id": "qq-bot",
+  "name": "QQ 机器人",
+  "icon": "🐧",
+  "version": "1.0.0",
+  "author": "OpenMinis",
+  "category": "channel",
+  "runtime": "engine",
+  "driver": "qq",
+  "description": "把 QQ 官方机器人接进引擎：私聊与群内 @ 都能对话，用的是同一套模型、技能、工具与记忆，会话在网页端也能接着聊。",
+  "fields": [
+    {
+      "key": "agentId",
+      "label": "由哪个 agent 接待",
+      "type": "select",
+      "optionsFrom": "agents",
+      "help": "默认跟随网页端的「当前身份」。也可以固定成某个身份，或直接交给助理页里的某个子代理（它有自己的人设、模型与工具）—— 子代理接管时这一路对话不经过主代理。"
+    },
+    {
+      "key": "appId",
+      "label": "AppID",
+      "type": "text",
+      "required": true,
+      "placeholder": "102xxxxxx",
+      "help": "QQ 开放平台（q.qq.com）→ 机器人 → 开发设置 里的 AppID"
+    },
+    {
+      "key": "clientSecret",
+      "label": "ClientSecret",
+      "type": "password",
+      "required": true,
+      "secret": true,
+      "help": "只存在本地数据目录，界面只回「已填 / 未填」"
+    },
+    {
+      "key": "allowFrom",
+      "label": "私聊白名单",
+      "type": "list",
+      "help": "一行一个 user_openid；留空表示任何人都能私聊。群里被 @ 到不受此限制。"
+    },
+    {
+      "key": "maxMessageChars",
+      "label": "单条上限（字符）",
+      "type": "number",
+      "default": 2000,
+      "min": 200,
+      "max": 2000,
+      "help": "QQ 官方限制单条 2000，超出会按段落自动分条发送"
+    },
+    {
+      "key": "chunkChars",
+      "label": "流式分段长度",
+      "type": "number",
+      "default": 900,
+      "min": 0,
+      "max": 2000,
+      "help": "回答攒够这么多字就先发一段，长回答不用干等；0 = 跑完一次发"
+    },
+    {
+      "key": "sendChunkDelayMs",
+      "label": "分段间隔（毫秒）",
+      "type": "number",
+      "default": 600,
+      "min": 0,
+      "max": 5000
+    }
+  ]
+}

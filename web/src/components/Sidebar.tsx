@@ -8,7 +8,7 @@ import type {
 } from '../types'
 import { RUNNING_SESSIONS_EVENT } from '../types'
 
-export type ViewId = 'chat' | 'workspaces' | 'sandbox' | 'settings' | 'projects' | 'knowledge' | 'memory' | 'skills' | 'market' | 'channels' | 'scheduler'
+export type ViewId = 'chat' | 'workspaces' | 'sandbox' | 'settings' | 'projects' | 'knowledge' | 'memory' | 'skills' | 'market' | 'channels' | 'plugins' | 'scheduler'
 
 interface NavItem {
   id: ViewId
@@ -18,7 +18,7 @@ interface NavItem {
 
 const TOP_NAV: NavItem[] = [{ id: 'chat', label: '聊天', icon: '💬' }]
 
-//: 「管理」折叠分组 —— 助理/知识/记忆/技能/广场/通道/定时 七个一起收起来，
+//: 「管理」折叠分组 —— 助理/知识/记忆/技能/广场/通道/插件/定时 一起收起来，
 //: 点分组标题展开（默认收起；当前页在组里时自动展开）。
 const MANAGE_NAV: NavItem[] = [
   { id: 'workspaces', label: '助理', icon: '🐾' },
@@ -27,6 +27,7 @@ const MANAGE_NAV: NavItem[] = [
   { id: 'skills', label: '技能', icon: '⚡' },
   { id: 'market', label: '广场', icon: '🛍️' },
   { id: 'channels', label: '通道', icon: '📡' },
+  { id: 'plugins', label: '插件', icon: '🧩' },
   { id: 'scheduler', label: '定时', icon: '⏰' },
 ]
 
@@ -44,6 +45,7 @@ const MANAGE_DESC: Record<string, string> = {
   skills: '内置与自定义技能',
   market: '技能广场',
   channels: '模型服务通道',
+  plugins: '装入 / 导入插件',
   scheduler: '定时任务',
 }
 

@@ -286,7 +286,7 @@ async def test_ws_turn_persists_tool_cards_but_not_into_context(tmp_path, monkey
         runtime = AgentRuntime()
         runtime.register(ToolExecutor(_echo_tool_def(), _shell_ok))
 
-        def fake_setup(store, session_id=None, on_fallback=None):
+        def fake_setup(store, session_id=None, identity_id=None, on_fallback=None, **_kw):
             return (
                 _OneToolProvider(), runtime, AgentRuntimeOptions(),
                 "你是助手", {"id": "gw", "model": "m1"},

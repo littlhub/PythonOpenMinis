@@ -5976,3 +5976,281 @@ dl.facts.usage-detail {
   border-color: var(--accent);
   color: var(--accent);
 }
+
+/* ---- Plugins（「插件」页 + 「通道」页的通道插件卡）--------------------- */
+.plugin-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.plugin-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.plugin-card.is-running {
+  border-color: var(--accent);
+}
+
+.plugin-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.plugin-icon {
+  font-size: 22px;
+  width: 30px;
+  text-align: center;
+  flex: none;
+}
+
+.plugin-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.plugin-name {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.plugin-chip {
+  font-size: 10px;
+  font-weight: 400;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid var(--accent);
+  color: var(--accent);
+}
+
+.plugin-chip.subtle {
+  border-color: var(--border);
+  color: var(--muted);
+}
+
+.plugin-desc {
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.plugin-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.plugin-btn {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  padding: 4px 12px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.plugin-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.plugin-btn.primary {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.plugin-btn.danger:hover:not(:disabled) {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.plugin-btn.tiny {
+  font-size: 11px;
+  padding: 2px 8px;
+}
+
+.plugin-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.plugin-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border);
+}
+
+.plugin-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.plugin-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.plugin-field-label {
+  font-size: 12px;
+  color: var(--text);
+}
+
+.plugin-field-label .req {
+  color: var(--danger);
+  font-style: normal;
+  margin-left: 2px;
+}
+
+.plugin-field input[type='text'],
+.plugin-field input[type='password'],
+.plugin-field input[type='number'],
+.plugin-field select,
+.plugin-field textarea,
+.plugin-import input {
+  width: 100%;
+  box-sizing: border-box;
+  font: inherit;
+  font-size: 12px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+}
+
+.plugin-field textarea {
+  resize: vertical;
+  line-height: 1.5;
+}
+
+.plugin-field input:focus,
+.plugin-field select:focus,
+.plugin-field textarea:focus,
+.plugin-import input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.plugin-field-help {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.plugin-form-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.plugin-import {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.plugin-import input {
+  flex: 1;
+  min-width: 220px;
+}
+
+.plugin-logs-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.plugin-log-list {
+  max-height: 220px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px;
+  background: var(--bg);
+}
+
+.plugin-log {
+  display: flex;
+  gap: 8px;
+  font-size: 11px;
+  line-height: 1.6;
+  font-family: var(--mono, ui-monospace, monospace);
+}
+
+.plugin-log-time {
+  color: var(--muted);
+  flex: none;
+}
+
+.plugin-log.warn .plugin-log-text {
+  color: #b58900;
+}
+
+.plugin-log.error .plugin-log-text {
+  color: var(--danger);
+}
+
+/* 窄屏：插件卡的动作按钮换行、导入框铺满 */
+@media (max-width: 768px) {
+  .plugin-head {
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }
+  .plugin-import input {
+    min-width: 100%;
+  }
+  .plugin-desc {
+    white-space: normal;
+  }
+}
+
+/* 插件提供的工具清单 */
+.plugin-tools {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.plugin-tool {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+}
+
+.plugin-tool-name {
+  font-size: 11px;
+  color: var(--accent);
+}
+
+.plugin-tool-desc {
+  font-size: 11px;
+  color: var(--muted);
+}

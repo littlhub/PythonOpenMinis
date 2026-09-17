@@ -9,6 +9,7 @@ import { MemoryView } from './components/MemoryView'
 import { SkillsView } from './components/SkillsView'
 import { MarketplaceView } from './components/MarketplaceView'
 import { ChannelsView } from './components/ChannelsView'
+import { PluginsView } from './components/PluginsView'
 import { SchedulerView } from './components/SchedulerView'
 import { SubagentsView } from './components/SubagentsView'
 import { LockScreen } from './components/LockScreen'
@@ -232,6 +233,11 @@ export default function App() {
         {view === 'channels' && (
           <div className="pane">
             <ChannelsView />
+          </div>
+        )}
+        {view === 'plugins' && (
+          <div className="pane">
+            <PluginsView />
           </div>
         )}
         {view === 'scheduler' && (

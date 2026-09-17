@@ -158,7 +158,7 @@ def _validate(store, cfg: dict[str, Any], existing: bool) -> None:
     # id — several OpenAI-compatible instances may exist). Legacy configs only
     # have ``providerType`` (the wire protocol); resolve it to the first
     # instance of that type so old subagents keep working.
-    from ..settings.catalog import ENGINE_READY, PROVIDER_TYPES, VALID_TOOLS
+    from ..settings.catalog import ENGINE_READY, PROVIDER_TYPES, known_tool_ids
     from ..settings.store import provider_type_label
 
     pid = str(cfg.get("providerId") or cfg.get("providerType") or "").strip()
@@ -185,7 +185,7 @@ def _validate(store, cfg: dict[str, Any], existing: bool) -> None:
     if ptype:
         cfg["providerType"] = ptype
 
-    cfg["tools"] = _clean_tools(cfg.get("tools"), VALID_TOOLS, sid)
+    cfg["tools"] = _clean_tools(cfg.get("tools"), known_tool_ids(), sid)
     cfg["skills"] = _clean_strings("skills", cfg.get("skills"), sid, "skills")
     cfg["mcpServers"] = _clean_strings("mcpServers", cfg.get("mcpServers"),
                                        sid, "mcpServers")
@@ -240,7 +240,12 @@ def build_registry(store) -> dict[str, Any]:
     This is exactly what gets embedded in the planner prompt so the main
     agent's LLM only ever picks from things that actually exist.
     """
-    from ..settings.catalog import ENGINE_READY, MODEL_GROUPS, PROVIDER_TYPES, TOOL_CATALOG
+    from ..settings.catalog import (
+        ENGINE_READY,
+        MODEL_GROUPS,
+        PROVIDER_TYPES,
+        all_tool_catalog,
+    )
     from ..skills import SkillStore
 
     data = store.load()
@@ -294,7 +299,7 @@ def build_registry(store) -> dict[str, Any]:
     return {
         "providers": providers,
         "models": models,
-        "tools": [dict(t) for t in TOOL_CATALOG],
+        "tools": all_tool_catalog(),
         "skills": skills,
         "mcpServers": [],
         # human note for the UI / planner about the MCP gap

@@ -20,7 +20,7 @@ from pathlib import Path
 
 from .. import __version__ as _package_version
 
-__all__ = ["AppContext", "app_context", "set_app_context"]
+__all__ = ["AppContext", "app_context", "set_app_context", "reset_app_context"]
 
 
 def _default_data_dir() -> Path:
@@ -161,3 +161,14 @@ def set_app_context(ctx: AppContext) -> None:
     global _context
     _context = ctx
     ctx.ensure_dirs()
+
+
+def reset_app_context() -> None:
+    """忘掉当前上下文，下次 :func:`app_context` 重新按环境变量推导。
+
+    测试用：``app_context`` 是**进程级单例**，一个测试把它指到 tmp 目录之后，
+    后面的测试如果直接读它就会看到别人留下的数据目录（曾经表现为
+    「单独跑通、一起跑挂」）。
+    """
+    global _context
+    _context = None

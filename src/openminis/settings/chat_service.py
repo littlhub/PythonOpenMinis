@@ -229,8 +229,13 @@ TOOL_FAILURE_DISCIPLINE = (
 )
 
 
-def identity_system_prompt(store: SettingsStore) -> str:
-    identity = store.active_identity()
+def identity_system_prompt(store: SettingsStore, identity=None) -> str:  # noqa: ANN001
+    """身份的系统提示。``identity`` 传了就用它，否则用「当前身份」。
+
+    通道插件（QQ 等）可以指定「由哪个 agent 接待」，那条链路拿不到"当前身份"
+    这个概念 —— 网页端把当前身份切走之后，机器人不该跟着变脸。
+    """
+    identity = identity or store.active_identity()
     try:
         subagent_on = bool(store.agent_config().get("subagentEnabled") or False)
     except Exception:  # pragma: no cover - settings unreadable
@@ -502,6 +507,7 @@ def build_chat_setup(  # noqa: ANN201
     instance_id: str | None = None,
     model_id: str | None = None,
     session_id: str | None = None,
+    identity_id: str | None = None,
     on_fallback: Callable[[str, str, str], Any] | None = None,
 ):
     """Return ``(provider, runtime, options, identity, provider_conf)`` for the
@@ -513,6 +519,10 @@ def build_chat_setup(  # noqa: ANN201
     user later selects as active. Everything else (identity, tools, agent
     options) still comes from the current settings, so the run behaves like a
     normal chat with just the model swapped.
+
+    ``identity_id`` overrides the **identity** (人设 + 工具集). 通道插件用它把
+    机器人的对话交给指定的 agent 接待（见 ``plugins.bridge``）；网页端不传，
+    照旧跟着「当前身份」走。
     """
     data = store.load()
     pid = instance_id or data.get("activeProviderId")
@@ -529,7 +539,9 @@ def build_chat_setup(  # noqa: ANN201
         conf = {**conf, "model": model_id}
     provider = build_provider(pid, conf)
 
-    identity = store.active_identity()
+    identity = (
+        store.identity(identity_id) if identity_id else None
+    ) or store.active_identity()
     # Agent 对话参数(模型设置):执行步数上限 + 深度思考 + 子代理助理开关。
     agent_cfg = store.agent_config()
     # 兜底模型链：主模型限流/超时/5xx 时按用户配的顺序自动切下一个。
@@ -569,7 +581,7 @@ def build_chat_setup(  # noqa: ANN201
         session_guards(session_id) if session_id else (None, None)
     )
     options = AgentRuntimeOptions(
-        system_prompt=identity_system_prompt(store),
+        system_prompt=identity_system_prompt(store, identity),
         max_turns=int(agent_cfg.get("maxToolSteps") or MAX_AGENT_TURNS),
         thinking_level=(
             ThinkingLevel.HIGH if agent_cfg.get("deepThinking") else ThinkingLevel.OFF

@@ -52,6 +52,9 @@ __all__ = [
     "Identity",
     "BUILTIN_IDENTITIES",
     "TOOL_CATALOG",
+    "VALID_TOOLS",
+    "known_tool_ids",
+    "all_tool_catalog",
     "build_tool_registry",
     "make_agent_tools",
     "lookup_model",
@@ -464,6 +467,33 @@ TOOL_CATALOG: list[dict] = [
 VALID_TOOLS = {t["id"] for t in TOOL_CATALOG}
 
 
+def known_tool_ids() -> set[str]:
+    """内置工具 + **已启用的插件工具**。
+
+    插件工具的名字是 ``<插件id>__<工具id>``（见 ``plugins.tools``），随插件的
+    安装/启用状态变化，所以这里每次现算 —— 用户刚启用一个工具插件，下一次保存
+    身份配置就该能勾上它。
+    """
+    try:
+        from ..plugins import tools as plugin_tools
+
+        return VALID_TOOLS | plugin_tools.tool_ids()
+    except Exception:  # pragma: no cover - 插件目录读不到不该拖垮设置
+        return set(VALID_TOOLS)
+
+
+def all_tool_catalog() -> list[dict]:
+    """``TOOL_CATALOG`` + 插件工具（设置界面按 category 分组展示）。"""
+    out = [dict(t) for t in TOOL_CATALOG]
+    try:
+        from ..plugins import tools as plugin_tools
+
+        out.extend(plugin_tools.catalog_entries())
+    except Exception:  # pragma: no cover
+        pass
+    return out
+
+
 def _wrap_static_executor(definition: AgentToolDefinition, sync_callable):  # noqa: ANN001
     """Adapt a synchronous static executor to the async ToolExecutor contract.
 
@@ -713,6 +743,16 @@ def build_tool_registry(enabled_ids: list[str]) -> dict[str, ToolExecutor]:
             out[tool_id] = _wrap_async_static_executor(
                 SendTool.definition(), SendTool.execute
             )
+    # 插件工具（声明式：调用时才起插件目录里的进程）。用户没勾选就不挂 ——
+    # 装了插件、又没启用，不该往模型的 schema 里塞工具。
+    try:
+        from ..plugins import tools as plugin_tools
+
+        for name, tool in plugin_tools.build_registry().items():
+            if name in enabled_ids:
+                out[name] = tool
+    except Exception:  # pragma: no cover - 插件目录读不到不该拖垮对话
+        pass
     return out
 
 

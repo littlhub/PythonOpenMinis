@@ -1,0 +1,748 @@
+"""[T-plugins-manager] 插件体系：安装 / 导入 / 推断 / 配置 / 起停 / 通道桥。
+
+用户诉求：「完善插件，在通道处装入插件，加入桥接插件，完善 QQ 机器人」+
+「加插件管理可以导入 dsh 等插件」。这组测试钉住四件事：
+
+1. 插件清单与配置读写（含密钥脱敏、密钥留空不改）；
+2. **导入现成项目**：没有 plugin.json 也能装 —— 按 package.json / 入口文件推断，
+   认不出入口就只登记（不硬启动）；
+3. 生命周期：引擎内驱动（假驱动）能起停，外部程序能起子进程并收到日志；
+4. 通道桥：IM 会话 ↔ 引擎会话的映射、命令、以及「跑一轮把回复发回去」。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import zipfile
+from pathlib import Path
+
+import pytest
+
+from openminis.plugins import store
+from openminis.plugins.base import (
+    STATE_CONNECTED,
+    ChannelAdapter,
+    IncomingMessage,
+)
+from openminis.plugins.bridge import ConversationBridge
+from openminis.plugins.manifest import (
+    RUNTIME_MANUAL,
+    RUNTIME_PROCESS,
+    ChannelManifest,
+    ManifestError,
+)
+from openminis.plugins.registry import PluginRuntime
+from openminis.plugins.drivers.qq import QQAdapter, normalize_event
+
+
+@pytest.fixture()
+def data_dir(tmp_path, monkeypatch):
+    from openminis.core import context
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MINIS_HOME", str(home))
+    context.set_app_context(context.AppContext(data_dir=home, cache_dir=home))
+    return home
+
+
+# ---------------------------------------------------------------------------
+# 清单
+# ---------------------------------------------------------------------------
+def test_manifest_requires_id_and_driver():
+    with pytest.raises(ManifestError):
+        ChannelManifest.from_dict({"name": "x"})
+    with pytest.raises(ManifestError):
+        ChannelManifest.from_dict({"id": "x"})          # 缺 driver
+    with pytest.raises(ManifestError):
+        ChannelManifest.from_dict({"id": "x", "runtime": "weird"})
+
+
+def test_manifest_process_needs_command():
+    with pytest.raises(ManifestError):
+        ChannelManifest.from_dict({"id": "x", "runtime": "process"})
+    m = ChannelManifest.from_dict({
+        "id": "dsh", "runtime": "process",
+        "process": {"command": "node", "args": ["index.js"]},
+    })
+    assert m.is_process
+    assert m.command_line() == ("node", ["index.js"], ".")
+
+
+def test_manifest_id_is_sanitized():
+    with pytest.raises(ManifestError):
+        ChannelManifest.from_dict({"id": "../evil", "driver": "qq"})
+
+
+# ---------------------------------------------------------------------------
+# 安装 / 配置
+# ---------------------------------------------------------------------------
+def test_install_builtin_and_config_roundtrip(data_dir):
+    manifest = store.install_builtin("qq-bot")
+    assert store.is_installed("qq-bot")
+    assert manifest.driver == "qq"
+    assert "AppID" in store.missing_required("qq-bot")
+
+    store.write_config("qq-bot", {"appId": "102xx", "clientSecret": "s3cret",
+                                  "allowFrom": "u1\n\nu2\n"})
+    cfg = store.read_config("qq-bot")
+    assert cfg["allowFrom"] == ["u1", "u2"]
+    assert store.missing_required("qq-bot") == []
+
+    # 密钥留空 = 沿用旧值（界面从来拿不到明文，不能一保存就抹掉）
+    store.write_config("qq-bot", {"clientSecret": ""})
+    assert store.read_config("qq-bot")["clientSecret"] == "s3cret"
+
+    public = store.public_config("qq-bot")
+    assert public["clientSecret"] == ""
+    assert public["clientSecret__set"] is True
+    assert public["appId"] == "102xx"
+
+
+def test_install_builtin_missing(data_dir):
+    with pytest.raises(ManifestError):
+        store.install_builtin("nope")
+
+
+def test_remove_refuses_path_escape(data_dir):
+    store.install_builtin("qq-bot")
+    assert store.remove("qq-bot") is True
+    assert not store.is_installed("qq-bot")
+    with pytest.raises(ManifestError):
+        store.remove("../qq-bot")
+
+
+# ---------------------------------------------------------------------------
+# 导入：现成的项目（dsh 这类）
+# ---------------------------------------------------------------------------
+def _make_node_project(root: Path, name: str = "@wenbin_wb/dsh-bridge") -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "package.json").write_text(json.dumps({
+        "name": name,
+        "version": "2.8.5",
+        "description": "QQ / 微信 / 飞书 / Telegram 桥接",
+        "main": "index.js",
+    }, ensure_ascii=False), encoding="utf-8")
+    (root / "index.js").write_text("console.log('hi')\n", encoding="utf-8")
+    return root
+
+
+def test_import_dir_without_manifest_infers(data_dir, tmp_path):
+    src = _make_node_project(tmp_path / "dsh-bridge-main")
+    manifest = store.import_plugin(src)
+    assert manifest.id == "dsh-bridge"
+    assert manifest.runtime == RUNTIME_PROCESS
+    assert manifest.category == "channel"          # 名字里有 bridge
+    assert manifest.process["command"] == "node"
+    assert manifest.process["args"] == ["index.js"]
+    # 推断出来的清单要落盘，用户能改
+    assert (store.plugins_dir() / "dsh-bridge" / "plugin.json").is_file()
+
+
+def test_import_zip_with_nested_dir(data_dir, tmp_path):
+    src = _make_node_project(tmp_path / "build" / "dsh-bridge-main")
+    archive = tmp_path / "dsh-bridge.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        for file in src.rglob("*"):
+            if file.is_file():
+                zf.write(file, file.relative_to(src.parent))
+    manifest = store.import_plugin(archive)
+    assert manifest.id == "dsh-bridge"
+    assert store.is_installed("dsh-bridge")
+
+
+def test_import_zip_rejects_path_escape(data_dir, tmp_path):
+    archive = tmp_path / "evil.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("../escape.json", "{}")
+        zf.writestr("plugin.json", "{}")
+    with pytest.raises(ManifestError):
+        store.import_plugin(archive)
+
+
+def test_import_unknown_project_is_registered_only(data_dir, tmp_path):
+    src = tmp_path / "mystery"
+    src.mkdir()
+    (src / "notes.txt").write_text("nothing runnable", encoding="utf-8")
+    manifest = store.import_plugin(src)
+    assert manifest.runtime == RUNTIME_MANUAL       # 不硬启动
+    assert store.is_installed(manifest.id)
+
+
+def test_import_python_project(data_dir, tmp_path):
+    src = tmp_path / "pybot"
+    src.mkdir()
+    (src / "main.py").write_text("print('hi')\n", encoding="utf-8")
+    manifest = store.import_plugin(src)
+    assert manifest.runtime == RUNTIME_PROCESS
+    assert manifest.process["args"] == ["main.py"]
+
+
+def test_install_builtin_then_import_same_id_replaces(data_dir, tmp_path):
+    store.install_builtin("qq-bot")
+    src = tmp_path / "qq-bot"
+    src.mkdir()
+    (src / "plugin.json").write_text(json.dumps({
+        "id": "qq-bot", "name": "自定义 QQ", "driver": "qq",
+    }, ensure_ascii=False), encoding="utf-8")
+    manifest = store.import_plugin(src)
+    assert manifest.name == "自定义 QQ"
+
+
+# ---------------------------------------------------------------------------
+# 生命周期
+# ---------------------------------------------------------------------------
+class FakeAdapter(ChannelAdapter):
+    driver = "fake"
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.sent: list[str] = []
+
+    async def start(self):
+        self.set_state(STATE_CONNECTED, "ok")
+
+    async def stop(self):
+        from openminis.plugins.base import STATE_STOPPED
+
+        self.set_state(STATE_STOPPED)
+
+    async def send_text(self, msg, text, **kw):
+        self.sent.append(text)
+
+
+def _install_fake(monkeypatch) -> None:
+    store.plugins_dir().joinpath("fake-bot").mkdir(parents=True, exist_ok=True)
+    (store.plugins_dir() / "fake-bot" / "plugin.json").write_text(json.dumps({
+        "id": "fake-bot", "name": "假通道", "runtime": "engine", "driver": "fake",
+        "category": "channel",
+    }, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(
+        "openminis.plugins.registry.load_adapter", lambda driver: FakeAdapter
+    )
+    monkeypatch.setattr(
+        "openminis.plugins.registry.has_driver", lambda driver: driver == "fake"
+    )
+
+
+@pytest.mark.asyncio
+async def test_engine_plugin_start_stop(data_dir, monkeypatch):
+    _install_fake(monkeypatch)
+    runtime = PluginRuntime()
+    status = await runtime.start("fake-bot")
+    assert status["state"] == STATE_CONNECTED
+    assert runtime.is_running("fake-bot")
+    assert store.is_enabled("fake-bot")
+
+    await runtime.stop("fake-bot")
+    assert not runtime.is_running("fake-bot")
+    assert not store.is_enabled("fake-bot")
+
+
+@pytest.mark.asyncio
+async def test_manual_plugin_refuses_start(data_dir, tmp_path):
+    src = tmp_path / "mystery"
+    src.mkdir()
+    (src / "readme.md").write_text("x", encoding="utf-8")
+    manifest = store.import_plugin(src)
+    runtime = PluginRuntime()
+    with pytest.raises(ManifestError):
+        await runtime.start(manifest.id)
+
+
+@pytest.mark.asyncio
+async def test_engine_plugin_start_requires_config(data_dir, monkeypatch):
+    _install_fake(monkeypatch)
+    (store.plugins_dir() / "fake-bot" / "plugin.json").write_text(json.dumps({
+        "id": "fake-bot", "name": "假通道", "runtime": "engine", "driver": "fake",
+        "fields": [{"key": "token", "label": "令牌", "required": True}],
+    }, ensure_ascii=False), encoding="utf-8")
+    runtime = PluginRuntime()
+    with pytest.raises(ManifestError) as err:
+        await runtime.start("fake-bot")
+    assert "令牌" in str(err.value)
+
+
+@pytest.mark.asyncio
+async def test_process_plugin_runs_and_logs(data_dir, tmp_path):
+    root = store.plugins_dir() / "echo-bot"
+    root.mkdir(parents=True)
+    (root / "sayer.py").write_text(
+        "import time, sys\n"
+        "print('hello from plugin', flush=True)\n"
+        "sys.stdout.flush()\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    (root / "plugin.json").write_text(json.dumps({
+        "id": "echo-bot", "name": "回声", "runtime": "process",
+        "category": "other",
+        "process": {"command": "python", "args": ["sayer.py"], "autoRestart": False},
+    }, ensure_ascii=False), encoding="utf-8")
+
+    runtime = PluginRuntime()
+    status = await runtime.start("echo-bot")
+    assert status["running"] is True and status["pid"]
+    await asyncio.sleep(1.2)
+    texts = " ".join(row["text"] for row in runtime.logs("echo-bot"))
+    assert "hello from plugin" in texts
+    await runtime.stop("echo-bot")
+    assert runtime.is_running("echo-bot") is False
+
+
+# ---------------------------------------------------------------------------
+# 通道桥
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_bridge_maps_conversation_and_replies(data_dir, monkeypatch):
+    from openminis.server import chat_store, main as server_main
+
+    chat_store.set_database_path(data_dir / "plugins_bridge.db")
+    adapter = FakeAdapter(plugin_id="fake-bot", config={})
+    adapter.set_state(STATE_CONNECTED)
+    bridge = ConversationBridge(plugin_id="fake-bot", adapter=adapter)
+
+    async def fake_run_chat(client_id, msg):
+        # 真链路里这是 _run_chat：往挂上的 sink 推帧
+        sink = server_main.manager.active[client_id]
+        await sink.send_json({"type": "delta", "text": "你"})
+        await sink.send_json({"type": "delta", "text": "好"})
+        await sink.send_json({"type": "done"})
+        await chat_store.append_turn(
+            msg["sessionId"], "assistant", "你好", model_label="m",
+        )
+
+    monkeypatch.setattr(server_main, "_run_chat", fake_run_chat)
+
+    msg = IncomingMessage(scope="c2c", peer_id="u1", sender_id="u1", text="在吗",
+                          message_id="m1")
+    await bridge.handle(msg)
+    assert adapter.sent == ["你好"]
+
+    sid = bridge.active_session("c2c:u1")
+    assert sid
+    rows = await chat_store.load_messages(sid)
+    assert [r.role for r in rows] == ["assistant"]     # 回复落到了引擎会话里
+    # 桥断开了订阅者，别再往已关的客户端推
+    assert all(not k.startswith("bot:") for k in server_main.manager.active)
+
+
+@pytest.mark.asyncio
+async def test_bridge_commands_new_list_resume(data_dir, monkeypatch):
+    from openminis.server import chat_store
+
+    chat_store.set_database_path(data_dir / "plugins_cmd.db")
+    adapter = FakeAdapter(plugin_id="fake-bot", config={})
+    bridge = ConversationBridge(plugin_id="fake-bot", adapter=adapter)
+    msg = IncomingMessage(scope="c2c", peer_id="u1", sender_id="u1", text="/help")
+
+    await bridge.handle(msg)
+    assert "我可以直接聊天" in adapter.sent[-1]
+
+    old = await bridge._ensure_session(msg)
+    await bridge.handle(IncomingMessage(scope="c2c", peer_id="u1", sender_id="u1",
+                                       text="/new"))
+    new = bridge.active_session("c2c:u1")
+    assert new and new != old
+
+    await bridge.handle(IncomingMessage(scope="c2c", peer_id="u1", sender_id="u1",
+                                       text="/list"))
+    assert "这个会话的对话" in adapter.sent[-1]
+
+    await bridge.handle(IncomingMessage(scope="c2c", peer_id="u1", sender_id="u1",
+                                       text="/resume 2"))
+    assert bridge.active_session("c2c:u1") == old
+
+    await bridge.handle(IncomingMessage(scope="c2c", peer_id="u1", sender_id="u1",
+                                       text="/ping"))
+    assert adapter.sent[-1] == "pong"
+
+
+@pytest.mark.asyncio
+async def test_unknown_slash_message_is_treated_as_text(data_dir, monkeypatch):
+    """认不出的斜杠开头消息不能吞掉 —— 当普通提问送进引擎。"""
+    from openminis.server import chat_store, main as server_main
+
+    chat_store.set_database_path(data_dir / "plugins_slash.db")
+    adapter = FakeAdapter(plugin_id="p", config={})
+    bridge = ConversationBridge(plugin_id="p", adapter=adapter)
+    called: dict[str, str] = {}
+
+    async def fake_run_chat(client_id, msg):
+        called["text"] = str(msg.get("text") or "")
+
+    monkeypatch.setattr(server_main, "_run_chat", fake_run_chat)
+
+    await bridge.handle(
+        IncomingMessage(scope="c2c", peer_id="u", sender_id="u", text="/我不认识这个")
+    )
+    assert called["text"] == "/我不认识这个"
+
+
+# ---------------------------------------------------------------------------
+# 「由哪个 agent 接待」：可选身份 / 子代理，按选择分流
+# ---------------------------------------------------------------------------
+def test_agent_options_lists_identities_and_subagents(data_dir):
+    from openminis.plugins import options as plugin_options
+    from openminis.settings.store import SettingsStore
+
+    store = SettingsStore.get()
+    data = store.load()
+    # 子代理要出现在候选里
+    data.setdefault("subagents", {})["researcher"] = {
+        "id": "researcher", "name": "研究员", "emoji": "🔬",
+        "description": "负责查资料", "persona": "你是研究员",
+        "providerId": "gw", "model": "m1", "tools": [],
+    }
+    store.save(data)
+
+    items = plugin_options.agent_options()
+    values = [i["value"] for i in items]
+    assert values[0] == plugin_options.FOLLOW_CURRENT          # 默认跟随当前身份
+    assert "identity:assistant" in values
+    assert "subagent:researcher" in values
+    groups = {i["group"] for i in items}
+    assert {"默认", "主 agent 身份", "子代理（助理）"} <= groups
+
+
+def test_parse_target():
+    from openminis.plugins.options import parse_target
+
+    assert parse_target("") == ("", "")
+    assert parse_target("subagent:abc") == ("subagent", "abc")
+    assert parse_target("identity:coder") == ("identity", "coder")
+
+
+def test_select_field_options_are_injected(data_dir):
+    """清单只声明 optionsFrom，真正的可选值由引擎在读取状态时回填。"""
+    root = store.plugins_dir() / "gate"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "plugin.json").write_text(json.dumps({
+        "id": "gate", "name": "网关", "runtime": "manual", "category": "tool",
+        "fields": [{
+            "key": "agentId", "label": "由哪个 agent 接待",
+            "type": "select", "optionsFrom": "agents",
+        }],
+    }, ensure_ascii=False), encoding="utf-8")
+
+    field = PluginRuntime().status("gate")["fields"][0]
+    # 清单本身不带选项
+    assert store.get("gate").fields[0].to_dict()["optionsFrom"] == "agents"
+    assert "options" not in store.get("gate").fields[0].to_dict()
+    # 但界面拿到的那份已经解析好了
+    assert field["options"][0]["value"] == ""
+    assert any(o["value"] == "identity:assistant" for o in field["options"])
+
+
+@pytest.mark.asyncio
+async def test_bridge_uses_selected_identity(data_dir, monkeypatch):
+    """选了某个身份 → 跑一轮时把 identityId 带进 _run_chat。"""
+    from openminis.server import chat_store, main as server_main
+
+    chat_store.set_database_path(data_dir / "plugins_agent.db")
+    adapter = FakeAdapter(plugin_id="q", config={"agentId": "identity:coder"})
+    bridge = ConversationBridge(plugin_id="q", adapter=adapter)
+    seen: dict[str, object] = {}
+
+    async def fake_run_chat(client_id, msg):
+        seen.update(msg)
+
+    monkeypatch.setattr(server_main, "_run_chat", fake_run_chat)
+
+    await bridge.handle(
+        IncomingMessage(scope="c2c", peer_id="u", sender_id="u", text="帮我看下")
+    )
+    assert seen["identityId"] == "coder"
+    assert seen["text"] == "帮我看下"
+
+
+@pytest.mark.asyncio
+async def test_bridge_hands_turn_to_subagent(data_dir, monkeypatch):
+    """选了子代理 → 这一路对话不经过 _run_chat，直接由子代理跑。"""
+    from openminis.agent import subagents as subagent_registry
+    from openminis.server import chat_store, main as server_main
+
+    chat_store.set_database_path(data_dir / "plugins_sub.db")
+    adapter = FakeAdapter(plugin_id="q", config={"agentId": "subagent:researcher"})
+    bridge = ConversationBridge(plugin_id="q", adapter=adapter)
+
+    async def fake_run_subagent(store, subagent_id, task, session_id):
+        assert subagent_id == "researcher" and task == "帮我查一下"
+        # 子代理的内层循环会把过程发到事件总线 —— 桥接过来就是流式回复
+        from openminis.agent.subagent_events import emit
+
+        await emit({"type": "subagentDelta", "text": "查到"})
+        await emit({"type": "subagentDelta", "text": "了三条"})
+        return "查到了三条"
+
+    async def boom(*_a, **_k):  # pragma: no cover - 走到这里就是分流错了
+        raise AssertionError("子代理模式下不该再走 _run_chat")
+
+    monkeypatch.setattr(subagent_registry, "run_subagent", fake_run_subagent)
+    monkeypatch.setattr(server_main, "_run_chat", boom)
+
+    await bridge.handle(
+        IncomingMessage(scope="c2c", peer_id="u", sender_id="u", text="帮我查一下")
+    )
+    assert adapter.sent == ["查到了三条"]      # 尾巴补一条，不重复整段
+
+
+@pytest.mark.asyncio
+async def test_bridge_subagent_failure_is_reported(data_dir, monkeypatch):
+    from openminis.agent import subagents as subagent_registry
+    from openminis.agent.subagents import SubagentError
+    from openminis.server import chat_store
+
+    chat_store.set_database_path(data_dir / "plugins_subfail.db")
+    adapter = FakeAdapter(plugin_id="q", config={"agentId": "subagent:ghost"})
+    bridge = ConversationBridge(plugin_id="q", adapter=adapter)
+
+    async def missing(*_a, **_k):
+        raise SubagentError("subagent 不存在: ghost")
+
+    monkeypatch.setattr(subagent_registry, "run_subagent", missing)
+    await bridge.handle(
+        IncomingMessage(scope="c2c", peer_id="u", sender_id="u", text="在吗")
+    )
+    assert "用不了" in adapter.sent[-1] and "ghost" in adapter.sent[-1]
+
+
+# ---------------------------------------------------------------------------
+# QQ 协议层
+# ---------------------------------------------------------------------------
+def test_normalize_c2c_and_group():
+    c2c = normalize_event("C2C_MESSAGE_CREATE", {
+        "id": "m1", "content": " 你好 ", "author": {"user_openid": "u_1"},
+        "msg_seq": 3,
+    })
+    assert c2c is not None
+    assert c2c.scope == "c2c" and c2c.peer_id == "u_1" and c2c.text == "你好"
+    assert c2c.conv_key == "c2c:u_1" and c2c.msg_seq == 3
+
+    group = normalize_event("GROUP_AT_MESSAGE_CREATE", {
+        "id": "m2", "content": "帮我看看", "group_openid": "g_9",
+        "author": {"member_openid": "u_2"},
+    })
+    assert group is not None
+    assert group.scope == "group" and group.peer_id == "g_9"
+    assert group.sender_id == "u_2" and group.is_group
+
+    assert normalize_event("SOMETHING_ELSE", {}) is None
+
+
+def test_qq_split_respects_limit_and_language():
+    adapter = QQAdapter(plugin_id="qq-bot", config={}, max_message_chars=200)
+    text = "第一段。" * 40 + "\n" + "second part. " * 20
+    chunks = adapter.split_text(text)
+    assert len(chunks) > 1
+    assert all(len(c) <= 200 for c in chunks)
+    assert "".join(chunks) == text
+
+
+def test_qq_allowlist_only_guards_private_chat():
+    adapter = QQAdapter(plugin_id="qq-bot", config={"allowFrom": ["u_ok"]})
+    ok = IncomingMessage(scope="c2c", peer_id="u_ok", sender_id="u_ok", text="hi")
+    bad = IncomingMessage(scope="c2c", peer_id="u_x", sender_id="u_x", text="hi")
+    group = IncomingMessage(scope="group", peer_id="g", sender_id="u_x", text="hi")
+    assert adapter._allowed(ok) is True
+    assert adapter._allowed(bad) is False
+    assert adapter._allowed(group) is True      # 群里被 @ 到就算找上门了
+
+
+def test_qq_configured_needs_both_fields():
+    assert QQAdapter(plugin_id="q", config={"appId": "1"}).configured is False
+    assert QQAdapter(
+        plugin_id="q", config={"appId": "1", "clientSecret": "s"}
+    ).configured is True
+
+
+def test_qq_msg_seq_increments_across_replies():
+    """同一条入站消息回多条时 msg_seq 必须互不相同，否则官方按 (msg_id, msg_seq) 丢弃。"""
+    adapter = QQAdapter(plugin_id="q", config={})
+    msg = IncomingMessage(scope="c2c", peer_id="u", sender_id="u", text="hi", message_id="m1")
+
+    assert adapter._reserve_seq(msg, 3) == 1          # 一段回复占 1/2/3
+    assert adapter._reserve_seq(msg, 1) == 4          # 下一次接着往下
+    assert adapter._reserve_seq(msg, 2) == 5
+
+    other = IncomingMessage(scope="c2c", peer_id="u", sender_id="u", text="hi", message_id="m2")
+    assert adapter._reserve_seq(other, 1) == 1        # 不同消息各自从 1 起
+    assert adapter._reserve_seq(None, 1) is None      # 主动消息不需要 seq
+
+
+@pytest.mark.asyncio
+async def test_qq_send_text_splits_with_ascending_seq(monkeypatch):
+    adapter = QQAdapter(
+        plugin_id="q", config={"maxMessageChars": 100, "sendChunkDelayMs": 1}
+    )
+    sent: list[dict] = []
+
+    async def fake_api(path, *, method="POST", body=None):
+        sent.append(dict(body or {}))
+        return {}
+
+    monkeypatch.setattr(adapter, "_api", fake_api)
+
+    msg = IncomingMessage(scope="group", peer_id="g", sender_id="u", text="x", message_id="m9")
+    await adapter.send_text(msg, "补" * 250)
+
+    assert len(sent) >= 3
+    assert [b["msg_seq"] for b in sent] == list(range(1, len(sent) + 1))
+    assert all(b["msg_id"] == "m9" and b["msg_type"] == 0 for b in sent)
+    assert all(len(b["content"]) <= 100 for b in sent)
+
+
+# ---------------------------------------------------------------------------
+# 插件工具：插件**不只是通道** —— tools 段让 agent 多一项能力
+# ---------------------------------------------------------------------------
+def _install_tool_plugin(data_dir, tmp_path, *, enabled: bool) -> str:
+    """造一个纯工具插件（无驱动、无进程常驻），装进插件目录。"""
+    root = store.plugins_dir() / "word-count"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "count.py").write_text(
+        "import json, sys\n"
+        "payload = json.load(sys.stdin)\n"
+        "print(f\"{payload['args']['text']} 有 {len(payload['args']['text'])} 个字\")\n",
+        encoding="utf-8",
+    )
+    (root / "plugin.json").write_text(json.dumps({
+        "id": "word-count",
+        "name": "字数统计",
+        "runtime": "manual",
+        "category": "tool",
+        "tools": [{
+            "id": "count",
+            "name": "统计字数",
+            "description": "数一段文字有多少个字",
+            "parameters": {"text": {"type": "string", "description": "要统计的文字"}},
+            "required": ["text"],
+            "command": ["python", "count.py"],
+            "timeoutSec": 20,
+        }],
+    }, ensure_ascii=False), encoding="utf-8")
+    if enabled:
+        store.set_enabled("word-count", True)
+    return "word-count"
+
+
+def test_manifest_parses_tool_spec():
+    manifest = ChannelManifest.from_dict({
+        "id": "wc", "name": "字数", "runtime": "manual", "category": "tool",
+        "tools": [{
+            "id": "count", "description": "数数",
+            "parameters": {"text": {"type": "string", "enum": ["a", "b"]}},
+            "required": ["text"], "command": ["python", "count.py"],
+        }],
+    })
+    spec = manifest.tools[0]
+    assert spec.command == ("python", "count.py")
+    assert spec.parameters["text"]["enum"] == ["a", "b"]
+    assert spec.required == ("text",)
+    assert manifest.to_dict()["tools"][0]["id"] == "count"
+
+
+def test_manifest_tool_needs_command():
+    with pytest.raises(ManifestError):
+        ChannelManifest.from_dict({
+            "id": "x", "runtime": "manual", "tools": [{"id": "t"}],
+        })
+    # 字符串命令不接受 —— 拼参数不可靠，报错要说得清除
+    with pytest.raises(ManifestError) as err:
+        ChannelManifest.from_dict({
+            "id": "x", "runtime": "manual",
+            "tools": [{"id": "t", "command": "python t.py"}],
+        })
+    assert "数组" in str(err.value)
+
+
+def test_manifest_allows_engine_plugin_with_only_tools():
+    """没有 driver 但有 tools 的包不该被拒 —— 它是纯能力包，不需要驱动。"""
+    manifest = ChannelManifest.from_dict({
+        "id": "x", "name": "只给工具", "tools": [{"id": "t", "command": ["echo"]}],
+    })
+    assert manifest.driver == "" and manifest.tools
+
+
+def test_plugin_tool_id_is_namespaced():
+    from openminis.plugins import tools as plugin_tools
+
+    assert plugin_tools.tool_full_id("qq-bot", "send") == "qq_bot__send"
+    assert plugin_tools.tool_full_id("my.plug", "a b") == "my_plug__a_b"
+
+
+@pytest.mark.asyncio
+async def test_tool_plugin_registers_and_runs(data_dir):
+    """启用 → 出现在 agent 工具注册表里 → 调用真能跑起来并回输出。"""
+    from openminis.plugins import tools as plugin_tools
+    from openminis.settings.catalog import build_tool_registry, known_tool_ids
+
+    _install_tool_plugin(data_dir, None, enabled=False)
+    assert plugin_tools.tool_ids() == set()           # 没启用就不挂
+    assert "word_count__count" not in known_tool_ids()
+
+    runtime = PluginRuntime()
+    await runtime.start("word-count")                 # manual + tools 允许启用
+    assert store.is_enabled("word-count")
+
+    name = "word_count__count"
+    assert plugin_tools.tool_ids() == {name}
+    assert name in known_tool_ids()                   # 设置里能勾选它
+
+    registry = build_tool_registry([name])
+    assert name in registry
+    assert registry[name].definition.description == "数一段文字有多少个字"
+
+    result = await registry[name].executor('{"text": "你好世界"}', "sess-1")
+    assert result.success
+    assert "4 个字" in result.output
+
+    await runtime.stop("word-count")
+    assert plugin_tools.tool_ids() == set()
+
+
+@pytest.mark.asyncio
+async def test_tool_plugin_reports_failure_and_timeout(data_dir):
+    from openminis.plugins import tools as plugin_tools
+
+    root = store.plugins_dir() / "boom"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "die.py").write_text("import sys\nsys.exit(3)\n", encoding="utf-8")
+    (root / "slow.py").write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+    (root / "plugin.json").write_text(json.dumps({
+        "id": "boom", "name": "出错插件", "runtime": "manual", "category": "tool",
+        "tools": [
+            {"id": "die", "command": ["python", "die.py"]},
+            {"id": "slow", "command": ["python", "slow.py"], "timeoutSec": 1},
+        ],
+    }, ensure_ascii=False), encoding="utf-8")
+    store.set_enabled("boom", True)
+
+    manifest = store.get("boom")
+    die = next(t for t in manifest.tools if t.id == "die")
+    slow = next(t for t in manifest.tools if t.id == "slow")
+
+    bad = await plugin_tools.run_tool(manifest, die, "{}", "")
+    assert bad.success is False and "失败" in bad.output
+
+    hung = await plugin_tools.run_tool(manifest, slow, "{}", "")
+    assert hung.success is False and hung.timed_out is True
+
+
+@pytest.mark.asyncio
+async def test_tool_plugin_refuses_cwd_escape(data_dir):
+    """工具的 cwd 不能跑到插件目录外面去。"""
+    from openminis.plugins import tools as plugin_tools
+
+    root = store.plugins_dir() / "escapee"
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "plugin.json").write_text(json.dumps({
+        "id": "escapee", "name": "越界", "runtime": "manual", "category": "tool",
+        "tools": [{"id": "x", "command": ["python", "x.py"], "cwd": "../../.."}],
+    }, ensure_ascii=False), encoding="utf-8")
+    store.set_enabled("escapee", True)
+
+    manifest = store.get("escapee")
+    result = await plugin_tools.run_tool(manifest, manifest.tools[0], "{}", "")
+    assert result.success is False
+    assert "越界" in result.output

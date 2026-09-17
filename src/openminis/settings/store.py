@@ -397,9 +397,10 @@ class SettingsStore:
                 if not isinstance(tools, list):
                     errors.append(f"身份 {eid} 的 enabledTools 必须是列表")
                     continue
-                from .catalog import VALID_TOOLS  # local import, small cycle risk
+                from .catalog import known_tool_ids  # local import, small cycle risk
 
-                clean = [t for t in tools if t in VALID_TOOLS]
+                allowed = known_tool_ids()
+                clean = [t for t in tools if t in allowed]
                 if eid in builtin_ids:
                     ov = dict(data["identityOverrides"].get(eid, {}))
                     ov["enabledTools"] = clean
@@ -428,9 +429,10 @@ class SettingsStore:
                 if not persona.strip():
                     errors.append(f"身份 {cid} 缺少 persona")
                     continue
-                from .catalog import VALID_TOOLS
+                from .catalog import known_tool_ids
 
-                tools = [t for t in (c.get("enabledTools") or []) if t in VALID_TOOLS]
+                allowed = known_tool_ids()
+                tools = [t for t in (c.get("enabledTools") or []) if t in allowed]
                 new_customs[cid] = {
                     "id": cid,
                     "name": str(c.get("name") or cid),

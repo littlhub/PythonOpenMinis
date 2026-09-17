@@ -381,6 +381,9 @@ export interface ToolInfo {
   name: string
   description: string
   category?: string
+  /** 插件工具才有：它来自哪个插件（category === 'Plugin'）。 */
+  pluginId?: string
+  pluginName?: string
 }
 
 export interface SettingsInfo {
@@ -717,6 +720,115 @@ export interface MarketplaceInstallResult {
   ok: boolean
   skill: { name: string; description: string }
   bytes: number
+}
+
+// -- 插件（通道 / 工具 / 桥接，含导入的第三方包）------------------------
+/** `select` 字段的一个可选项（由后端按 optionsFrom 解析出来）。 */
+export interface PluginOptionInfo {
+  value: string
+  label: string
+  description?: string
+  /** 分组标题：默认 / 主 agent 身份 / 子代理（助理） */
+  group?: string
+  kind?: string
+}
+
+/** 插件清单里的一个配置项 —— 界面按 type 渲染成对应的输入控件。 */
+export interface PluginFieldInfo {
+  key: string
+  label: string
+  /** text | password | number | switch | list | csv | select */
+  type: string
+  required: boolean
+  secret: boolean
+  default?: unknown
+  help: string
+  min?: number
+  max?: number
+  placeholder?: string
+  /** select 专用：选项来源（如 agents）。界面只用来判断要不要渲染下拉。 */
+  optionsFrom?: string
+  /** select 专用：真实可选值。 */
+  options?: PluginOptionInfo[]
+}
+
+/** 外部程序插件的启动段（env 已脱敏成 envKeys，避免密钥回传浏览器）。 */
+export interface PluginProcessInfo {
+  command?: string
+  args?: string[]
+  cwd?: string
+  healthUrl?: string
+  envKeys?: string[]
+}
+
+/** 插件给 agent 加的一个工具（声明式：调用时才起插件目录里的进程）。 */
+export interface PluginToolInfo {
+  id: string
+  name: string
+  description: string
+  /** JSON Schema 的 properties：{参数名: {type, description, enum?}} */
+  parameters: Record<string, { type?: string; description?: string; enum?: string[] }>
+  required: string[]
+  command: string[]
+  cwd: string
+  timeoutSec: number
+  requiresConfig?: string[]
+}
+
+/** 一个插件的清单 + 运行状态（`/api/plugins` 的元素）。 */
+export interface PluginStatus {
+  id: string
+  name: string
+  icon: string
+  version: string
+  description: string
+  category: string
+  /** engine（引擎内驱动）/ process（外部程序）/ manual（无连接，可声明工具） */
+  runtime: string
+  driver: string
+  builtin: boolean
+  installed: boolean
+  /** 上次是不是启用状态 —— 引擎重启会自动把它拉起来。 */
+  enabled: boolean
+  running: boolean
+  /** idle | starting | connected | reconnecting | error | stopped */
+  state: string
+  detail: string
+  error: string
+  account: string
+  /** 外部程序插件的进程号 / 已运行秒数。 */
+  pid: number
+  uptimeSec: number
+  since: number
+  /** 当前配置（密钥字段回传空串，另带 `<key>__set` 标记是否已存过）。 */
+  config: Record<string, unknown>
+  /** 必填但还没填的字段 label。 */
+  missing: string[]
+  fields: PluginFieldInfo[]
+  /** 这个插件给 agent 加的工具（启用后可在身份/子代理里勾选）。 */
+  tools: PluginToolInfo[]
+  toolCount: number
+  process?: PluginProcessInfo
+  maxMessageChars?: number
+}
+
+export interface PluginsList {
+  plugins: PluginStatus[]
+  dir: string
+  /** 引擎内置的驱动（新建清单时 driver 只能从这些里选）。 */
+  drivers: { id: string; label: string }[]
+}
+
+export interface PluginLogEntry {
+  ts: number
+  level: string
+  text: string
+}
+
+export interface PluginLogs {
+  id: string
+  logs: PluginLogEntry[]
+  now: number
 }
 
 export interface KnowledgeItem {

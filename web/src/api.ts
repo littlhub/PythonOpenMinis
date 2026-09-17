@@ -26,6 +26,9 @@ import type {
   MemoryDoc,
   MemoryList,
   OrganizeResponse,
+  PluginLogs,
+  PluginStatus,
+  PluginsList,
   ScheduledRunInfo,
   ScheduledTaskDraft,
   ScheduledTaskInfo,
@@ -253,8 +256,62 @@ export const api = {
       { method: 'POST' },
     ),
 
-  // -- marketplace (技能广场) --------------------------------------
+  // -- plugins (插件：通道 / 桥接 / 外部程序，含导入的第三方包) --------
+  pluginsList: () => request<PluginsList>('/plugins'),
 
+  pluginDetail: (id: string) =>
+    request<PluginStatus>(`/plugins/${encodeURIComponent(id)}`),
+
+  /** 安装随引擎发布的内置插件（如 qq-bot）到数据目录，之后可改配置。 */
+  pluginInstall: (id: string) =>
+    request<{ ok: boolean; id: string; plugin: PluginStatus }>('/plugins/install', {
+      method: 'POST',
+      body: JSON.stringify({ id }),
+    }),
+
+  /** 导入本机路径的插件包（zip 或目录），没有 plugin.json 也能装。 */
+  pluginImport: (path: string) =>
+    request<{ ok: boolean; id: string; plugin: PluginStatus }>('/plugins/import', {
+      method: 'POST',
+      body: JSON.stringify({ path }),
+    }),
+
+  /** 上传 zip 插件包并导入（multipart，不能走 request()）。 */
+  pluginUpload: async (
+    file: File,
+  ): Promise<{ ok: boolean; id: string; plugin: PluginStatus }> => {
+    const form = new FormData()
+    form.append('file', file)
+    const res = await fetch(`${API}/plugins/upload`, { method: 'POST', body: form })
+    if (!res.ok) {
+      const detail = await res.json().catch(() => ({ detail: res.statusText }))
+      throw new Error(detail?.detail ?? res.statusText)
+    }
+    return res.json()
+  },
+
+  pluginRemove: (id: string) =>
+    request<{ ok: boolean }>(`/plugins/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+
+  /** 保存配置：密钥字段留空 = 不改（界面不回传明文密钥）。 */
+  pluginConfigSave: (id: string, values: Record<string, unknown>) =>
+    request<{ ok: boolean; plugin: PluginStatus }>(
+      `/plugins/${encodeURIComponent(id)}/config`,
+      { method: 'PUT', body: JSON.stringify({ values }) },
+    ),
+
+  pluginAction: (id: string, action: 'start' | 'stop' | 'restart') =>
+    request<{ ok: boolean; plugin: PluginStatus }>(
+      `/plugins/${encodeURIComponent(id)}/${action}`,
+      { method: 'POST' },
+    ),
+
+  pluginLogs: (id: string, limit = 120) =>
+    request<PluginLogs>(`/plugins/${encodeURIComponent(id)}/logs?limit=${limit}`),
+
+  // -- marketplace (技能广场) --------------------------------------
   marketplaceSources: () =>
     request<{ sources: MarketplaceSource[] }>('/marketplace'),
 
