@@ -3,7 +3,7 @@
 界面（「插件」页与「通道」页）只走这一套：
 
     GET    /api/plugins                    列出所有插件 + 运行状态 + 配置（密钥脱敏）
-    POST   /api/plugins/install            安装内置插件（如 qq-bot）
+    POST   /api/plugins/install            安装内置插件（`refresh` 可刷新已装清单）
     POST   /api/plugins/import             导入本机路径的插件包（zip / 目录）
     POST   /api/plugins/upload             上传 zip 并导入
     DELETE /api/plugins/{id}               卸载（连配置）
@@ -67,12 +67,22 @@ async def plugin_detail(plugin_id: str) -> dict[str, Any]:
 
 @router.post("/install")
 async def plugin_install(payload: dict[str, Any]) -> dict[str, Any]:
-    """安装内置插件（把包内那份复制进数据目录，之后可改配置）。"""
-    plugin_id = str((payload or {}).get("id") or "").strip()
+    """安装内置插件（把包内那份复制进数据目录，之后可改配置）。
+
+    ``{"refresh": true}`` 时用包内那份覆盖已装的清单 —— 内置插件装过之后不会
+    自动跟着升级，新加的配置项也就永远不出现；刷新会保留用户填的 config.json。
+    """
+    body = payload or {}
+    plugin_id = str(body.get("id") or "").strip()
     if not plugin_id:
         raise HTTPException(status_code=400, detail="缺少 id")
+    refresh = bool(body.get("refresh") or False)
+    was_running = get_runtime().is_running(plugin_id)
     try:
-        manifest = store.install_builtin(plugin_id)
+        manifest = store.install_builtin(plugin_id, refresh=refresh)
+        if refresh and was_running:
+            # 清单变了（可能多了必填项），让运行时按新清单重新装配一次
+            await get_runtime().restart(plugin_id)
     except Exception as exc:
         raise _err(exc) from exc
     return {"ok": True, "id": manifest.id, "plugin": get_runtime().status(manifest.id)}

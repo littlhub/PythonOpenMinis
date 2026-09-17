@@ -6,22 +6,116 @@
 
 做法很直接：往连接管理器里挂一个「虚拟订阅者」，``_run_chat`` 的推流帧就会送到
 这里来 —— 于是机器人也能用上流式输出（按平台上限分段发），不用另接一套。
+
+附件（图片与文件）两头都在这里收口：
+
+* **入站** —— 附件先落进工作区 ``uploads/``，再把路径按 ``![名字](路径)``（图片）
+  或 ``[附件: 名字](路径)``（文件）贴到消息开头。引擎侧的附件解析
+  （``settings/attachments.py``）认的就是这两种引用，于是 path-only 模式、
+  ``read_image`` / ``read_file``、识图子代理、inline 模式全部白拿。
+* **出站** —— ``toolEnd`` 帧带的 ``images``（生图工具/脚本新落盘的图）+ 正文里
+  模型自己写的引用（图片 ``![](路径)``、文件 ``[附件: 名字](路径)``），都摘出来
+  交给 ``adapter.send_image`` / ``adapter.send_file`` 单独发。
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any, Callable, Awaitable
 
 from ..core import context
 from . import options
-from .base import ChannelAdapter, IncomingMessage
+from .base import ChannelAdapter, IncomingMessage, save_attachments
 
 #: 累积到这么多字符就先发一段（长回答不必等到全部跑完）。
 DEFAULT_CHUNK_CHARS = 900
+
+#: 正文里形如 ``![说明](路径)`` 的图片引用。
+_MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)\s]+)\)")
+
+#: 正文里形如 ``[附件: 名字](路径)`` 的文件引用（与 ``settings/attachments.py``
+#: 认的写法完全一致 —— 同一个 markdown，网页端渲染成文件芯片，IM 这边发成附件）。
+_MD_FILE_RE = re.compile(r"\[附件[:：]\s*[^\]]*\]\(([^)\s]+)\)")
+
+#: 流式文本的尾巴上最多压这么多字符，等一个可能被 chunk 切开的下半截引用。
+_REF_TAIL_HOLD = 400
+
+#: 尾巴上「可能是一条半截引用」的形状。命中就把这一段压住，等下一块拼上来
+#: 再判 —— 否则聊天里会漏出一串残废 markdown，或者把半截路径当图片去发。
+_TAIL_REF_RE = re.compile(
+    r"(?:"
+    r"!\[[^\]]*\]\([^)\s]*"          # ![alt](path  —— 还没等到 ')'
+    r"|!\[[^\]]*"                    # ![alt
+    r"|!"
+    r"|\[附件[:：][^\]]*\]\([^)\s]*"
+    r"|\[附件[:：][^\]]*"
+    r"|\[附?"                        # 半截开头：'[' 或 '[附'
+    r")$"
+)
+
+
+def _hold_from(text: str) -> int:
+    """返回需要留在缓冲里等下一块的起点；没有半截引用就返回 ``-1``。
+
+    流式分块会把 ``![说明](C:/a.p`` + ``ng)`` 切开，这时既不能当正文发出去
+    （聊天里会冒出一串残废 markdown），也不能提前当附件处理（路径还不全）。
+    """
+    floor = max(0, len(text) - _REF_TAIL_HOLD)
+    m = _TAIL_REF_RE.search(text, floor)
+    return m.start() if m else -1
+
+
+class _AttachmentRefFilter:
+    """把流式正文里的 ``![](本地路径)`` / ``[附件: 名字](本地路径)`` 摘出来。
+
+    模型经常很自觉地写 ``![生成图](C:/.../a.png)`` —— 那是给网页端渲染用的。
+    IM 里这串 markdown 只会显示成一行丑字，附件却发不出去。摘出来单独发，聊天
+    里就只剩正文。
+
+    ``feed`` 返回 ``(可以发出去的正文, [(kind, 路径)])``，``kind`` 是 ``image``
+    或 ``file``；网络图 / ``data:`` 内联串原样留在正文里（它们不是本地文件，
+    发不出去也不该被吞掉）。
+    """
+
+    def __init__(self) -> None:
+        self._buf = ""
+
+    def feed(self, chunk: str = "") -> tuple[str, list[tuple[str, str]]]:
+        self._buf += chunk
+        found: list[tuple[str, str]] = []
+
+        def _sub(kind: str):
+            def _take(m: re.Match[str]) -> str:
+                path = m.group(1)
+                if path.startswith(("http://", "https://", "data:")):
+                    return m.group(0)
+                found.append((kind, path))
+                return ""
+
+            return _take
+
+        text = _MD_IMAGE_RE.sub(_sub("image"), self._buf)
+        text = _MD_FILE_RE.sub(_sub("file"), text)
+        hold = _hold_from(text)
+        if hold >= 0:
+            self._buf = text[hold:]
+            text = text[:hold]
+        else:
+            self._buf = ""
+        return text, found
+
+    def flush(self) -> tuple[str, list[tuple[str, str]]]:
+        """收尾：把还压在缓冲里的半截引用当普通文本吐出来。
+
+        这时候已经没机会再补齐了 —— 残废的 markdown 比丢字好，至少用户知道
+        模型写了点什么。
+        """
+        body, self._buf = self._buf, ""
+        return body, []
 
 HELP_TEXT = """我可以直接聊天，也认这几条命令：
 /new      开一个新对话（之后的消息接着新对话走）
@@ -88,6 +182,14 @@ class ConversationBridge:
     async def handle(self, msg: IncomingMessage) -> None:
         """适配器收到消息后调这里。"""
         text = (msg.text or "").strip()
+        text = await self._attach_incoming_attachments(msg, text)
+        blocked = [str(x) for x in (msg.raw.get("_blockedAttachments") or [])]
+        if blocked:
+            # 有人把 .exe 这类文件丢进来，我们一律不收 —— 但必须说清楚，否则
+            # 用户以为发出去了、模型却什么也没看到，双方都莫名其妙。
+            await self._send(
+                msg, "（这些文件类型不收，已跳过：" + "、".join(blocked) + "）"
+            )
         if not text:
             return
         if text.startswith("/"):
@@ -105,6 +207,44 @@ class ConversationBridge:
         async with lock:
             await self._run_turn(msg, text)
 
+    async def _attach_incoming_attachments(
+        self, msg: IncomingMessage, text: str
+    ) -> str:
+        """把入站附件落进工作区，并按 markdown 引用贴到消息开头。
+
+        引用格式与网页端上传附件完全一致（图片 ``![名字](绝对路径)`` / 文件
+        ``[附件: 名字](绝对路径)``），所以引擎那边的附件解析、path-only 约定、
+        识图子代理、inline 模式全部不用改一行。
+
+        失败（下载不了、写不进去）只记日志，原来那句话照样往下走 —— 收附件是加分
+        项，不该因为它把一条正常消息吞掉。收附件成功但用户一个字没说时，只把附件
+        送进去也是合理的（「这个文件讲了什么」本来就是完整的提问）。
+        """
+        if not msg.attachments:
+            return text
+        try:
+            dest = context.app_context().external_files_dir / "uploads"
+            saved = await save_attachments(self.adapter, msg, dest)
+        except Exception as exc:  # pragma: no cover - 兜底，别拖垮这一轮
+            self.adapter.log(f"处理入站附件失败：{exc}", "warn")
+            return text
+        if not saved:
+            return text
+        lines = []
+        for kind, path in saved:
+            posix = path.as_posix()
+            lines.append(
+                f"![{path.name}]({posix})" if kind == "image"
+                else f"[附件: {path.name}]({posix})"
+            )
+        images = sum(1 for kind, _ in saved if kind == "image")
+        files = len(saved) - images
+        self.adapter.log(
+            f"收到 {len(saved)} 个附件（图 {images} / 文件 {files}），已存入工作区"
+        )
+        refs = "\n".join(lines)
+        return f"{refs}\n\n{text}" if text else refs
+
     async def _send(self, msg: IncomingMessage, text: str) -> None:
         if not str(text or "").strip():
             return
@@ -112,6 +252,30 @@ class ConversationBridge:
             await self.adapter.send_text(msg, text)
         except Exception as exc:  # pragma: no cover - 发不出去只能记日志
             self.adapter.log(f"回复失败：{exc}", "error")
+
+    async def _send_attachments(
+        self, msg: IncomingMessage, refs: list[tuple[str, str]], sent: set[str]
+    ) -> None:
+        """把一批本地附件发给通道（同一个文件只发一次）。
+
+        ``sent`` 由调用方持有、跨整个回合共用 —— 生图工具、``toolEnd`` 帧、正文里
+        的 markdown 引用可能重复指向同一个文件，用户不该收到三遍。
+        """
+        for kind, path in refs:
+            key = str(path or "").strip()
+            if not key or key in sent:
+                continue
+            sent.add(key)
+            try:
+                if kind == "file":
+                    ok = await self.adapter.send_file(msg, key)
+                else:
+                    ok = await self.adapter.send_image(msg, key)
+            except Exception as exc:  # pragma: no cover - 平台侧各种意外
+                self.adapter.log(f"发附件失败：{exc}", "error")
+                continue
+            if ok is False:
+                self.adapter.log("这个通道不支持直接发附件，已退回把路径当文本发", "warn")
 
     # -- 跑一轮 -----------------------------------------------------------
     async def _run_turn(self, msg: IncomingMessage, text: str) -> None:
@@ -130,6 +294,16 @@ class ConversationBridge:
         client_id = f"bot:{self.plugin_id}:{msg.conv_key}"
         buffer: list[str] = []
         seen = {"chars": 0, "error": ""}
+        refs = _AttachmentRefFilter()
+        #: 这个回合已经发过的附件 —— 生图工具 / toolEnd 帧 / 正文引用会重复指向
+        #: 同一个文件，用户不该收到三遍。
+        sent_atts: set[str] = set()
+
+        async def flush_text() -> None:
+            payload = "".join(buffer)
+            buffer.clear()
+            if payload.strip():
+                await self.adapter.send_text(msg, payload)
 
         async def on_frame(frame: dict[str, Any]) -> None:
             kind_ = frame.get("type")
@@ -137,13 +311,26 @@ class ConversationBridge:
                 chunk = str(frame.get("text") or "")
                 if not chunk:
                     return
-                buffer.append(chunk)
                 seen["chars"] += len(chunk)
-                pending = sum(len(p) for p in buffer)
-                if self.chunk_chars and pending >= self.chunk_chars:
-                    payload = "".join(buffer)
-                    buffer.clear()
-                    await self.adapter.send_text(msg, payload)
+                text_out, found = refs.feed(chunk)
+                if text_out:
+                    buffer.append(text_out)
+                if found:
+                    # 先把已经攒着的正文发出去，再发附件 —— 顺序别倒过来
+                    await flush_text()
+                    await self._send_attachments(msg, found, sent_atts)
+                if self.chunk_chars and sum(len(p) for p in buffer) >= self.chunk_chars:
+                    await flush_text()
+            elif kind_ == "toolEnd":
+                # 生图工具/脚本本轮新落盘的图，引擎已经扫好放在帧里了
+                images = [
+                    ("image", str(p))
+                    for p in (frame.get("images") or [])
+                    if str(p or "")
+                ]
+                if images:
+                    await flush_text()
+                    await self._send_attachments(msg, images, sent_atts)
             elif kind_ == "error":
                 seen["error"] = str(frame.get("error") or "")
 
@@ -162,14 +349,23 @@ class ConversationBridge:
         finally:
             server_main.manager.disconnect(client_id)
 
-        tail = "".join(buffer)
-        if tail.strip():
-            await self._send(msg, tail)
+        tail, found = refs.flush()
+        if tail:
+            buffer.append(tail)
+        if found:
+            await self._send_attachments(msg, found, sent_atts)
+        payload = "".join(buffer)
+        if payload.strip():
+            await self._send(msg, payload)
         elif seen["error"]:
             await self._send(msg, f"出错了：{seen['error']}")
-        elif seen["chars"] == 0:
+        elif seen["chars"] == 0 and not sent_atts:
             await self._send(msg, "（这轮没有产生内容）")
-        self.adapter.log(f"回复完成（{seen['chars']} 字）")
+        self.adapter.log(
+            f"回复完成（{seen['chars']} 字"
+            + (f"，{len(sent_atts)} 个附件" if sent_atts else "")
+            + "）"
+        )
 
     async def _run_subagent_turn(
         self, msg: IncomingMessage, session_id: str, text: str, subagent_id: str
@@ -186,6 +382,15 @@ class ConversationBridge:
 
         buffer: list[str] = []
         streamed = {"n": 0}
+        refs = _AttachmentRefFilter()
+        sent_atts: set[str] = set()
+
+        async def flush_text() -> None:
+            payload = "".join(buffer)
+            buffer.clear()
+            if payload.strip():
+                streamed["n"] += len(payload)
+                await self.adapter.send_text(msg, payload)
 
         async def on_event(event: dict[str, Any]) -> None:
             if event.get("type") != "subagentDelta":
@@ -193,12 +398,14 @@ class ConversationBridge:
             chunk = str(event.get("text") or "")
             if not chunk:
                 return
-            buffer.append(chunk)
+            text_out, found = refs.feed(chunk)
+            if text_out:
+                buffer.append(text_out)
+            if found:
+                await flush_text()
+                await self._send_attachments(msg, found, sent_atts)
             if self.chunk_chars and sum(len(p) for p in buffer) >= self.chunk_chars:
-                payload = "".join(buffer)
-                buffer.clear()
-                streamed["n"] += len(payload)
-                await self.adapter.send_text(msg, payload)
+                await flush_text()
 
         token = subagent_events.set_emitter(on_event)
         try:
@@ -215,11 +422,18 @@ class ConversationBridge:
         finally:
             subagent_events.reset_emitter(token)
 
-        tail = "".join(buffer)
-        if tail.strip():
+        tail, found = refs.flush()
+        if tail:
+            buffer.append(tail)
+        if found:
+            await self._send_attachments(msg, found, sent_atts)
+        payload = "".join(buffer)
+        if payload.strip():
             # 已经流出去一部分，剩下的尾巴补一条
-            await self._send(msg, tail)
-        elif streamed["n"] == 0:
+            if streamed["n"] == 0:
+                streamed["n"] = len(payload)
+            await self._send(msg, payload)
+        elif streamed["n"] == 0 and not sent_atts:
             # 一个字都没流过（子代理没走事件总线 / 内容太短）→ 整段发出去
             await self._send(msg, answer or "（这轮没有产生内容）")
         self.adapter.log(f"回复完成（子代理 {subagent_id}）")

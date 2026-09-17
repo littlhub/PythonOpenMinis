@@ -262,11 +262,15 @@ export const api = {
   pluginDetail: (id: string) =>
     request<PluginStatus>(`/plugins/${encodeURIComponent(id)}`),
 
-  /** 安装随引擎发布的内置插件（如 qq-bot）到数据目录，之后可改配置。 */
-  pluginInstall: (id: string) =>
+  /**
+   * 安装随引擎发布的内置插件（如 qq-bot）到数据目录，之后可改配置。
+   * `refresh` 会用包内那份覆盖已装的清单（保留用户配置）—— 内置插件装过之后
+   * 不会自动跟着升级，新加的配置项否则永远不出现。
+   */
+  pluginInstall: (id: string, refresh = false) =>
     request<{ ok: boolean; id: string; plugin: PluginStatus }>('/plugins/install', {
       method: 'POST',
-      body: JSON.stringify({ id }),
+      body: JSON.stringify({ id, refresh }),
     }),
 
   /** 导入本机路径的插件包（zip 或目录），没有 plugin.json 也能装。 */

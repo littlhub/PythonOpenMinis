@@ -13,7 +13,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+import re
 import zipfile
 from pathlib import Path
 
@@ -24,6 +26,7 @@ from openminis.plugins.base import (
     STATE_CONNECTED,
     ChannelAdapter,
     IncomingMessage,
+    attachment_is_image,
 )
 from openminis.plugins.bridge import ConversationBridge
 from openminis.plugins.manifest import (
@@ -33,7 +36,7 @@ from openminis.plugins.manifest import (
     ManifestError,
 )
 from openminis.plugins.registry import PluginRuntime
-from openminis.plugins.drivers.qq import QQAdapter, normalize_event
+from openminis.plugins.drivers.qq import QQAdapter, QQBotError, normalize_event
 
 
 @pytest.fixture()
@@ -199,6 +202,12 @@ class FakeAdapter(ChannelAdapter):
     def __init__(self, **kw):
         super().__init__(**kw)
         self.sent: list[str] = []
+        #: 发出去的图片 / 文件路径（按调用顺序）。
+        self.images: list[str] = []
+        self.files: list[str] = []
+        #: 让测试注入「附件 URL → 字节 / 文件名」，模拟下载。
+        self.attachment_bytes: dict[str, bytes] = {}
+        self.attachment_names: dict[str, str] = {}
 
     async def start(self):
         self.set_state(STATE_CONNECTED, "ok")
@@ -210,6 +219,21 @@ class FakeAdapter(ChannelAdapter):
 
     async def send_text(self, msg, text, **kw):
         self.sent.append(text)
+
+    async def send_image(self, msg, path, **kw):
+        self.images.append(str(path))
+        return True
+
+    async def send_file(self, msg, path, **kw):
+        self.files.append(str(path))
+        return True
+
+    async def fetch_attachment(self, att):
+        url = str(att.get("url") or "")
+        data = self.attachment_bytes.get(url)
+        if data is None:
+            return None
+        return data, self.attachment_names.get(url, "pic.jpg")
 
 
 def _install_fake(monkeypatch) -> None:
@@ -746,3 +770,440 @@ async def test_tool_plugin_refuses_cwd_escape(data_dir):
     result = await plugin_tools.run_tool(manifest, manifest.tools[0], "{}", "")
     assert result.success is False
     assert "越界" in result.output
+
+
+# ---------------------------------------------------------------------------
+# 通道图片：入站落盘 + 出站富媒体
+# ---------------------------------------------------------------------------
+def test_attachment_is_image_prefers_content_type():
+    assert attachment_is_image({"content_type": "image/jpeg"}) is True
+    assert attachment_is_image({"content_type": "application/pdf"}) is False
+    # 只给「通用二进制」时才回头看文件名/URL 后缀
+    assert attachment_is_image(
+        {"content_type": "application/octet-stream", "filename": "a.PNG"}
+    ) is True
+    assert attachment_is_image({"url": "https://x/y.webp?x=1"}) is True
+    assert attachment_is_image({"filename": "notes.txt"}) is False
+
+
+def test_attachment_kind_and_name():
+    from openminis.plugins.base import attachment_kind, attachment_name
+
+    assert attachment_kind({"content_type": "image/png"}) == "image"
+    assert attachment_kind({"content_type": "application/pdf", "filename": "a.pdf"}) == "file"
+    assert attachment_kind({}) == ""            # 没名字没 URL：跳过，别落个空文件
+    assert attachment_name({"url": "https://x/y/report.xlsx?sig=1"}) == "report.xlsx"
+
+
+def test_channel_file_name_sanitizes_suffix():
+    from openminis.plugins.base import channel_file_name
+
+    # 正常后缀保留
+    assert channel_file_name("报表.xlsx", prefix="qq").endswith(".xlsx")
+    # 可执行后缀一律换成兜底 —— 别让落盘文件名本身成为隐患
+    assert channel_file_name("evil.exe", prefix="qq").endswith(".bin")
+    # 没有后缀 → 兜底
+    assert channel_file_name("README", prefix="qq").endswith(".bin")
+    # 图片的兜底是 .jpg（否则引擎认不出是图、前端也不渲染）
+    assert channel_file_name("blob", prefix="qq", fallback_suffix=".jpg").endswith(".jpg")
+
+
+def test_attachment_ref_filter_extracts_and_holds_split_refs():
+    from openminis.plugins.bridge import _AttachmentRefFilter
+
+    refs = _AttachmentRefFilter()
+    text, found = refs.feed("看图 ![生成图](C:/a/b.p")
+    assert text == "看图 "        # 半截引用被压住，不能当正文漏出去
+    assert found == []
+    text2, found2 = refs.feed("ng)")
+    assert text2 == "" and found2 == [("image", "C:/a/b.png")]
+    assert refs.flush() == ("", [])
+
+    # 文件引用走同一套
+    refs_f = _AttachmentRefFilter()
+    text3, found3 = refs_f.feed("报表给你 [附件: 月报.xlsx](C:/a/月报.xlsx) 收好")
+    assert found3 == [("file", "C:/a/月报.xlsx")]
+    assert text3 == "报表给你  收好"
+
+    # 网络图 / 内联串不是本地文件，原样留着，别去发一个本地路径
+    refs2 = _AttachmentRefFilter()
+    text4, found4 = refs2.feed("![x](https://example.com/a.png)")
+    assert text4 == "![x](https://example.com/a.png)" and found4 == []
+
+    # 收尾：补不齐的半截引用当普通文本吐出来，别吞字
+    refs3 = _AttachmentRefFilter()
+    refs3.feed("看图 ![半截")
+    assert refs3.flush() == ("![半截", [])
+
+
+@pytest.mark.asyncio
+async def test_bridge_ingests_incoming_images(data_dir, monkeypatch):
+    """入站图片：落进工作区 uploads/，并以 markdown 路径引用喂给引擎。"""
+    from openminis.core import context
+    from openminis.server import chat_store, main as server_main
+
+    chat_store.set_database_path(data_dir / "plugins_img_in.db")
+    png = b"\x89PNG\r\n\x1a\n" + b"0" * 32
+    adapter = FakeAdapter(plugin_id="p", config={})
+    adapter.attachment_bytes["https://cdn/a.png"] = png
+    adapter.attachment_names["https://cdn/a.png"] = "cat.png"
+    bridge = ConversationBridge(plugin_id="p", adapter=adapter)
+    seen: dict[str, str] = {}
+
+    async def fake_run_chat(client_id, msg):
+        seen["text"] = str(msg.get("text") or "")
+
+    monkeypatch.setattr(server_main, "_run_chat", fake_run_chat)
+    att = {"content_type": "image/png", "url": "https://cdn/a.png", "filename": "cat.png"}
+
+    await bridge.handle(IncomingMessage(
+        scope="c2c", peer_id="u1", sender_id="u1", text="这是什么",
+        message_id="m1", attachments=[att],
+    ))
+    text = seen["text"]
+    assert "这是什么" in text
+    m = re.search(r"!\[[^\]]*\]\(([^)]+)\)", text)
+    assert m, text
+    path = Path(m.group(1))
+    assert path.is_file() and path.read_bytes() == png
+    workspace = context.app_context().external_files_dir.resolve()
+    assert workspace in path.resolve().parents     # 必须落在工作区内，否则引擎拒收
+    assert "uploads" in path.parts
+
+    # 只发图、一个字都没说 —— 也不该被当成空消息丢掉
+    await bridge.handle(IncomingMessage(
+        scope="c2c", peer_id="u1", sender_id="u1", text="",
+        message_id="m2", attachments=[att],
+    ))
+    assert seen["text"].startswith("![")
+
+
+@pytest.mark.asyncio
+async def test_bridge_ingests_incoming_files(data_dir, monkeypatch):
+    """入站文件：也落工作区，贴成 ``[附件: 名字](路径)``（引擎认这种引用）。"""
+    from openminis.server import chat_store, main as server_main
+
+    chat_store.set_database_path(data_dir / "plugins_file_in.db")
+    adapter = FakeAdapter(plugin_id="p", config={})
+    adapter.attachment_bytes["https://cdn/月报.xlsx"] = b"PK\x03\x04xlsx"
+    adapter.attachment_names["https://cdn/月报.xlsx"] = "月报.xlsx"
+    bridge = ConversationBridge(plugin_id="p", adapter=adapter)
+    seen: dict[str, str] = {}
+
+    async def fake_run_chat(client_id, msg):
+        seen["text"] = str(msg.get("text") or "")
+
+    monkeypatch.setattr(server_main, "_run_chat", fake_run_chat)
+    await bridge.handle(IncomingMessage(
+        scope="c2c", peer_id="u", sender_id="u", text="看下这个",
+        attachments=[{
+            "content_type": "application/vnd.ms-excel",
+            "url": "https://cdn/月报.xlsx", "filename": "月报.xlsx",
+        }],
+    ))
+    text = seen["text"]
+    m = re.search(r"\[附件: ([^\]]+)\]\(([^)]+)\)", text)
+    assert m, text
+    saved = Path(m.group(2))
+    assert saved.is_file() and saved.read_bytes() == b"PK\x03\x04xlsx"
+    assert saved.suffix == ".xlsx"
+    assert "看下这个" in text
+
+
+@pytest.mark.asyncio
+async def test_bridge_refuses_executable_attachments(data_dir, monkeypatch):
+    """可执行文件不收 —— 但必须回一句，别让用户以为发出去了。"""
+    from openminis.server import chat_store, main as server_main
+
+    chat_store.set_database_path(data_dir / "plugins_exe.db")
+    adapter = FakeAdapter(plugin_id="p", config={})
+    adapter.attachment_bytes["https://cdn/x.exe"] = b"MZ"
+    bridge = ConversationBridge(plugin_id="p", adapter=adapter)
+    seen: dict[str, str] = {}
+
+    async def fake_run_chat(client_id, msg):
+        seen["text"] = str(msg.get("text") or "")
+
+    monkeypatch.setattr(server_main, "_run_chat", fake_run_chat)
+    await bridge.handle(IncomingMessage(
+        scope="c2c", peer_id="u", sender_id="u", text="跑一下",
+        attachments=[{
+            "content_type": "application/octet-stream",
+            "url": "https://cdn/x.exe", "filename": "x.exe",
+        }],
+    ))
+    assert seen["text"] == "跑一下"                      # 没被塞进引用
+    assert any("不收" in s and "x.exe" in s for s in adapter.sent)
+
+
+@pytest.mark.asyncio
+async def test_bridge_sends_file_refs_from_text(data_dir, monkeypatch):
+    """正文里的 ``[附件: 名字](本地路径)`` 也要真发成附件，正文里不留 markdown。"""
+    from openminis.server import chat_store, main as server_main
+
+    chat_store.set_database_path(data_dir / "plugins_file_out.db")
+    adapter = FakeAdapter(plugin_id="p", config={})
+    bridge = ConversationBridge(plugin_id="p", adapter=adapter)
+    book = "C:/tmp/report.xlsx"
+
+    async def fake_run_chat(client_id, msg):
+        sink = server_main.manager.active[client_id]
+        await sink.send_json({"type": "delta", "text": "报表好了："})
+        await sink.send_json({"type": "delta", "text": f"[附件: 月报.xlsx]({book})"})
+        await sink.send_json({"type": "done"})
+
+    monkeypatch.setattr(server_main, "_run_chat", fake_run_chat)
+    await bridge.handle(
+        IncomingMessage(scope="c2c", peer_id="u", sender_id="u", text="出个报表")
+    )
+    assert adapter.files == [book]
+    assert adapter.images == []
+    assert "[附件" not in "".join(adapter.sent)
+    assert "报表好了：" in "".join(adapter.sent)
+
+
+@pytest.mark.asyncio
+async def test_bridge_sends_generated_images_and_strips_refs(data_dir, monkeypatch):
+    """出站图片：toolEnd 的 images 与正文里的 markdown 引用都单独发，正文不留 markdown。"""
+    from openminis.server import chat_store, main as server_main
+
+    chat_store.set_database_path(data_dir / "plugins_img_out.db")
+    adapter = FakeAdapter(plugin_id="p", config={})
+    bridge = ConversationBridge(plugin_id="p", adapter=adapter)
+    img = "C:/tmp/generated/cat.png"
+
+    async def fake_run_chat(client_id, msg):
+        sink = server_main.manager.active[client_id]
+        await sink.send_json({"type": "delta", "text": "画好了，见图 "})
+        await sink.send_json({
+            "type": "toolEnd", "id": "t1", "name": "image_gen", "ok": True,
+            "images": [img],
+        })
+        # 模型自己又写了一遍引用 —— 同一张图不该发两遍
+        await sink.send_json({"type": "delta", "text": f"![生成图]({img})"})
+        await sink.send_json({"type": "done"})
+
+    monkeypatch.setattr(server_main, "_run_chat", fake_run_chat)
+    await bridge.handle(
+        IncomingMessage(scope="c2c", peer_id="u", sender_id="u", text="画只猫")
+    )
+
+    assert adapter.images == [img]
+    joined = "".join(adapter.sent)
+    assert "画好了，见图" in joined
+    assert "![" not in joined            # markdown 引用不该进聊天正文
+
+
+@pytest.mark.asyncio
+async def test_bridge_falls_back_when_channel_cannot_send_images(data_dir, monkeypatch):
+    """平台不支持富媒体时退化成发一条「[图片] 路径」，不能静默丢。"""
+    from openminis.server import chat_store, main as server_main
+
+    chat_store.set_database_path(data_dir / "plugins_img_fallback.db")
+
+    class PlainAdapter(FakeAdapter):
+        pass
+
+    adapter = PlainAdapter(plugin_id="p", config={})
+    # 退回基类实现（不支持图片）
+    adapter.send_image = ChannelAdapter.send_image.__get__(adapter, PlainAdapter)
+    bridge = ConversationBridge(plugin_id="p", adapter=adapter)
+    img = "C:/tmp/generated/cat.png"
+
+    async def fake_run_chat(client_id, msg):
+        sink = server_main.manager.active[client_id]
+        await sink.send_json({"type": "toolEnd", "id": "t1", "name": "image_gen",
+                              "ok": True, "images": [img]})
+
+    monkeypatch.setattr(server_main, "_run_chat", fake_run_chat)
+    await bridge.handle(
+        IncomingMessage(scope="c2c", peer_id="u", sender_id="u", text="画只猫")
+    )
+    assert any("[图片]" in s for s in adapter.sent)
+
+
+@pytest.mark.asyncio
+async def test_qq_send_image_uploads_then_sends_rich_media(tmp_path, monkeypatch):
+    """QQ 发图必须两步：先 /files 拿 file_info，再 msg_type 7 那条消息。"""
+    pic = tmp_path / "a.png"
+    pic.write_bytes(b"\x89PNG" + b"1" * 16)
+
+    adapter = QQAdapter(plugin_id="qq", config={"appId": "1", "clientSecret": "s"})
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_api(path, *, method="POST", body=None):
+        calls.append((path, dict(body or {})))
+        return {"file_info": "FI-1", "ttl": 300} if path.endswith("/files") else {}
+
+    monkeypatch.setattr(adapter, "_api", fake_api)
+    msg = IncomingMessage(scope="group", peer_id="G1", sender_id="U1", text="",
+                          message_id="m7")
+
+    assert await adapter.send_image(msg, pic) is True
+    assert calls[0][0] == "/v2/groups/G1/files"
+    assert calls[0][1]["file_type"] == 1
+    assert calls[0][1]["srv_send_msg"] is False
+    assert base64.b64decode(calls[0][1]["file_data"]) == pic.read_bytes()
+
+    assert calls[1][0] == "/v2/groups/G1/messages"
+    assert calls[1][1]["msg_type"] == 7
+    assert calls[1][1]["media"] == {"file_info": "FI-1"}
+    assert calls[1][1]["msg_id"] == "m7" and calls[1][1]["msg_seq"] == 1
+    # 图片也占了一个 seq，紧接着的文字回复必须往后排
+    assert adapter._reserve_seq(msg, 1) == 2
+
+    # 上传失败 → 如实返回 False 并记日志，不抛给上层
+    async def bad_api(path, *, method="POST", body=None):
+        raise QQBotError("boom")
+
+    monkeypatch.setattr(adapter, "_api", bad_api)
+    assert await adapter.send_image(msg, pic) is False
+
+
+@pytest.mark.asyncio
+async def test_qq_fetch_attachment_downloads_bytes(monkeypatch):
+    adapter = QQAdapter(plugin_id="qq", config={"appId": "1", "clientSecret": "s"})
+    seen: list[tuple[str, dict]] = []
+
+    class FakeResp:
+        status_code = 200
+        content = b"PNGDATA"
+
+    class FakeHttp:
+        async def get(self, url, headers=None):
+            seen.append((url, headers or {}))
+            return FakeResp()
+
+    async def fake_token():
+        return "tok"
+
+    monkeypatch.setattr(adapter, "_access_token", fake_token)
+    monkeypatch.setattr(adapter, "_http", lambda: FakeHttp())
+
+    got = await adapter.fetch_attachment({
+        "url": "https://cdn/a.jpg", "filename": "a.jpg", "content_type": "image/jpeg",
+    })
+    assert got == (b"PNGDATA", "a.jpg")
+    assert seen[0][1]["Authorization"] == "QQBot tok"
+    assert await adapter.fetch_attachment({}) is None      # 没 URL 就别硬来
+
+
+@pytest.mark.asyncio
+async def test_qq_send_image_converts_webp_to_png(tmp_path, monkeypatch):
+    """QQ 只收 png/jpg —— webp 先转码再传，否则平台只会回一句看不懂的失败。"""
+    from PIL import Image
+
+    webp = tmp_path / "a.webp"
+    Image.new("RGB", (4, 4), (200, 30, 30)).save(webp, format="WEBP")
+
+    adapter = QQAdapter(plugin_id="qq", config={"appId": "1", "clientSecret": "s"})
+    seen: list[dict] = []
+
+    async def fake_api(path, *, method="POST", body=None):
+        seen.append(dict(body or {}))
+        return {"file_info": "FI"} if path.endswith("/files") else {}
+
+    monkeypatch.setattr(adapter, "_api", fake_api)
+    msg = IncomingMessage(scope="c2c", peer_id="U1", sender_id="U1", text="")
+    assert await adapter.send_image(msg, webp) is True
+
+    raw = base64.b64decode(seen[0]["file_data"])
+    assert raw != webp.read_bytes()
+    assert Image.open(__import__("io").BytesIO(raw)).format == "PNG"
+
+
+@pytest.mark.asyncio
+async def test_qq_send_file_passes_file_name(tmp_path, monkeypatch):
+    """QQ 发文件：file_type=4，且**必须**带 file_name —— 否则客户端显示「未命名」。"""
+    doc = tmp_path / "月报.xlsx"
+    doc.write_bytes(b"PK\x03\x04" + b"9" * 24)
+
+    adapter = QQAdapter(plugin_id="qq", config={"appId": "1", "clientSecret": "s"})
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_api(path, *, method="POST", body=None):
+        calls.append((path, dict(body or {})))
+        return {"file_info": "FI-FILE"} if path.endswith("/files") else {}
+
+    monkeypatch.setattr(adapter, "_api", fake_api)
+    msg = IncomingMessage(scope="c2c", peer_id="U1", sender_id="U1", text="",
+                          message_id="m9")
+
+    assert await adapter.send_file(msg, doc) is True
+    assert calls[0][0] == "/v2/users/U1/files"
+    assert calls[0][1]["file_type"] == 4
+    assert calls[0][1]["file_name"] == "月报.xlsx"
+    assert calls[0][1]["srv_send_msg"] is False
+    assert base64.b64decode(calls[0][1]["file_data"]) == doc.read_bytes()
+
+    assert calls[1][1]["msg_type"] == 7
+    assert calls[1][1]["media"] == {"file_info": "FI-FILE"}
+    assert calls[1][1]["msg_seq"] == 1
+
+    # 图片那条路不该带 file_name（官方只在文件类型上认它）
+    pic = tmp_path / "a.png"
+    pic.write_bytes(b"\x89PNG" + b"1" * 8)
+    calls.clear()
+    assert await adapter.send_image(msg, pic) is True
+    assert calls[0][1]["file_type"] == 1
+    assert "file_name" not in calls[0][1]
+
+
+@pytest.mark.asyncio
+async def test_qq_warns_when_passive_reply_quota_used_up(tmp_path, monkeypatch):
+    """被动回复有次数上限；附件各占一次，逼近时要在日志里说出来。"""
+    pic = tmp_path / "a.png"
+    pic.write_bytes(b"\x89PNG" + b"1" * 8)
+
+    adapter = QQAdapter(plugin_id="qq", config={"appId": "1", "clientSecret": "s"})
+
+    async def fake_api(path, *, method="POST", body=None):
+        return {"file_info": "FI"} if path.endswith("/files") else {}
+
+    monkeypatch.setattr(adapter, "_api", fake_api)
+    msg = IncomingMessage(scope="c2c", peer_id="U1", sender_id="U1", text="",
+                          message_id="m11")
+
+    for _ in range(4):                       # 单聊上限就是 4
+        assert await adapter.send_image(msg, pic) is True
+    warns = [row["text"] for row in adapter.logs() if row["level"] == "warn"]
+    assert any("官方上限 4" in t for t in warns)
+
+
+def test_builtin_refresh_keeps_user_config(data_dir, tmp_path, monkeypatch):
+    """内置清单升级：refresh 换掉清单、保留用户填的配置。
+
+    这个坑很隐蔽 —— 内置插件装过之后数据目录那份**不会**自动跟着升级，于是
+    新加的配置项在界面上永远不出现，用户只看到「我明明装了却没有那一项」。
+    """
+    fake_builtin = tmp_path / "builtin"
+    (fake_builtin / "gg").mkdir(parents=True)
+    spec = fake_builtin / "gg" / "plugin.json"
+    spec.write_text(json.dumps({
+        "id": "gg", "name": "假内置", "runtime": "engine", "driver": "fake",
+        "fields": [{"key": "token", "label": "令牌", "type": "password", "secret": True}],
+    }, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(store, "builtin_dir", lambda: fake_builtin)
+
+    store.install_builtin("gg")
+    store.write_config("gg", {"token": "secret-value"})
+    assert store.builtin_outdated("gg") is False
+
+    # 包内清单升级（多出一个配置项）
+    spec.write_text(json.dumps({
+        "id": "gg", "name": "假内置", "runtime": "engine", "driver": "fake",
+        "fields": [
+            {"key": "token", "label": "令牌", "type": "password", "secret": True},
+            {"key": "n", "label": "新项", "type": "text"},
+        ],
+    }, ensure_ascii=False), encoding="utf-8")
+    assert store.builtin_outdated("gg") is True
+
+    manifest = store.install_builtin("gg", refresh=True)
+    assert [f.key for f in manifest.fields] == ["token", "n"]
+    assert store.read_config("gg").get("token") == "secret-value"   # 配置没被抹掉
+    assert store.builtin_outdated("gg") is False
+
+    # 不传 refresh 时依旧幂等：不会把配置洗掉，也不会误报有更新
+    store.install_builtin("gg")
+    assert store.read_config("gg").get("token") == "secret-value"

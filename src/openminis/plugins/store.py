@@ -121,19 +121,60 @@ def is_installed(plugin_id: str) -> bool:
 
 
 # -- 安装 / 导入 / 卸载 -------------------------------------------------------
-def install_builtin(plugin_id: str) -> ChannelManifest:
-    """把内置插件复制进数据目录（幂等：已存在则只返回清单）。"""
+def _copy_builtin(source: Path, target: Path) -> None:
+    """把内置插件的文件复制进去，但**绝不碰已有的 config.json**。
+
+    配置是用户填的（AppID / 密钥 / 白名单），不该因为「更新了内置插件」就消失；
+    包内那份 config.json（如果有）只当作没装过时的初始值。
+    """
+    target.mkdir(parents=True, exist_ok=True)
+    for item in sorted(source.rglob("*")):
+        rel = item.relative_to(source)
+        dest = target / rel
+        if item.is_dir():
+            dest.mkdir(parents=True, exist_ok=True)
+            continue
+        if rel.name == CONFIG_NAME and dest.exists():
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(item, dest)
+
+
+def install_builtin(plugin_id: str, *, refresh: bool = False) -> ChannelManifest:
+    """把内置插件装进数据目录。
+
+    已安装时默认什么都不做（幂等）；``refresh=True`` 会用包内那份覆盖清单 ——
+    专门用来解决「包里升级了、数据目录那份还是旧的」：内置插件装过之后不会自动
+    跟着升级，于是新加的配置项在界面上永远不出现，很难自己反应过来。配置照旧保留。
+    """
     pid = _safe_id(plugin_id)
     source = builtin_dir() / pid
     if not source.is_dir():
         raise ManifestError(f"没有内置插件：{pid}")
     target = plugins_dir() / pid
-    if not target.is_dir():
-        shutil.copytree(source, target)
+    if target.is_dir() and not refresh:
+        manifest = _load_dir(target, builtin=False)
+        if manifest is None:
+            raise ManifestError(f"内置插件 {pid} 的清单不合法")
+        return manifest
+    _copy_builtin(source, target)
     manifest = _load_dir(target, builtin=False)
     if manifest is None:
         raise ManifestError(f"内置插件 {pid} 的清单不合法")
     return manifest
+
+
+def builtin_outdated(plugin_id: str) -> bool:
+    """数据目录那份的清单和包内的不一致吗（= 内置插件升级过了）。"""
+    pid = _safe_id(plugin_id)
+    source = builtin_dir() / pid / MANIFEST_NAME
+    target = plugins_dir() / pid / MANIFEST_NAME
+    if not source.is_file() or not target.is_file():
+        return False
+    try:
+        return source.read_bytes() != target.read_bytes()
+    except OSError:  # pragma: no cover - 读不动就当没差异，别拿它挡启动
+        return False
 
 
 def import_plugin(source: str | Path) -> ChannelManifest:
@@ -532,6 +573,7 @@ __all__ = [
     "get",
     "is_installed",
     "install_builtin",
+    "builtin_outdated",
     "import_plugin",
     "remove",
     "read_config",

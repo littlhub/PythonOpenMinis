@@ -788,6 +788,8 @@ export interface PluginStatus {
   driver: string
   builtin: boolean
   installed: boolean
+  /** 内置插件的包内清单比数据目录那份新 —— 可以点「更新清单」刷新。 */
+  outdated?: boolean
   /** 上次是不是启用状态 —— 引擎重启会自动把它拉起来。 */
   enabled: boolean
   running: boolean

@@ -13,6 +13,15 @@
 - 回复：``POST /v2/users/{openid}/messages`` 或 ``/v2/groups/{group_openid}/messages``
   body ``{content, msg_type: 0, msg_id, msg_seq}`` —— 带上被动回复的 ``msg_id``
   才不占用主动消息额度；同一条消息回多段时 ``msg_seq`` 递增。
+- 图片 / 文件：**先传后发**。``POST /v2/{users|groups}/{id}/files``
+  body ``{file_type: 1(图)|4(文件), file_data: <base64>, srv_send_msg: false}``
+  → ``{file_info, ttl}``；再发一条 ``msg_type: 7`` 且 ``media: {file_info}`` 的
+  消息，同样要带 ``msg_id`` + 递增的 ``msg_seq``。富媒体只在 ttl 内可发，所以
+  每次都重新上传。**文件必须带 ``file_name``**，否则客户端里显示成「未命名」。
+- 收附件：事件里的 ``attachments[]`` 带 ``url`` / ``content_type`` / ``filename``，
+  下载后落进工作区的 ``uploads/``（引擎侧只认工作区以内的路径）。
+- 被动回复有次数上限（单聊 4 次 / 群聊 5 次）；附件各占一次，逼近时会在日志里
+  提前告警 —— 顶到之后平台只会静默失败，不说出来用户完全无从判断。
 
 这里的实现**不依赖任何第三方框架**：用 httpx 发 HTTP、websockets 连网关，
 断线自动重连（指数退避）、token 到期前自动刷新、消息 id 去重（QQ 会重推）。
@@ -21,8 +30,10 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import time
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -55,6 +66,15 @@ INTENT_INTERACTION = 1 << 26
 
 #: 官方单条消息上限。
 MAX_MESSAGE_CHARS = 2000
+#: 富媒体 ``file_type``：1=图片 2=视频 3=语音 4=文件。这里只发图片与文件。
+FILE_TYPE_IMAGE = 1
+FILE_TYPE_FILE = 4
+#: 各类富媒体的字节上限（官方不写死，按实测/社区实现取保守值）。
+MAX_IMAGE_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_FILE_UPLOAD_BYTES = 20 * 1024 * 1024
+#: 被动回复次数上限：单聊每个周期 4 次、群聊 5 次。发图/发文件各算一次，
+#: 所以「带图的长回答」很容易顶到，逼近时提前告警。
+PASSIVE_REPLY_LIMIT = {"c2c": 4, "group": 5}
 #: 提前多久刷新 token（官方 TTL 7200s）。
 TOKEN_MARGIN_SEC = 300
 REQUEST_TIMEOUT_SEC = 15.0
@@ -95,6 +115,8 @@ class QQAdapter(ChannelAdapter):
         self._seen: dict[str, float] = {}
         #: ``msg_id -> (下一个可用的 msg_seq, 最后使用时间)``。
         self._seq_for_msg: dict[str, tuple[int, float]] = {}
+        #: ``msg_id -> 已经回了几条``（被动回复有次数上限，见 PASSIVE_REPLY_LIMIT）。
+        self._replies: dict[str, tuple[int, float]] = {}
 
     # ---- 配置快照 -------------------------------------------------------
     @property
@@ -386,20 +408,161 @@ class QQAdapter(ChannelAdapter):
             "input_notify": {"input_type": 1, "input_second": 5},
             "msg_id": msg.message_id,
             # 输入状态也算一条被动回复，一样要占一个 seq，否则跟正式回复撞号。
-            "msg_seq": self._reserve_seq(msg, 1) or 1,
+            "msg_seq": self._reserve_seq(msg, 1, counts_as_reply=False) or 1,
         }
         try:
             await self._api(self._endpoint(msg.peer_id, msg.scope), body=body)
         except QQBotError:
             pass  # 输入状态是锦上添花，失败不打扰用户
 
+    # ---- 出站附件（富媒体）----------------------------------------------
+    async def send_image(
+        self, msg: IncomingMessage | None, path: str | Path, **kwargs: Any
+    ) -> bool:
+        """发一张本地图片：先传成富媒体拿 ``file_info``，再发一条 ``msg_type 7``。"""
+        return await self._send_media(msg, path, file_type=FILE_TYPE_IMAGE, **kwargs)
+
+    async def send_file(
+        self, msg: IncomingMessage | None, path: str | Path, **kwargs: Any
+    ) -> bool:
+        """发一个本地文件（``file_type 4``）。
+
+        **必须带 ``file_name``** —— 官方不传这个字段也能上传成功，但客户端里会
+        显示成「未命名」，收的人根本不知道是什么。
+        """
+        return await self._send_media(msg, path, file_type=FILE_TYPE_FILE, **kwargs)
+
+    async def _send_media(
+        self,
+        msg: IncomingMessage | None,
+        path: str | Path,
+        *,
+        file_type: int,
+        **kwargs: Any,
+    ) -> bool:
+        """上传 + 发送富媒体。图片和文件走同一条路，只有 ``file_type`` 与上限不同。
+
+        官方规定富媒体只在 ttl 内有效，所以**每次都重新上传**，不做缓存 ——
+        与其赌缓存里那份还没过期，不如多一次请求换确定性。
+        """
+        scope = str(kwargs.get("scope") or (msg.scope if msg else "c2c"))
+        peer = str(kwargs.get("peer") or (msg.peer_id if msg else ""))
+        if not peer:
+            return False
+        target = Path(path)
+        if not target.is_file():
+            self.log(f"要发的{'图片' if file_type == FILE_TYPE_IMAGE else '文件'}"
+                     f"不存在：{target}", "warn")
+            return False
+        is_image = file_type == FILE_TYPE_IMAGE
+        try:
+            file_info = await self._upload_media(
+                scope, peer, target, file_type=file_type, is_image=is_image
+            )
+        except QQBotError as exc:
+            self.log(f"上传{'图片' if is_image else '文件'}失败：{exc}", "error")
+            self.state.error = str(exc)
+            return False
+
+        body: dict[str, Any] = {
+            "msg_type": 7,  # 7 = 富媒体
+            "media": {"file_info": file_info},
+            "content": "",
+        }
+        if msg is not None and msg.message_id:
+            body["msg_id"] = msg.message_id
+            # 附件也算一条出站，一样要占 seq，否则和文字那条撞号被官方丢掉。
+            body["msg_seq"] = self._reserve_seq(msg, 1) or 1
+        try:
+            await self._api(self._endpoint(peer, scope), body=body)
+        except QQBotError as exc:
+            self.log(f"发送{'图片' if is_image else '文件'}失败：{exc}", "error")
+            self.state.error = str(exc)
+            return False
+        self.log(f"已发送{'图片' if is_image else '文件'}：{target.name}")
+        return True
+
+    async def _upload_media(
+        self,
+        scope: str,
+        peer: str,
+        path: Path,
+        *,
+        file_type: int,
+        is_image: bool,
+    ) -> str:
+        """把本地文件传成富媒体，返回 ``file_info``（ttl 内可用来发消息）。"""
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            raise QQBotError(f"读不了文件：{exc}") from exc
+        if not data:
+            raise QQBotError("文件是空的")
+        if is_image:
+            data = _to_supported_image(data, path.suffix.lower())
+        cap = MAX_IMAGE_UPLOAD_BYTES if is_image else MAX_FILE_UPLOAD_BYTES
+        if len(data) > cap:
+            raise QQBotError(
+                f"{'图片' if is_image else '文件'} {len(data) / 1024 / 1024:.1f}MB "
+                f"超过平台上限 {cap // 1024 // 1024}MB"
+            )
+        body: dict[str, Any] = {
+            "file_type": file_type,
+            # 官方只认 base64 本体字符串（不带 data: 前缀）。
+            "file_data": base64.b64encode(data).decode("ascii"),
+            # false = 只上传不立刻发；发送由后面那条 msg_type 7 完成，
+            # 这样附件才是「跟着这一轮回复」走的，而不是凭空冒出来。
+            "srv_send_msg": False,
+        }
+        if not is_image:
+            # 文件不传 file_name，客户端里会显示成「未命名」。
+            body["file_name"] = path.name
+        kind = "groups" if scope == "group" else "users"
+        resp = await self._api(f"/v2/{kind}/{peer}/files", body=body)
+        info = ""
+        if isinstance(resp, dict):
+            info = str(resp.get("file_info") or "")
+        if not info:
+            raise QQBotError("上传没拿到 file_info（可能是格式或尺寸不合规）")
+        return info
+
+    # ---- 入站附件 -------------------------------------------------------
+    async def fetch_attachment(
+        self, att: dict[str, Any]
+    ) -> tuple[bytes, str] | None:
+        """下载一条入站附件（图片或文件）。官方把直链放在 ``attachments[].url``。"""
+        url = str(att.get("url") or "").strip()
+        if not url:
+            return None
+        name = str(att.get("filename") or att.get("name") or "qq-file.bin")
+        try:
+            token = await self._access_token()
+            resp = await self._http().get(
+                url, headers={"Authorization": f"QQBot {token}"}
+            )
+            if resp.status_code >= 400:
+                # CDN 直链本身是签过名的，偶尔不带鉴权头反而更顺；再裸试一次。
+                resp = await self._http().get(url)
+        except Exception as exc:
+            self.log(f"下载附件失败：{exc}", "warn")
+            return None
+        if resp.status_code >= 400 or not resp.content:
+            self.log(f"下载附件失败：HTTP {resp.status_code}", "warn")
+            return None
+        return resp.content, name
+
     # ---- 小工具 ---------------------------------------------------------
-    def _reserve_seq(self, msg: IncomingMessage | None, count: int) -> int | None:
+    def _reserve_seq(
+        self, msg: IncomingMessage | None, count: int, *, counts_as_reply: bool = True
+    ) -> int | None:
         """为同一条入站消息预留 ``count`` 个连续 ``msg_seq``，返回第一个。
 
         官方按 ``(msg_id, msg_seq)`` 判重，重复的会被静默丢弃；所以同一条消息
-        的每一次出站（流式分段、输入状态、命令提示）都要拿一个没人用过的号。
+        的每一次出站（流式分段、输入状态、命令提示、附件）都要拿一个没人用过的号。
         没有 ``msg_id`` 的主动消息不需要 seq，返回 ``None``。
+
+        ``counts_as_reply`` 只有输入状态会传 False —— 它占 ``msg_seq`` 但通常不算
+        一次被动回复，别让「正在输入」把次数额度也吃掉、又反过来误报超额。
         """
         if msg is None or not msg.message_id:
             return None
@@ -409,7 +572,33 @@ class QQAdapter(ChannelAdapter):
             self._seq_for_msg.pop(key, None)
         start, _at = self._seq_for_msg.get(msg.message_id, (1, now))
         self._seq_for_msg[msg.message_id] = (start + max(1, int(count)), now)
+        if counts_as_reply:
+            self._note_replies(msg, max(1, int(count)))
         return start
+
+    def _note_replies(self, msg: IncomingMessage, count: int) -> None:
+        """记账「这条入站消息已经回了几条」，逼近官方上限时告警一次。
+
+        官方对被动回复有次数限制（单聊 4 次 / 群聊 5 次）。**每张图、每个文件
+        都各占一次**，所以一次「带三张图的回答」很容易顶到天花板。顶到之后平台
+        只会静默失败 —— 与其让用户对着「怎么不回我了」发呆，不如提前说出来。
+        """
+        if not msg.message_id:
+            return
+        now = time.time()
+        expired = [k for k, (_, at) in self._replies.items() if now - at > DEDUP_TTL_SEC]
+        for key in expired:
+            self._replies.pop(key, None)
+        used, _at = self._replies.get(msg.message_id, (0, now))
+        used += count
+        self._replies[msg.message_id] = (used, now)
+        limit = PASSIVE_REPLY_LIMIT.get(msg.scope, 4)
+        if used == limit:
+            self.log(
+                f"这条消息已经回了 {used} 条（官方上限 {limit}），"
+                "再往后平台会静默失败 —— 附件/长回答要拆开发",
+                "warn",
+            )
 
     def _mark_seen(self, message_id: str) -> bool:
         """第一次见返回 True；重复推送返回 False。"""
@@ -474,6 +663,32 @@ def _attachments(data: dict[str, Any]) -> list[dict[str, Any]]:
     return [a for a in raw if isinstance(a, dict)] if isinstance(raw, list) else []
 
 
+def _to_supported_image(data: bytes, suffix: str) -> bytes:
+    """把平台不收的图片格式转成 PNG —— QQ 富媒体只认 png / jpg。
+
+    生图产物可能是 webp / bmp / avif，直接扔过去会被平台拒掉，而报错信息只有
+    「上传失败」，用户完全看不出是格式问题。所以在这里先转一道：PNG 保留透明
+    通道，比统一转 JPEG 更安全。
+
+    Pillow 缺失或解码失败就原样返回 —— 让平台自己报错，至少错误是真实的，而
+    不是被我们吞掉换成一句含糊的「转换失败」。
+    """
+    if suffix in (".png", ".jpg", ".jpeg"):
+        return data
+    try:
+        import io
+
+        from PIL import Image
+
+        with Image.open(io.BytesIO(data)) as im:
+            im.load()
+            buf = io.BytesIO()
+            im.save(buf, format="PNG")
+        return buf.getvalue()
+    except Exception:  # pragma: no cover - Pillow 缺失 / 文件损坏
+        return data
+
+
 def _as_int(value: Any) -> int | None:
     try:
         return int(value)
@@ -503,4 +718,8 @@ __all__ = [
     "TOKEN_URL",
     "API_BASE",
     "MAX_MESSAGE_CHARS",
+    "MAX_IMAGE_UPLOAD_BYTES",
+    "MAX_FILE_UPLOAD_BYTES",
+    "FILE_TYPE_IMAGE",
+    "FILE_TYPE_FILE",
 ]

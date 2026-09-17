@@ -2,12 +2,12 @@
   "id": "qq-bot",
   "name": "QQ 机器人",
   "icon": "🐧",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "OpenMinis",
   "category": "channel",
   "runtime": "engine",
   "driver": "qq",
-  "description": "把 QQ 官方机器人接进引擎：私聊与群内 @ 都能对话，用的是同一套模型、技能、工具与记忆，会话在网页端也能接着聊。",
+  "description": "把 QQ 官方机器人接进引擎：私聊与群内 @ 都能对话，用的是同一套模型、技能、工具与记忆，会话在网页端也能接着聊。图片与文件双向收发 —— 用户发来的图/文件会落进工作区让 agent 自己看，agent 生成的图与文件也会发回 QQ。",
   "fields": [
     {
       "key": "agentId",

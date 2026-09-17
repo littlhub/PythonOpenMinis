@@ -137,6 +137,13 @@ export function PluginCard({
       onNotice?.(`已安装插件「${r.plugin.name || plugin.id}」，填好配置后点启动`)
     })
 
+  /** 内置插件的清单更新 —— 已填的配置会保留，只把清单换成包内那份。 */
+  const doRefresh = () =>
+    run('refresh', async () => {
+      const r = await api.pluginInstall(plugin.id, true)
+      onNotice?.(`已把「${r.plugin.name || plugin.id}」的清单更新到内置版本（配置已保留）`)
+    })
+
   const doRemove = () => {
     if (!confirm(`卸载插件「${plugin.name}」？插件目录与它的配置都会被删除。`)) return
     return run('remove', async () => {
@@ -215,6 +222,12 @@ export function PluginCard({
         </div>
       </div>
 
+      {plugin.installed && plugin.outdated && (
+        <div className="note note-info" style={{ marginTop: 8 }}>
+          这个内置插件的清单有新版（可能多了配置项）。点「更新清单」换上，已填的配置会保留。
+        </div>
+      )}
+
       {plugin.installed && plugin.missing.length > 0 && (
         <div className="note note-warn" style={{ marginTop: 8 }}>
           还差必填项：{plugin.missing.join('、')}
@@ -228,6 +241,16 @@ export function PluginCard({
           </button>
         ) : (
           <>
+            {plugin.outdated && plugin.builtin && (
+              <button
+                className="plugin-btn primary"
+                disabled={busy !== ''}
+                title="用内置那版清单覆盖已装的，配置会保留"
+                onClick={() => void doRefresh()}
+              >
+                {busy === 'refresh' ? '更新中…' : '更新清单'}
+              </button>
+            )}
             {canStart &&
               (plugin.running ? (
                 <button className="plugin-btn" disabled={busy !== ''} onClick={() => void doAction('stop')}>

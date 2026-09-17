@@ -163,6 +163,11 @@ class PluginRuntime:
                 "runtime": manifest.runtime,
                 "driver": manifest.driver,
                 "builtin": manifest.builtin,
+                # 包内的清单比数据目录那份新 —— 界面上给一个「更新」入口，
+                # 否则新加的配置项永远不会出现（装过就不会自动跟着升级）。
+                "outdated": (
+                    manifest.builtin and store.builtin_outdated(pid)
+                ),
                 "config": store.public_config(pid),
                 "missing": store.missing_required(pid),
                 # 界面不用管 optionsFrom —— 这里已经解析成一组真实可选值。
