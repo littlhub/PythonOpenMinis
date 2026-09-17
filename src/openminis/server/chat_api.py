@@ -81,6 +81,10 @@ async def session_messages(session_id: str) -> dict[str, Any]:
                 "role": m.role,
                 "text": m.text,
                 "createdAt": m.createdAt,
+                # [T-tool-cards-persist-and-fold] 这一回合的工具调用记录：界面
+                # 据此把折叠工具卡画回来（刷新/切会话/重启后仍在）。它们不参与
+                # 模型上下文。
+                "runs": m.runs or [],
             }
             for m in rows
         ]

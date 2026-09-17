@@ -108,6 +108,15 @@ def _defaults() -> dict[str, Any]:
             # 形如 [{"instance": "<厂商实例 id>", "model": "<模型 id>"}, …]，
             # 顺序即优先级；空数组 = 不启用兜底。
             "fallbackModels": [],
+            # [T-tool-cards-persist-and-fold] 工具输出**进上下文**的上限。
+            # 工具调用本身在会话里是一张可展开的卡片（内容落库、刷新还在），
+            # 但喂给模型的那份不能一直是全文 —— 一次 read_file 几万字符、
+            # 一轮 shell 一大屏，上下文很快就被历史工具输出吃光。
+            #   toolKeepRecent      = 最近 N 条工具输出保持完整，更早的折成一行
+            #                         （0 = 不折叠，全部保留）
+            #   toolOutputMaxChars  = 单条输出进上下文的字符上限（0 = 不截断）
+            "toolKeepRecent": 6,
+            "toolOutputMaxChars": 8000,
         },
     }
 
@@ -513,6 +522,10 @@ class SettingsStore:
                     "maxToolSteps": (1, 1000),
                     # 长边上限：过小会糊到看不清，过大则吃上下文
                     "imageMaxEdge": (128, 8192),
+                    # 工具输出进上下文：最近 N 条完整（0 = 全部保留）
+                    "toolKeepRecent": (0, 200),
+                    # 单条工具输出上限（0 = 不截断）
+                    "toolOutputMaxChars": (0, 2_000_000),
                 }
                 for key, (lo, hi) in ints.items():
                     if key in raw:

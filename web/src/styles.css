@@ -1977,6 +1977,14 @@ button.link.danger {
 .tool-card.tool-err .tool-state { color: #b04545; }
 .tool-card.tool-running .tool-state { color: var(--accent); }
 
+/* 工具耗时（右上角，紧挨状态）—— 长任务一眼看出时间花在哪个工具上。 */
+.tool-ms {
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  flex: 0 0 auto;
+}
+
 /* 缩小显示（默认、全局记住）：只留一行，更紧凑。 */
 .tool-card.is-collapsed .tool-head {
   padding: 3px 10px;
@@ -5543,12 +5551,39 @@ dl.facts.usage-detail {
     padding-left: 64px;
   }
 
-  /* 顶栏收紧：会话选择器吃掉剩余宽度，右侧的「工具栏」开关绝不被挤掉 */
+  /* 顶栏收紧：会话选择器吃掉剩余宽度，右侧的「工具栏」开关绝不被挤掉。
+     ⚠ 这里**不能**用 overflow: hidden —— 会话下拉（.picker-pop）是顶栏里
+     absolute 定位的子元素，会被整块裁掉，表现就是「点了一下没反应、
+     会话列表不出现」。防溢出交给下面各子项的 min-width:0 + 省略号。 */
   .chat-topbar {
     padding: 6px 10px;
     gap: 6px;
     flex-wrap: nowrap;
-    overflow: hidden;
+    overflow: visible;
+  }
+
+  /* 会话下拉在窄屏吃满顶栏宽度：把 .picker 变成 static，让面板的定位基准
+     变成整条顶栏（原来是 180px 宽的小按钮，280px 的面板往左右一偏就出屏）。
+     行高也放大到拇指够用。 */
+  .chat-topbar .picker-pop {
+    left: 8px;
+    right: 8px;
+    top: calc(100% - 2px);
+    width: auto;
+    min-width: 0;
+    max-width: none;
+    max-height: 62vh;
+    overflow-y: auto;
+    z-index: 60;
+  }
+
+  .chat-topbar .picker-list {
+    max-height: none;
+  }
+
+  .chat-topbar .picker-list li {
+    padding: 10px 12px;
+    font-size: 13.5px;
   }
 
   /* 占位符换成"选择器自适应" —— 原来两边各撑一份 flex，窄屏下右上角的
@@ -5560,6 +5595,8 @@ dl.facts.usage-detail {
   .chat-topbar .picker {
     flex: 1 1 auto;
     min-width: 0;
+    /* 不设 relative：让下拉面板以整条顶栏为定位基准（见下面 .picker-pop） */
+    position: static;
   }
 
   .chat-topbar .picker-trigger {

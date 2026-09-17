@@ -45,6 +45,37 @@ def _guard_outbound(messages: list[LLMMessage], session_id: str) -> None:
     except Exception:  # pragma: no cover - 脱敏失败不该中断本轮
         logger.debug("outbound secret scan failed", exc_info=True)
 
+
+def _prepare_outbound(
+    messages: list[LLMMessage], session_id: str, opts: "AgentRuntimeOptions"
+) -> None:
+    """每次把 messages 交给 provider 之前的统一处理。
+
+    两件事，顺序有讲究：
+
+    1. **脱敏**（``_guard_outbound``）：凭据不能发出去。
+    2. **工具输出收敛**（``fold_tool_outputs``）：只让最近几轮的输出保持完整，
+       更早的折成一行。放在这里 —— 也就是「每一次真实请求之前」—— 而不是
+       ``run()`` 开头，是因为一轮里可能连着好几次请求（工具轮、空转收尾轮、
+       硬停总结轮），每一趟上下文都在变大。
+
+    折叠只改 ``ToolResult.content``，块本身保留：``tool_use`` 少了配对的
+    ``tool_result`` 会被 provider 判为非法请求。
+    """
+    _guard_outbound(messages, session_id)
+    if not (opts.tool_keep_recent or opts.tool_output_max_chars):
+        return
+    try:
+        from .tool_context import fold_tool_outputs
+
+        fold_tool_outputs(
+            messages,
+            keep_recent=opts.tool_keep_recent,
+            max_chars=opts.tool_output_max_chars,
+        )
+    except Exception:  # pragma: no cover - 收敛失败不该中断本轮
+        logger.debug("tool output fold failed", exc_info=True)
+
 logger = get_logger("agent.runtime")
 
 __all__ = ["AgentRuntime", "AgentChunkSink", "AgentRuntimeOptions", "MAX_AGENT_TURNS"]
@@ -128,6 +159,14 @@ class AgentRuntimeOptions:
     #: ``"kt"``  —— 原版：只跑 KT ToolLoopDetector 的四条策略（10/20/30），
     #:   不做额外拦截与自动收尾，循环由模型自己停或 max_turns 用尽结束。
     loop_mode: str = "react"
+    #: [T-tool-cards-persist-and-fold] 工具输出进上下文的上限。
+    #: ``tool_keep_recent`` —— 最近 N 条工具输出保持完整，更早的折成一行
+    #:   （0 = 不折叠，全部保留；原来的行为）。
+    #: ``tool_output_max_chars`` —— 单条输出的字符上限（0 = 不截断）。
+    #: 工具卡本身在会话里照旧完整可展开（那读的是落库原文），这里管的只是
+    #: 「喂给模型的那一份」。设置页 → 对话参数 → 工具输出进上下文。
+    tool_keep_recent: int = 6
+    tool_output_max_chars: int = 8000
 
 
 @dataclass(slots=True)
@@ -300,7 +339,7 @@ class AgentRuntime:
             # ── 1. stream the turn ─────────────────────────────────────────
             llm_started = time.monotonic()
             try:
-                _guard_outbound(messages, session_id)
+                _prepare_outbound(messages, session_id, opts)
                 stream = provider.stream_message(
                     messages,
                     opts.system_prompt,
@@ -578,7 +617,7 @@ class AgentRuntime:
                         for pass_tools in (finish_defs, None):
                             wrap_text: list[str] = []
                             wrap_calls: list[ToolUse] = []
-                            _guard_outbound(messages, session_id)
+                            _prepare_outbound(messages, session_id, opts)
                             stream = provider.stream_message(
                                 messages,
                                 opts.system_prompt,
@@ -696,7 +735,7 @@ class AgentRuntime:
                 ))
                 wrap_up: list[str] = []
                 try:
-                    _guard_outbound(messages, session_id)
+                    _prepare_outbound(messages, session_id, opts)
                     stream = provider.stream_message(
                         messages,
                         opts.system_prompt,
@@ -741,7 +780,7 @@ class AgentRuntime:
         ))
         summary: Optional[str] = None
         try:
-            _guard_outbound(messages, session_id)
+            _prepare_outbound(messages, session_id, opts)
             stream = provider.stream_message(
                 messages,
                 opts.system_prompt,

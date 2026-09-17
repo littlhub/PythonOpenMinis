@@ -65,6 +65,8 @@ export type ServerFrame =
       name: string
       ok: boolean
       output: string
+      /** 耗时（毫秒）。工具卡上显示「跑了多久」，长任务一眼看出慢在哪。 */
+      ms?: number
       /** 本次调用新生成、可直接预览的图片（本地绝对路径）—— 生图自动预览用。 */
       images?: string[]
     }
@@ -160,6 +162,23 @@ export interface ChatMessageInfo {
   role: 'user' | 'assistant'
   text: string
   createdAt: number
+  /** [T-tool-cards-persist-and-fold] 这一回合调用过的工具（有序），随消息落库。
+   *  界面据此把折叠工具卡画回来 —— 刷新、切会话、重启后端后依然在、能展开。
+   *  它们**不进模型上下文**：喂给模型的那份只取消息正文，且更早的输出会被
+   *  折成一行（设置 → 对话参数 → 工具输出进上下文）。 */
+  runs?: ToolRunInfo[]
+}
+
+/** 落库的一条工具调用记录。字段与 chat 帧的 toolStart/toolEnd 对齐。 */
+export interface ToolRunInfo {
+  id: string
+  name: string
+  input?: Record<string, unknown>
+  /** 成功与否。老数据可能没有。 */
+  ok?: boolean
+  output?: string
+  /** 耗时（毫秒），落库时由后端算好。 */
+  ms?: number
 }
 
 /** 群聊里的一个「发言人」（主代理 / 子代理 / 你）。 */
@@ -391,6 +410,10 @@ export interface AgentConfig {
   memoryOrganizeEvery?: number
   /** LLM 兜底模型链:主模型限流/超时/5xx 时按顺序自动切下一个. */
   fallbackModels?: { instance: string; model: string }[]
+  /** 工具输出进上下文:最近 N 条保持完整,更早的折成一行(0=不折叠). */
+  toolKeepRecent?: number
+  /** 单条工具输出进上下文的字符上限(0=不截断). */
+  toolOutputMaxChars?: number
 }
 
 export interface FetchModelsRequest {

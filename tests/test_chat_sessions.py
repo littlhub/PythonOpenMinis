@@ -65,6 +65,88 @@ async def test_sessions_ordered_newest_first_and_delete(isolated_chat_db):
 
 
 # ---------------------------------------------------------------------------
+# 工具卡持久化 [T-tool-cards-persist-and-fold]
+# ---------------------------------------------------------------------------
+_TOOL_RUN = {
+    "id": "call_1",
+    "name": "shell_execute",
+    "input": {"command": "pytest -q"},
+    "ok": True,
+    "output": "11 passed in 0.78s",
+    "ms": 780,
+}
+
+
+@pytest.mark.asyncio
+async def test_tool_runs_roundtrip_without_entering_context(isolated_chat_db):
+    """工具卡随回合落库（界面能画回来），但不进模型上下文。"""
+    s = await chat_store.create_session()
+    await chat_store.append_turn(s.id, "user", "跑个测试")
+    await chat_store.append_turn(
+        s.id, "assistant", "都过了。", runs=[_TOOL_RUN],
+    )
+
+    rows = await chat_store.load_messages(s.id)
+    assert rows[1].text == "都过了。"
+    assert rows[1].runs == [_TOOL_RUN]
+
+    # 上下文重建：只有正文，没有工具调用记录
+    hist = await chat_store.load_runtime_history(s.id)
+    assert [m.role.value for m in hist] == ["user", "assistant"]
+    assert hist[1].content == "都过了。"
+    assert "shell_execute" not in hist[1].content
+    assert "11 passed" not in hist[1].content
+
+
+@pytest.mark.asyncio
+async def test_tool_only_turn_still_persists_cards(isolated_chat_db):
+    """模型只调工具、没留下正文时，卡片也不能跟着回合一起消失。"""
+    s = await chat_store.create_session()
+    await chat_store.append_turn(s.id, "user", "看看目录")
+    await chat_store.append_turn(s.id, "assistant", "", runs=[_TOOL_RUN])
+
+    rows = await chat_store.load_messages(s.id)
+    assert len(rows) == 2
+    assert rows[1].text == "" and rows[1].runs == [_TOOL_RUN]
+
+
+@pytest.mark.asyncio
+async def test_plain_turn_stores_no_runs(isolated_chat_db):
+    s = await chat_store.create_session()
+    await chat_store.append_turn(s.id, "assistant", "纯文字")
+    assert (await chat_store.load_messages(s.id))[0].runs is None
+
+
+@pytest.mark.asyncio
+async def test_messages_api_returns_runs(isolated_chat_db):
+    import httpx
+
+    s = await chat_store.create_session()
+    await chat_store.append_turn(s.id, "assistant", "都过了。", runs=[_TOOL_RUN])
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        r = await c.get(f"/api/chats/sessions/{s.id}/messages")
+    msgs = r.json()["messages"]
+    assert msgs[0]["text"] == "都过了。"
+    assert msgs[0]["runs"] == [_TOOL_RUN]
+
+
+@pytest.mark.asyncio
+async def test_messages_api_defaults_runs_to_empty_list(isolated_chat_db):
+    """老消息（没有工具记录）也要给前端一个空数组，省得它到处判 undefined。"""
+    import httpx
+
+    s = await chat_store.create_session()
+    await chat_store.append_turn(s.id, "user", "只有文字")
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        r = await c.get(f"/api/chats/sessions/{s.id}/messages")
+    assert r.json()["messages"][0]["runs"] == []
+
+
+# ---------------------------------------------------------------------------
 # REST API
 # ---------------------------------------------------------------------------
 @pytest.mark.asyncio

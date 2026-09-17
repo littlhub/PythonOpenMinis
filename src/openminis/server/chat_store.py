@@ -41,6 +41,7 @@ __all__ = [
     "load_runtime_history",
     "drop_runtime",
     "parts_to_text",
+    "parts_to_runs",
     "TITLE_DEFAULT",
 ]
 
@@ -112,6 +113,37 @@ def _text_parts(text: str) -> str:
     return json.dumps([{"type": "text", "text": text}], ensure_ascii=False)
 
 
+#: [T-tool-cards-persist-and-fold] 工具调用记录在 ``parts_json`` 里的类型标签。
+#: 一条助手回合的 parts 形如 ``[{text}, {tool}…]`` —— 复用了 Room 时代就有的
+#: 「parts 数组」结构，因此**不需要加列、不需要迁移**；``parts_to_text`` 本来
+#: 就只挑 ``type == "text"`` 的部分，历史重建（进模型上下文的那条路）自动
+#: 忽略它们，这正是我们要的：卡片留在界面上，不进上下文。
+RUN_PART_TYPE = "tool"
+
+
+def _parts_with_runs(text: str, runs: list[dict[str, Any]] | None) -> str:
+    parts: list[dict[str, Any]] = [{"type": "text", "text": text}]
+    for run in runs or []:
+        if isinstance(run, dict) and run:
+            parts.append({"type": RUN_PART_TYPE, **run})
+    return json.dumps(parts, ensure_ascii=False)
+
+
+def parts_to_runs(parts_json: str) -> list[dict[str, Any]]:
+    """Extract the persisted tool-call records from a stored ``parts_json``."""
+    try:
+        parts = json.loads(parts_json or "[]")
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parts, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for p in parts:
+        if isinstance(p, dict) and p.get("type") == RUN_PART_TYPE:
+            out.append({k: v for k, v in p.items() if k != "type"})
+    return out
+
+
 @dataclass(frozen=True)
 class ChatSessionInfo:
     id: str
@@ -127,6 +159,10 @@ class ChatMessageInfo:
     role: str
     text: str
     createdAt: int
+    #: [T-tool-cards-persist-and-fold] 这一回合调用过的工具（有序）。工具卡在
+    #: 会话里要能一直看得见、能展开，所以随消息一起落库；它们**不进模型上下文**
+    #: （见 ``parts_to_text`` 只认 text part）。
+    runs: list[dict[str, Any]] | None = None
 
 
 async def ensure_db() -> None:
@@ -369,6 +405,7 @@ async def load_messages(session_id: str) -> list[ChatMessageInfo]:
                 role=r.role,
                 text=parts_to_text(r.parts_json),
                 createdAt=r.created_at,
+                runs=parts_to_runs(r.parts_json) or None,
             )
             for r in rows
         ]
@@ -379,6 +416,7 @@ async def append_turn(
     role: str,
     text: str,
     *,
+    runs: list[dict[str, Any]] | None = None,
     model_label: str | None = None,
     token_usage: str | None = None,
     model_id: str | None = None,
@@ -395,6 +433,11 @@ async def append_turn(
     column: joining on it re-attributed a session's whole history to whichever
     model it currently pointed at. ``token_usage`` is the serialised
     :class:`LLMUsage` JSON — only rows where it is non-NULL are billed rows.
+
+    [T-tool-cards-persist-and-fold] ``runs`` 是这一回合的工具调用记录（有序：
+    ``{id, name, input, ok, output, ms}``），与正文一同写进 ``parts_json``。
+    它们不会进模型上下文（``parts_to_text`` 只取 text part），只服务于界面上的
+    工具卡 —— 刷新、切会话、重启后端之后卡片依然在、依然能展开看原文。
     """
     await ensure_db()
     text = text.strip()
@@ -410,7 +453,9 @@ async def append_turn(
                 id=uuid.uuid4().hex,
                 session_id=session_id,
                 role=role,
-                parts_json=_text_parts(text),
+                parts_json=(
+                    _parts_with_runs(text, runs) if runs else _text_parts(text)
+                ),
                 created_at=now,
                 sort_order=order,
                 token_usage=token_usage,

@@ -579,5 +579,10 @@ def build_chat_setup(  # noqa: ANN201
         loop_mode=loop_mode,
         loop_detector=loop_detector,
         repeat_guard=repeat_guard,
+        # [T-tool-cards-persist-and-fold] 工具输出进上下文的上限：最近几轮保持
+        # 完整，更早的折成一行（工具卡在会话里照旧完整可展开，读的是落库原文）。
+        # 0/0 = 全部保留（旧行为）。
+        tool_keep_recent=int(agent_cfg.get("toolKeepRecent", 6) or 0),
+        tool_output_max_chars=int(agent_cfg.get("toolOutputMaxChars", 8000) or 0),
     )
     return provider, runtime, options, identity, conf

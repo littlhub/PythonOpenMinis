@@ -661,6 +661,21 @@ _RUNNING_CHATS: dict[str, asyncio.Task[None]] = {}
 #: 任务可能在跑完前被 GC 回收。
 _BG_TASKS: set[asyncio.Task[Any]] = set()
 
+#: [T-tool-cards-persist-and-fold] 工具卡落库时单条输出的上限。比推给前端的
+#: 4000 大一档（展开时能看到更多原文），但也不能无限 —— 一屏几十万字符的
+#: shell 输出会把库撑大，而且用户可以随时重跑那条命令。
+_TOOL_RUN_OUTPUT_MAX = 8000
+
+
+def _clip_tool_output(text: str) -> str:
+    """工具输出落库前的收口（超出上限只留开头，并说明截断）。"""
+    if len(text) <= _TOOL_RUN_OUTPUT_MAX:
+        return text
+    return (
+        f"{text[:_TOOL_RUN_OUTPUT_MAX]}\n"
+        f"…(输出过长已截断：共 {len(text)} 字符，此处保留前 {_TOOL_RUN_OUTPUT_MAX})"
+    )
+
 
 def _spawn_bg(coro: Any) -> asyncio.Task[Any]:
     """起一个后台任务并保活引用，跑完自动出清。"""
@@ -897,6 +912,11 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
     pending_tool_started: dict[str, float] = {}
     #: 本轮自动生成的图片（绝对路径，去重），落库时补进回复正文。
     generated_images: list[str] = []
+    #: [T-tool-cards-persist-and-fold] 本回合的工具调用记录（按调用先后有序）。
+    #: 随助手回合一起落库 —— 界面上的工具卡因此刷新、切会话、重启后端之后
+    #: 依然在、依然能展开看原文；而它们**不会进模型上下文**（那条路只读 text
+    #: part，见 ``chat_store.parts_to_text``）。
+    tool_runs: dict[str, dict[str, Any]] = {}
 
     async def sink(chunk: object) -> None:
         if isinstance(chunk, LLMStreamChunk.Text):
@@ -909,6 +929,11 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
             # 以及「本次调用新落盘的图」是哪几张（自动预览用）。
             pending_tool_args[chunk.id] = chunk.args or {}
             pending_tool_started[chunk.id] = time.time()
+            tool_runs[chunk.id] = {
+                "id": chunk.id,
+                "name": chunk.name,
+                "input": chunk.args or {},
+            }
             await _safe_send(client_id, {
                 "type": "toolStart",
                 "id": chunk.id,
@@ -918,7 +943,8 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
             })
         elif isinstance(chunk, LLMStreamChunk.ToolResult):
             # Final state of that tool call: success / error + truncated body.
-            body = chunk.content or ""
+            raw = chunk.content or ""
+            body = raw
             if len(body) > 4000:
                 body = body[:4000] + "\n…(输出过长已截断)"
             frame: dict[str, Any] = {
@@ -928,6 +954,18 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
                 "ok": not chunk.is_error,
                 "output": body,
             }
+            elapsed_ms = None
+            _started = pending_tool_started.get(chunk.id)
+            if _started is not None:
+                elapsed_ms = int((time.time() - _started) * 1000)
+                frame["ms"] = elapsed_ms
+            # 落库那份（工具卡展开时看的）：上限比线上帧宽一档。
+            run = tool_runs.get(chunk.id)
+            if run is not None:
+                run["ok"] = not chunk.is_error
+                run["output"] = _clip_tool_output(raw)
+                if elapsed_ms is not None:
+                    run["ms"] = elapsed_ms
             # 生图调用成功 → 顺手把本次新产生的图片路径带上，前端自动预览。
             # 生图脚本只打印文件名，模型又常常忘记写 `![](路径)` —— 前端拿不到
             # 可渲染路径时用户「图生成了但看不到」。
@@ -1018,9 +1056,15 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
             # 生图自动交付：模型忘了写 `![](路径)` 时补上，保证刷新/切换会话后
             # 图片依然能渲染（即时那份由前端 toolEnd 帧的自动预览负责）。
             final_text = append_image_refs(final_text, generated_images)
-            if final_text.strip():
+            runs = list(tool_runs.values())
+            # 没有正文但有工具调用（模型只调工具就收工）也要落库：否则那一回合
+            # 连同它的一堆工具卡一起消失，用户回头无从回看。空正文的行在重建
+            # 上下文时被跳过（``load_runtime_history`` 只收有文字的），所以这
+            # 不会往模型上下文里塞空气。
+            if final_text.strip() or runs:
                 await chat_store.append_turn(
                     sid, "assistant", final_text,
+                    runs=runs or None,
                     model_label=model_label,
                     token_usage=(
                         json.dumps(usage_meter) if any(usage_meter.values()) else None

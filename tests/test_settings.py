@@ -746,6 +746,46 @@ def test_image_max_edge_clamped(store):
     assert store.agent_config()["imageMaxEdge"] == 1024
 
 
+# ---------------------------------------------------------------------------
+# 工具输出进上下文 [T-tool-cards-persist-and-fold]
+# ---------------------------------------------------------------------------
+def test_tool_context_defaults(store):
+    cfg = store.agent_config()
+    assert cfg["toolKeepRecent"] == 6
+    assert cfg["toolOutputMaxChars"] == 8000
+
+
+def test_tool_context_keys_clamped(store):
+    store.apply_full({"agent": {"toolKeepRecent": 3, "toolOutputMaxChars": 2000}})
+    cfg = store.agent_config()
+    assert cfg["toolKeepRecent"] == 3 and cfg["toolOutputMaxChars"] == 2000
+
+    # 负数压到 0（0 = 关闭折叠/不截断），过大的值压到上限
+    store.apply_full({"agent": {"toolKeepRecent": -5, "toolOutputMaxChars": -1}})
+    cfg = store.agent_config()
+    assert cfg["toolKeepRecent"] == 0 and cfg["toolOutputMaxChars"] == 0
+
+    store.apply_full({"agent": {"toolKeepRecent": 9999, "toolOutputMaxChars": 10**9}})
+    cfg = store.agent_config()
+    assert cfg["toolKeepRecent"] == 200
+    assert cfg["toolOutputMaxChars"] == 2_000_000
+
+
+def test_tool_context_keys_feed_the_runtime_options(store):
+    """设置值要真的传到 AgentRuntimeOptions（否则页面白给）。"""
+    from openminis.settings.chat_service import build_chat_setup
+
+    store.apply_full({
+        "providers": [{"id": "gw", "type": "openAI", "apiKey": "k",
+                       "model": "gpt-4o", "baseUrl": "https://x/v1"}],
+        "activeProviderId": "gw",
+        "agent": {"toolKeepRecent": 2, "toolOutputMaxChars": 1500},
+    })
+    _, _, options, _, _ = build_chat_setup(store)
+    assert options.tool_keep_recent == 2
+    assert options.tool_output_max_chars == 1500
+
+
 def test_image_context_discipline_switches_with_mode(store):
     from openminis.settings.chat_service import (
         IMAGE_INLINE_DISCIPLINE,

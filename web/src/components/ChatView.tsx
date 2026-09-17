@@ -223,6 +223,8 @@ interface ToolCallCard {
   input: Record<string, unknown>
   ok?: boolean
   output?: string
+  /** 耗时（毫秒）。实时帧与落库记录都带，历史工具卡也能显示。 */
+  ms?: number
 }
 
 // ---------------------------------------------------------------------------
@@ -687,7 +689,17 @@ export function ChatView({
             id: m.id,
             role: m.role,
             text: m.text,
-            toolCalls: [],
+            // [T-tool-cards-persist-and-fold] 工具卡随消息一起落库了 —— 把
+            // 它们画回来（默认折叠，点开看调用参数与输出）。这些内容不进
+            // 模型上下文，只服务于「刚才到底干了什么」这件事。
+            toolCalls: (m.runs ?? []).map<ToolCallCard>((r) => ({
+              id: r.id,
+              name: r.name,
+              input: r.input ?? {},
+              ok: r.ok,
+              output: r.output,
+              ms: r.ms,
+            })),
           })),
         )
       } catch (e) {
@@ -811,7 +823,7 @@ export function ChatView({
             const tail = list[i]
             const cards = (tail.toolCalls ?? []).map((c) =>
               c.id === frame.id
-                ? { ...c, ok: frame.ok, output: frame.output }
+                ? { ...c, ok: frame.ok, output: frame.output, ms: frame.ms }
                 : c,
             )
             // 生图自动预览：后端把本次新生成的图片路径带在 toolEnd 上，
@@ -1891,6 +1903,9 @@ function ToolCard({ call }: { call: ToolCallCard }) {
         <span className="tool-state">
           {state === 'running' ? '执行中…' : state === 'ok' ? '✓' : '✗'}
         </span>
+        {call.ms !== undefined && (
+          <span className="tool-ms">{formatMs(call.ms)}</span>
+        )}
         <span className="tool-caret" aria-hidden="true">
           {open ? '⌃' : '⌄'}
         </span>
@@ -1919,6 +1934,16 @@ function iconFor(name: string): string {
   if (name.includes('search')) return '🔍'
   if (name.includes('browser')) return '🌐'
   return '🔧'
+}
+
+/** 工具耗时显示：不足 1 秒给毫秒，1 分钟内给一位小数的秒，再长给分秒。 */
+function formatMs(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return ''
+  if (ms < 1000) return `${Math.round(ms)}ms`
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`
+  const m = Math.floor(ms / 60_000)
+  const s = Math.round((ms % 60_000) / 1000)
+  return `${m}m${s}s`
 }
 
 function Composer({

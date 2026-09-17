@@ -1432,6 +1432,60 @@ export function AgentConfigPage(props: { onBack: () => void }) {
             </div>
           </SectionCard>
 
+          <SectionCard
+            title="工具调用与上下文"
+            hint="工具卡在会话里一直留着、可展开看原文；这里管的是「喂给模型的那一份」。"
+          >
+            <Note>
+              工具调用在会话里是一张**默认折叠的卡片**（点开能看调用参数与完整
+              输出，刷新、切会话、重启后端都还在），但它**不整包占着模型上下文** ——
+              只有最近几条的输出保持完整，更早的会折成一行说明。一次读大文件、
+              一屏命令行输出，都能把上下文吃光，这是长任务跑着跑着「变傻/变慢」的
+              常见原因。
+            </Note>
+            <div className="provider-fields">
+              <label className="wide">
+                <span>完整保留最近几条工具输出</span>
+                <input
+                  type="number"
+                  min={0}
+                  max={200}
+                  value={cfg.toolKeepRecent ?? 6}
+                  onChange={(e) =>
+                    setCfg({
+                      ...cfg,
+                      toolKeepRecent: Math.max(0, Number(e.target.value) || 0),
+                    })
+                  }
+                />
+                <span className="muted" style={{ fontSize: 12 }}>
+                  更早的工具输出折成一行（保留开头一小段当索引），需要时模型会
+                  重新调工具、你也可以展开卡片看原文；填 0 ＝ 全部保留（旧行为）
+                </span>
+              </label>
+              <label className="wide">
+                <span>单条工具输出上限（字符）</span>
+                <input
+                  type="number"
+                  min={0}
+                  max={2000000}
+                  step={1000}
+                  value={cfg.toolOutputMaxChars ?? 8000}
+                  onChange={(e) =>
+                    setCfg({
+                      ...cfg,
+                      toolOutputMaxChars: Math.max(0, Number(e.target.value) || 0),
+                    })
+                  }
+                />
+                <span className="muted" style={{ fontSize: 12 }}>
+                  超过就只留开头；填 0 ＝ 不截断。想让它读完整文件就调大（代价是
+                  每条工具结果都按这个尺寸进上下文）
+                </span>
+              </label>
+            </div>
+          </SectionCard>
+
           <SectionCard title="兜底模型">
             <Note>
               主模型被限流（429）、超时或网关 5xx 时，按下面的顺序自动换模型重试。
