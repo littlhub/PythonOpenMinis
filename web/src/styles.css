@@ -1923,6 +1923,83 @@ button.link.danger {
 }
 
 /* ---------- tool cards ---------- */
+/* 整段工具调用收成一行：20 次调用 = 1 行，点开才逐条列（每条再各自折叠）。 */
+.tool-group {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg);
+  overflow: hidden;
+  margin-top: 4px;
+  font-size: 13px;
+}
+.tool-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  /* 收起态对齐单卡的 is-collapsed（默认就是收起的） */
+  padding: 3px 10px;
+  text-align: left;
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--text);
+  font-family: inherit;
+}
+.tool-group.is-open .tool-group-head {
+  padding: 8px 12px;
+  font-size: 13px;
+}
+.tool-group-title {
+  flex: 1;
+  font-weight: 500;
+  white-space: nowrap;
+}
+.tool-group-count {
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+.tool-group-state {
+  display: inline-flex;
+  gap: 6px;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--muted);
+}
+.tool-group.is-collapsed .tool-group-state {
+  font-size: 11px;
+}
+.tool-group-run {
+  color: var(--accent);
+}
+.tool-group-cur {
+  font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+  opacity: 0.8;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tool-group-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border-top: 1px dashed var(--border);
+}
+/* 组内的单卡退一层：常态无边框靠缩进分层，异常色仍保留。 */
+.tool-group-body .tool-card {
+  border-color: transparent;
+  background: var(--panel);
+}
+.tool-group-body .tool-card.tool-err {
+  border-color: #efd0d0;
+}
+.tool-group-body .tool-card.tool-running {
+  border-color: var(--accent);
+}
+
 .tool-stack {
   display: flex;
   flex-direction: column;
@@ -5765,6 +5842,17 @@ dl.facts.usage-detail {
     display: block;
     width: 28px;
     font-size: 15px;
+  }
+
+  /* 工具组头在窄屏只留「执行中…」：工具名一长会把耗时和箭头挤出屏幕 */
+  .tool-group-cur {
+    display: none;
+  }
+
+  .tool-group-title,
+  .tool-group-state {
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 }
 

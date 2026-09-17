@@ -85,6 +85,9 @@ async def session_messages(session_id: str) -> dict[str, Any]:
                 # 据此把折叠工具卡画回来（刷新/切会话/重启后仍在）。它们不参与
                 # 模型上下文。
                 "runs": m.runs or [],
+                # [T-subagent-log-persist] 子代理过程的身份与正文（有才是子代理
+                # 消息）。正文不在 text 里，同样不进模型上下文。
+                "sub": m.sub,
             }
             for m in rows
         ]

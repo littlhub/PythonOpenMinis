@@ -38,10 +38,12 @@ __all__ = [
     "delete_session",
     "load_messages",
     "append_turn",
+    "append_sub_turn",
     "load_runtime_history",
     "drop_runtime",
     "parts_to_text",
     "parts_to_runs",
+    "parts_to_sub",
     "TITLE_DEFAULT",
 ]
 
@@ -144,6 +146,66 @@ def parts_to_runs(parts_json: str) -> list[dict[str, Any]]:
     return out
 
 
+#: [T-subagent-log-persist] 子代理过程在 ``parts_json`` 里的两个类型标签。
+#:
+#: 一次子代理委派落成一条 assistant 行：``[{submeta}, {subtext}…, {tool}…]``。
+#: 它的正文刻意**不写成 ``text`` part** —— ``parts_to_text``（界面正文 +
+#: 模型上下文都靠它）只认 ``text``，于是子代理过程与它的工具卡一样：
+#: 会话里看得见、能展开，但永远不进模型上下文。零迁移，和历史数据并存。
+SUB_META_TYPE = "submeta"
+SUB_TEXT_TYPE = "subtext"
+
+
+def _sub_parts(
+    speaker: dict[str, Any] | None,
+    task: str,
+    room_id: str,
+    text: str,
+    runs: list[dict[str, Any]] | None,
+) -> str:
+    parts: list[dict[str, Any]] = [{
+        "type": SUB_META_TYPE,
+        "speaker": speaker or {},
+        "task": task or "",
+        "roomId": room_id or "",
+    }]
+    if text:
+        parts.append({"type": SUB_TEXT_TYPE, "text": text})
+    for run in runs or []:
+        if isinstance(run, dict) and run:
+            parts.append({"type": RUN_PART_TYPE, **run})
+    return json.dumps(parts, ensure_ascii=False)
+
+
+def parts_to_sub(parts_json: str) -> dict[str, Any] | None:
+    """子代理消息的身份与正文；不是子代理消息就返回 ``None``。"""
+    try:
+        parts = json.loads(parts_json or "[]")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parts, list):
+        return None
+    meta: dict[str, Any] | None = None
+    chunks: list[str] = []
+    for p in parts:
+        if not isinstance(p, dict):
+            continue
+        kind = p.get("type")
+        if kind == SUB_META_TYPE and meta is None:
+            meta = p
+        elif kind == SUB_TEXT_TYPE:
+            chunks.append(str(p.get("text") or ""))
+    if meta is None:
+        return None
+    speaker = meta.get("speaker")
+    return {
+        "speaker": speaker if isinstance(speaker, dict) else {},
+        "task": str(meta.get("task") or ""),
+        "roomId": str(meta.get("roomId") or ""),
+        "text": "".join(chunks),
+    }
+
+
 @dataclass(frozen=True)
 class ChatSessionInfo:
     id: str
@@ -163,6 +225,9 @@ class ChatMessageInfo:
     #: 会话里要能一直看得见、能展开，所以随消息一起落库；它们**不进模型上下文**
     #: （见 ``parts_to_text`` 只认 text part）。
     runs: list[dict[str, Any]] | None = None
+    #: [T-subagent-log-persist] 子代理消息：``{speaker, task, roomId, text}``。
+    #: 正文在 ``subtext`` part 里（``text`` 字段因此是空的），所以同样不进上下文。
+    sub: dict[str, Any] | None = None
 
 
 async def ensure_db() -> None:
@@ -406,9 +471,49 @@ async def load_messages(session_id: str) -> list[ChatMessageInfo]:
                 text=parts_to_text(r.parts_json),
                 createdAt=r.created_at,
                 runs=parts_to_runs(r.parts_json) or None,
+                sub=parts_to_sub(r.parts_json),
             )
             for r in rows
         ]
+
+
+async def append_sub_turn(
+    session_id: str,
+    *,
+    speaker: dict[str, Any] | None,
+    task: str,
+    room_id: str,
+    text: str,
+    runs: list[dict[str, Any]] | None = None,
+) -> None:
+    """把子代理的一次委派过程（发言 + 它调用的工具）落库。
+
+    [T-subagent-log-persist] 原先子代理过程只在推流帧里活着，刷新/切会话/
+    重启后端之后就没了 —— 开着子代理时「工具调用切窗口就消失」的根因。
+    这里落成一条 assistant 行，但正文放 ``subtext`` part：既能回放，又
+    不会挤进模型上下文（历史重建只收 text part）。
+
+    刻意**不更新**会话的 last_message / updatedAt：子代理那句话不是用户
+    看到的答复，别让侧边栏预览变成它的自言自语。
+    """
+    await ensure_db()
+    text = (text or "").strip()
+    now = _now_ms()
+    async with _get_db().session() as s:
+        dao = ChatDao(s)
+        if await dao.get_session(session_id) is None:
+            return
+        order = await dao.next_sort_order(session_id)
+        await dao.insert_message(
+            MessageEntity(
+                id=uuid.uuid4().hex,
+                session_id=session_id,
+                role="assistant",
+                parts_json=_sub_parts(speaker, task, room_id, text, runs),
+                created_at=now,
+                sort_order=order,
+            )
+        )
 
 
 async def append_turn(

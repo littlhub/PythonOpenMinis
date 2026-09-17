@@ -60,6 +60,7 @@ from ..skills import SkillStore
 from ..agent.repeat_guard import looks_like_image_generation
 from . import chat_api, compaction, fs_api, scheduled_api, workspaces, chat_store
 from .media_scan import append_image_refs, collect_recent_images
+from .sub_turn_log import SubTurnRecorder
 from .knowledge_api import router as knowledge_router
 from .guard_api import router as guard_router
 from .marketplace_api import router as marketplace_router
@@ -677,6 +678,27 @@ def _clip_tool_output(text: str) -> str:
     )
 
 
+async def _persist_sub_turns(sid: str, recorder: SubTurnRecorder) -> None:
+    """[T-subagent-log-persist] 把本轮子代理过程落库（在最终答复之前）。
+
+    顺序很关键：这些行要插在「本条提问」之后、「最终答复」之前，回放才自然。
+    落库失败绝不影响本轮对话 —— 它们只服务「回看子代理到底干了什么」。
+    """
+    try:
+        for turn in recorder.turns():
+            payload = turn.as_payload()
+            await chat_store.append_sub_turn(
+                sid,
+                speaker=payload["speaker"],
+                task=payload["task"],
+                room_id=payload["roomId"],
+                text=payload["text"],
+                runs=payload["runs"] or None,
+            )
+    except Exception:  # pragma: no cover - 只记日志，不能打断对话
+        logger.debug("subagent transcript persist failed", exc_info=True)
+
+
 def _spawn_bg(coro: Any) -> asyncio.Task[Any]:
     """起一个后台任务并保活引用，跑完自动出清。"""
     task = asyncio.create_task(coro)
@@ -1036,7 +1058,17 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
         # 于是 subagents.run_subagent 不用改签名就能把过程推出去。
         from ..agent.subagent_events import reset_emitter, set_emitter
 
-        emitter_token = set_emitter(lambda ev: _safe_send(client_id, ev))
+        #: [T-subagent-log-persist] 顺路把子代理过程攒下来落库 —— 原先它只活在
+        #: 推流帧里，刷新页面、重连后重拉历史、重启后端之后整段消失（连它调过的
+        #: 那堆工具卡一起）。开着子代理时，绝大部分工具调用其实发生在这里，
+        #: 所以「工具卡切窗口就不见了」的根因就在这一段。
+        sub_turns = SubTurnRecorder()
+
+        async def _on_agent_event(ev: dict[str, Any]) -> None:
+            sub_turns.on_event(ev)
+            await _safe_send(client_id, ev)
+
+        emitter_token = set_emitter(_on_agent_event)
         try:
             await runtime.run(
                 provider,
@@ -1046,6 +1078,7 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
             )
         finally:
             reset_emitter(emitter_token)
+            await _persist_sub_turns(sid, sub_turns)
         # persist the final assistant text (intermediate tool rounds live only
         # in the in-process transcript cache)
         tail = messages[-1] if messages else None

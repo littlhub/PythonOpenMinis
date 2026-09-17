@@ -685,28 +685,53 @@ export function ChatView({
         const data = await api.chatMessages(sid)
         if (!force && msgsRef.current[sid]) return
         patchMsgs(sid, () =>
-          data.messages.map<UiMessage>((m: ChatMessageInfo) => ({
-            id: m.id,
-            role: m.role,
-            text: m.text,
+          data.messages.flatMap<UiMessage>((m: ChatMessageInfo) => {
             // [T-tool-cards-persist-and-fold] 工具卡随消息一起落库了 —— 把
             // 它们画回来（默认折叠，点开看调用参数与输出）。这些内容不进
             // 模型上下文，只服务于「刚才到底干了什么」这件事。
-            toolCalls: (m.runs ?? []).map<ToolCallCard>((r) => ({
+            const runs = (m.runs ?? []).map<ToolCallCard>((r) => ({
               id: r.id,
               name: r.name,
               input: r.input ?? {},
               ok: r.ok,
               output: r.output,
               ms: r.ms,
-            })),
-          })),
+            }))
+            // [T-subagent-log-persist] 子代理那段过程也落库了：重建发言人
+            // 与它的工具卡。原先只有实时帧里有，切窗口/刷新就整段消失 ——
+            // 开着子代理时，绝大部分工具调用其实发生在子代理里。
+            if (m.sub) {
+              const sp: Speaker = {
+                id: m.sub.speaker?.subagentId || m.sub.speaker?.id || 'sub',
+                name: m.sub.speaker?.name || '子代理',
+                emoji: m.sub.speaker?.emoji || '🤖',
+                kind: 'sub',
+                project: m.sub.speaker?.project || undefined,
+              }
+              rememberSub(sid, sp)
+              return [
+                {
+                  id: m.id,
+                  role: 'assistant' as const,
+                  text: m.sub.text ?? '',
+                  speaker: sp,
+                  roomId: m.sub.roomId || undefined,
+                  subTask: m.sub.task || undefined,
+                  subTools: runs,
+                  subDone: true,
+                },
+              ]
+            }
+            return [
+              { id: m.id, role: m.role, text: m.text, toolCalls: runs },
+            ]
+          }),
         )
       } catch (e) {
         setError(String((e as Error).message), sid)
       }
     },
-    [patchMsgs, setError],
+    [patchMsgs, rememberSub, setError],
   )
 
   useEffect(() => {
@@ -1841,20 +1866,12 @@ function Bubble({
         </div>
       )}
       {msg.toolCalls && msg.toolCalls.length > 0 && (
-        <div className="tool-stack">
-          {msg.toolCalls.map((tc) => (
-            <ToolCard key={tc.id} call={tc} />
-          ))}
-        </div>
+        <ToolStack calls={msg.toolCalls} />
       )}
       {/* 子代理在自己的循环里调的工具（read_image / shell / 检索…）——
           让「它到底干了什么」可见，而不是只有一个最终答复。 */}
       {isSub && msg.subTools && msg.subTools.length > 0 && (
-        <div className="tool-stack">
-          {msg.subTools.map((tc) => (
-            <ToolCard key={tc.id} call={tc} />
-          ))}
-        </div>
+        <ToolStack calls={msg.subTools} />
       )}
     </div>
   )
@@ -1883,6 +1900,113 @@ function writeToolOpen(open: boolean): void {
   } catch {
     /* 隐私模式下写不了，忽略 */
   }
+}
+
+/** 整段工具调用（同一回合里连着调的那批）的展开状态 —— 同样是纯 UI 偏好。 */
+const TOOL_GROUP_OPEN_KEY = 'openminis:tool-group-open'
+
+function readGroupOpen(): boolean {
+  try {
+    return localStorage.getItem(TOOL_GROUP_OPEN_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+function writeGroupOpen(open: boolean): void {
+  try {
+    localStorage.setItem(TOOL_GROUP_OPEN_KEY, open ? '1' : '0')
+  } catch {
+    /* 隐私模式下写不了，忽略 */
+  }
+}
+
+/**
+ * 一段工具调用的容器 —— **整段收成一行**。
+ *
+ * 一次任务常常连着调十几二十次工具，逐张铺开就是几十行噪音，把回答本身挤没了。
+ * 所以 ≥2 次调用时收成一行（`🔧 工具调用 ×20 · 全部完成 ✓ · 1.4s`），点开才逐条
+ * 列出，每条再各自折叠/展开（看参数与输出）。
+ *
+ * **正在跑的时候默认展开**（过程要看得见），一轮跑完自动收起 —— 除非你手动点过，
+ * 那就听你的（偏好全局记住）。折叠只写 localStorage：**不进上下文、不影响模型
+ * 看到的工具结果**，纯粹是「你想不想看」。
+ */
+function ToolStack({ calls }: { calls: ToolCallCard[] }) {
+  const running = calls.some((c) => c.ok === undefined)
+  const failed = calls.filter((c) => c.ok === false).length
+  // 跑着 → 展开看进度；已完成 → 收起（尊重上次的手动选择）。
+  const [open, setOpen] = useState<boolean>(() => running || readGroupOpen())
+  /** 手动点过就不自动收起 —— 别跟人抢开关。 */
+  const touched = useRef(false)
+
+  useEffect(() => {
+    // 跑完回到「偏好」：默认是收起（整段变一行）；上次手动展开过的则保持展开。
+    if (!touched.current && !running) setOpen(readGroupOpen())
+  }, [running])
+
+  // 只有一次调用就别套一层壳了 —— 一张卡自成一组没意义。
+  if (calls.length <= 1) {
+    return (
+      <div className="tool-stack">
+        {calls.map((c) => (
+          <ToolCard key={c.id} call={c} />
+        ))}
+      </div>
+    )
+  }
+
+  const totalMs = calls.reduce((n, c) => n + (c.ms ?? 0), 0)
+  const last = calls[calls.length - 1]
+  // 整段都是同一个工具 → 用它的图标；混着调就统一用扳手。
+  const icon = calls.every((c) => c.name === calls[0].name) ? iconFor(calls[0].name) : '🔧'
+
+  return (
+    <div className={`tool-group${open ? ' is-open' : ' is-collapsed'}`}>
+      <button
+        className="tool-group-head"
+        type="button"
+        aria-expanded={open}
+        onClick={() => {
+          touched.current = true
+          setOpen((v) => {
+            const next = !v
+            writeGroupOpen(next)
+            return next
+          })
+        }}
+      >
+        <span className="tool-glyph">{icon}</span>
+        <span className="tool-group-title">
+          工具调用 <span className="tool-group-count">×{calls.length}</span>
+        </span>
+        <span className="tool-group-state">
+          {running ? (
+            <>
+              <span className="tool-group-run">执行中…</span>
+              {/* 窄屏用 CSS 把这半截藏掉，只留「执行中…」 */}
+              <span className="tool-group-cur">{last?.name ?? ''}</span>
+            </>
+          ) : failed > 0 ? (
+            `✓ ${calls.length - failed} ✗ ${failed}`
+          ) : (
+            '全部完成 ✓'
+          )}
+        </span>
+        {totalMs > 0 && <span className="tool-ms">{formatMs(totalMs)}</span>}
+        <span className="tool-caret" aria-hidden="true">
+          {open ? '⌃' : '⌄'}
+        </span>
+      </button>
+      {open && (
+        <div className="tool-group-body">
+          {calls.map((c) => (
+            <ToolCard key={c.id} call={c} />
+          ))}
+        </div>
+      )}
+    </div>
+  )
 }
 
 function ToolCard({ call }: { call: ToolCallCard }) {

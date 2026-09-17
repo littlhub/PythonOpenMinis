@@ -167,6 +167,26 @@ export interface ChatMessageInfo {
    *  它们**不进模型上下文**：喂给模型的那份只取消息正文，且更早的输出会被
    *  折成一行（设置 → 对话参数 → 工具输出进上下文）。 */
   runs?: ToolRunInfo[]
+  /** [T-subagent-log-persist] 子代理的一段过程（有值才是子代理消息）。
+   *  它的发言与工具调用原先只活在推流帧里，切窗口/刷新就没了；现在随消息
+   *  落库，回放时重建出子代理气泡。同样**不进模型上下文**（正文不在 text 里）。 */
+  sub?: SubTurnInfo | null
+}
+
+/** 落库的一段子代理过程（一次委派 = 一条）。 */
+export interface SubTurnInfo {
+  speaker?: {
+    id?: string
+    subagentId?: string
+    name?: string
+    emoji?: string
+    project?: string
+  }
+  /** 主代理交给它的任务。 */
+  task?: string
+  /** 外层那次 `subagent_delegate` 调用的 id。 */
+  roomId?: string
+  text?: string
 }
 
 /** 落库的一条工具调用记录。字段与 chat 帧的 toolStart/toolEnd 对齐。 */
