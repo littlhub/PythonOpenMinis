@@ -1252,3 +1252,58 @@ async def test_channel_media_fallback_uses_sandbox_path(data_dir):
     assert ok is False
     assert adapter.sent and "C:" not in adapter.sent[0]
     assert adapter.sent[0].startswith("[图片] /var/minis/workspace/")
+
+
+def test_qq_collects_attachments_from_msg_elements():
+    """引用回复/图文混排时附件挂在 msg_elements 里，也要收。
+
+    少收这一处，用户看到的就是「我明明发了图，机器人说没看到」。
+    """
+    from openminis.plugins.drivers.qq import describe_inbound, normalize_event
+
+    data = {
+        "author": {"member_openid": "U1"},
+        "group_openid": "G1",
+        "content": "<@!BOT1> 识图",
+        "id": "m1",
+        "msg_elements": [
+            {"msg_idx": "REFIDX_a", "content": "看这张"},
+            {"msg_idx": "REFIDX_b",
+             "attachments": [{"content_type": "image/jpeg", "url": "https://cdn/a.jpg",
+                              "filename": "a.jpg"}]},
+        ],
+    }
+    msg = normalize_event("GROUP_AT_MESSAGE_CREATE", data)
+    assert msg is not None
+    assert len(msg.attachments) == 1
+    assert msg.attachments[0]["url"] == "https://cdn/a.jpg"
+    assert msg.text == "识图"                       # @ 占位符被清掉
+    info = describe_inbound(data)
+    assert "附件 1" in info and "msg_elements 2" in info
+
+
+def test_qq_content_mention_placeholder_is_stripped():
+    from openminis.plugins.drivers.qq import normalize_event
+
+    msg = normalize_event("C2C_MESSAGE_CREATE", {
+        "author": {"user_openid": "U"},
+        "content": "<@!E4F4AEA33253A2797FB897C50B81D7ED>   帮我看看",
+        "id": "m2",
+    })
+    assert msg is not None
+    assert msg.text == "帮我看看"
+    assert "<@" not in msg.text
+
+
+def test_describe_inbound_says_when_nothing_attached():
+    """排障靠它：一眼看出是平台没推还是我们没认。"""
+    from openminis.plugins.drivers.qq import describe_inbound
+
+    info = describe_inbound({"content": "识图", "id": "m3"})
+    assert "附件 0(无)" in info
+
+
+def test_attachment_image_accepts_bare_image_type():
+    """有的平台 content_type 只给大类 ``image``。"""
+    assert attachment_is_image({"content_type": "image"}) is True
+    assert attachment_is_image({"content_type": "voice"}) is False

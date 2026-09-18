@@ -32,6 +32,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -63,6 +64,9 @@ DEFAULT_GATEWAY = "wss://api.bot.qq.com/websocket/"
 #: INTERACTION_CREATE（1<<26）是按钮/菜单回调。
 INTENT_GROUP_AND_C2C = 1 << 25
 INTENT_INTERACTION = 1 << 26
+
+#: ``content`` 里的 @ 占位符（``<@!openid>``）。
+_MENTION_RE = re.compile(r"<@!?[0-9A-Za-z_\-]+>")
 
 #: 官方单条消息上限。
 MAX_MESSAGE_CHARS = 2000
@@ -334,7 +338,10 @@ class QQAdapter(ChannelAdapter):
         if not self._allowed(msg):
             self.log(f"忽略未在白名单里的私聊：{msg.sender_id[-6:]}", "warn")
             return
-        self.log(f"收到{'群' if msg.is_group else '私聊'}消息：{msg.text[:40]}")
+        self.log(
+            f"收到{'群' if msg.is_group else '私聊'}消息：{msg.text[:40]}"
+            f"［{describe_inbound(data)}］"
+        )
         await self._dispatch(msg)
 
     async def _close_ws(self) -> None:
@@ -641,7 +648,7 @@ def normalize_event(event: str, data: dict[str, Any]) -> IncomingMessage | None:
             scope="c2c",
             peer_id=openid,
             sender_id=openid,
-            text=str(data.get("content") or "").strip(),
+            text=_clean_content(str(data.get("content") or "")),
             message_id=str(data.get("id") or data.get("msg_id") or ""),
             msg_seq=_as_int(data.get("msg_seq")),
             attachments=_attachments(data),
@@ -654,7 +661,7 @@ def normalize_event(event: str, data: dict[str, Any]) -> IncomingMessage | None:
             scope="group",
             peer_id=group,
             sender_id=str(author.get("member_openid") or author.get("id") or data.get("member_openid") or ""),
-            text=str(data.get("content") or "").strip(),
+            text=_clean_content(str(data.get("content") or "")),
             message_id=str(data.get("id") or data.get("msg_id") or ""),
             msg_seq=_as_int(data.get("msg_seq")),
             attachments=_attachments(data),
@@ -663,9 +670,57 @@ def normalize_event(event: str, data: dict[str, Any]) -> IncomingMessage | None:
     return None
 
 
+def _clean_content(text: str) -> str:
+    """去掉 ``content`` 里的 @ 占位符（官方塞的是 ``<@!openid>`` 这种）。
+
+    不清掉的话正文会变成 ``<@!E4F4AE…> 识图``，一路带进上下文 —— 模型看见一串
+    无意义的 id，用户在 IM 里也会看到它出现在回复里。
+    """
+    cleaned = _MENTION_RE.sub("", text or "").strip()
+    return re.sub(r"[ \t]{2,}", " ", cleaned) if cleaned else ""
+
+
 def _attachments(data: dict[str, Any]) -> list[dict[str, Any]]:
+    """入站附件 —— ``attachments`` 和 ``msg_elements`` 两处都收。
+
+    正常消息的图就在 ``attachments``；但**引用回复 / 图文混排**场景下官方会把
+    消息拆成 ``msg_elements``，附件挂在每个元素里。少收一处，用户看到的就是
+    「我明明发了图，机器人说没看到」。
+    """
+    out: list[dict[str, Any]] = []
     raw = data.get("attachments")
-    return [a for a in raw if isinstance(a, dict)] if isinstance(raw, list) else []
+    if isinstance(raw, list):
+        out.extend(a for a in raw if isinstance(a, dict))
+    elements = data.get("msg_elements")
+    if isinstance(elements, list):
+        for element in elements:
+            if not isinstance(element, dict):
+                continue
+            nested = element.get("attachments")
+            if isinstance(nested, list):
+                out.extend(a for a in nested if isinstance(a, dict))
+    return out
+
+
+def describe_inbound(data: dict[str, Any]) -> str:
+    """一行说清这条事件的形状 —— 排障用。
+
+    「用户发了图，机器人没看到」这类问题，光看正文猜不出来是平台没推、还是推了
+    我们没认。把附件条数与类型、mentions/msg_elements/message_scene 的存在情况
+    记进日志，下次一眼能定位。
+    """
+    atts = _attachments(data)
+    kinds = ",".join(str(a.get("content_type") or "?") for a in atts) or "无"
+    scene = data.get("message_scene")
+    ext = scene.get("ext") if isinstance(scene, dict) else None
+    parts = [
+        f"附件 {len(atts)}({kinds})",
+        f"mentions {len(data.get('mentions') or [])}",
+        f"msg_elements {len(data.get('msg_elements') or [])}",
+    ]
+    if ext:
+        parts.append(f"scene {ext}")
+    return " · ".join(parts)
 
 
 def _to_supported_image(data: bytes, suffix: str) -> bytes:

@@ -107,7 +107,8 @@ def attachment_is_image(att: dict[str, Any]) -> bool:
     看文件名/URL 后缀 —— 有些平台（含 QQ 的部分场景）就是这么含糊。
     """
     ctype = str(att.get("content_type") or att.get("contentType") or "").strip().lower()
-    if ctype.startswith("image/"):
+    # ``image/jpeg`` 是常见写法，但有的平台只给大类 ``image`` —— 都算图。
+    if ctype.startswith("image/") or ctype == "image":
         return True
     if ctype not in _VAGUE_MIMES:
         return False
