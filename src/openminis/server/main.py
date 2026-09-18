@@ -650,6 +650,23 @@ class ConnectionManager:
         if ws is not None:
             await ws.send_json(payload)
 
+    async def broadcast_web(self, payload: dict[str, Any], *, exclude: str = "") -> None:
+        """把一帧抄送给所有浏览器客户端。
+
+        为什么需要：一轮对话可能由**机器人通道**发起（``client_id`` 是
+        ``bot:…`` 那个虚拟订阅者），此时浏览器只是另一个旁观者 —— 它的帧收不到
+        任何东西，只能等回合结束重新拉历史，看上去就是「工具调用没有实时流式
+        显示，只在最后一轮结束后才出现」。抄送一份过去，前端本来就是按
+        ``sessionId`` 分桶的，不是它关心的会话自然会被忽略。
+        """
+        for cid, ws in list(self.active.items()):
+            if cid == exclude or not str(cid).startswith("c"):
+                continue  # 只发给浏览器（``c<n>``），别把机器人订阅者串起来
+            try:
+                await ws.send_json(payload)
+            except Exception:  # pragma: no cover - 个别连接坏了不该影响别人
+                logger.debug("broadcast to %s failed", cid, exc_info=True)
+
 
 manager = ConnectionManager()
 
@@ -676,6 +693,10 @@ async def _safe_send(client_id: str, payload: dict[str, Any]) -> None:
         manager.disconnect(client_id)
     except Exception:  # pragma: no cover - defensive
         logger.debug("ws send failed for %s", client_id, exc_info=True)
+    # 这一轮不是浏览器发起的（机器人通道跑的那一条会话）→ 抄送给浏览器，
+    # 让它在网页端也能实时看到工具卡与流式文字，而不是等回合结束才刷出来。
+    if not str(client_id).startswith("c") and payload.get("sessionId"):
+        await manager.broadcast_web(payload, exclude=client_id)
 
 
 #: 正在跑的对话轮次，key = 会话 id。对话跑在独立 task 里（不阻塞收帧循环），

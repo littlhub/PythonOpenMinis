@@ -283,6 +283,31 @@ class ConversationBridge:
         except Exception as exc:  # pragma: no cover - 发不出去只能记日志
             self.adapter.log(f"回复失败：{exc}", "error")
 
+    def _start_typing_heartbeat(self, msg: IncomingMessage) -> asyncio.Task[Any] | None:
+        """跑一轮期间持续刷新「正在输入」。
+
+        平台的输入状态只活几秒，而带工具的回合经常跑几分钟（识图尤其慢）——
+        只在开头打一次，用户 5 秒后就看不出机器人还在不在干活，体验就是「发出去
+        石沉大海，几分钟后突然蹦出一大段」。这个心跳让它一直显示「正在输入」。
+
+        用输入状态而不是发消息，是因为它**不占被动回复的次数额度**（QQ 群聊只有
+        5 次、单聊 4 次），刷新多少次都不影响正经回复。
+        """
+        interval = max(1.0, float(self.adapter.config.get("typingIntervalSec") or 4.0))
+
+        async def beat() -> None:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    await self.adapter.send_typing(msg)
+                except Exception:  # pragma: no cover - 心跳失败不值得中断对话
+                    return
+
+        try:
+            return asyncio.create_task(beat())
+        except RuntimeError:  # pragma: no cover - 没有事件循环（同步测试里）
+            return None
+
     async def _send_attachments(
         self, msg: IncomingMessage, refs: list[tuple[str, str]], sent: set[str]
     ) -> None:
@@ -364,8 +389,10 @@ class ConversationBridge:
                 seen["error"] = str(frame.get("error") or "")
 
         server_main.manager.attach(client_id, _Sink(on_frame))
+        typing: asyncio.Task[Any] | None = None
         try:
             await self.adapter.send_typing(msg)
+            typing = self._start_typing_heartbeat(msg)
             payload: dict[str, Any] = {"text": text, "sessionId": sid}
             if kind == "identity" and target:
                 # 「由哪个 agent 接待」= 固定人设 + 工具集，不跟着网页端当前身份变
@@ -376,6 +403,8 @@ class ConversationBridge:
             await self._send(msg, f"出错了：{exc}")
             return
         finally:
+            if typing is not None:
+                typing.cancel()
             server_main.manager.disconnect(client_id)
 
         tail, found = refs.flush()
@@ -437,8 +466,10 @@ class ConversationBridge:
                 await flush_text()
 
         token = subagent_events.set_emitter(on_event)
+        typing: asyncio.Task[Any] | None = None
         try:
             await self.adapter.send_typing(msg)
+            typing = self._start_typing_heartbeat(msg)
             store = SettingsStore.get()
             answer = await run_subagent(store, subagent_id, text, session_id)
         except SubagentError as exc:
@@ -449,6 +480,8 @@ class ConversationBridge:
             await self._send(msg, f"出错了：{exc}")
             return
         finally:
+            if typing is not None:
+                typing.cancel()
             subagent_events.reset_emitter(token)
 
         tail, found = refs.flush()

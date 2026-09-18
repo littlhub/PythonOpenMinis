@@ -1307,3 +1307,87 @@ def test_attachment_image_accepts_bare_image_type():
     """有的平台 content_type 只给大类 ``image``。"""
     assert attachment_is_image({"content_type": "image"}) is True
     assert attachment_is_image({"content_type": "voice"}) is False
+
+
+# ---------------------------------------------------------------------------
+# 「干了几分钟，结果发不回去」
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_qq_switches_to_proactive_after_window_expires(data_dir, monkeypatch):
+    """被动回复窗口过了就改走主动消息 —— 否则平台静默拒收，用户只看到机器人装死。
+
+    现场：群里 @ 一张图 → 识图几十秒、模型还反复调 → 等要发时已过群聊的 5 分钟
+    上限 → 带 msg_id 的回复被丢弃。
+    """
+    import time as _time
+
+    adapter = QQAdapter(plugin_id="qq", config={"appId": "1", "clientSecret": "s"})
+    seen: list[dict] = []
+
+    async def fake_api(path, *, method="POST", body=None):
+        seen.append(dict(body or {}))
+        return {}
+
+    monkeypatch.setattr(adapter, "_api", fake_api)
+
+    fresh = IncomingMessage(scope="group", peer_id="G1", sender_id="U1", text="x",
+                            message_id="m1", received_at=_time.time())
+    await adapter.send_text(fresh, "结果")
+    assert seen[-1]["msg_id"] == "m1" and seen[-1]["msg_seq"] == 1
+
+    stale = IncomingMessage(scope="group", peer_id="G1", sender_id="U1", text="x",
+                            message_id="m2", received_at=_time.time() - 400)
+    seen.clear()
+    await adapter.send_text(stale, "迟到的结果")
+    assert "msg_id" not in seen[-1]          # 主动消息：不带 msg_id / msg_seq
+    assert "msg_seq" not in seen[-1]
+    assert any("被动回复窗口已过" in row["text"] for row in adapter.logs())
+
+    # 单聊窗口长得多（60 分钟），同样的时间差仍然是正常被动回复
+    c2c = IncomingMessage(scope="c2c", peer_id="U1", sender_id="U1", text="x",
+                          message_id="m3", received_at=_time.time() - 400)
+    seen.clear()
+    await adapter.send_text(c2c, "结果")
+    assert seen[-1]["msg_id"] == "m3"
+
+
+@pytest.mark.asyncio
+async def test_qq_resends_proactively_when_passive_send_fails(data_dir, monkeypatch):
+    """窗口刚好在发送前一刻关掉 → 去掉 msg_id 再发一次。"""
+    adapter = QQAdapter(plugin_id="qq", config={"appId": "1", "clientSecret": "s"})
+    calls: list[dict] = []
+
+    async def fake_api(path, *, method="POST", body=None):
+        body = dict(body or {})
+        calls.append(body)
+        if "msg_id" in body:
+            raise QQBotError("QQ 接口 400：msg_id 已过期", status=400)
+        return {}
+
+    monkeypatch.setattr(adapter, "_api", fake_api)
+    msg = IncomingMessage(scope="group", peer_id="G1", sender_id="U1", text="x",
+                          message_id="m1")
+    await adapter.send_text(msg, "结果")
+    assert len(calls) == 2
+    assert "msg_id" in calls[0] and "msg_id" not in calls[1]
+    assert any("主动消息补发成功" in row["text"] for row in adapter.logs())
+
+
+@pytest.mark.asyncio
+async def test_bridge_refreshes_typing_while_running(data_dir, monkeypatch):
+    """跑一轮期间持续刷新「正在输入」—— 平台的输入状态只活几秒。"""
+    count = {"n": 0}
+
+    class TypingAdapter(FakeAdapter):
+        async def send_typing(self, msg):
+            count["n"] += 1
+
+    adapter = TypingAdapter(plugin_id="p", config={"typingIntervalSec": 1})
+    bridge = ConversationBridge(plugin_id="p", adapter=adapter)
+    msg = IncomingMessage(scope="c2c", peer_id="u", sender_id="u", text="看图")
+
+    task = bridge._start_typing_heartbeat(msg)
+    assert task is not None
+    await asyncio.sleep(2.6)
+    task.cancel()
+    assert count["n"] >= 2          # 至少刷了两次，不是开头打一下就没了

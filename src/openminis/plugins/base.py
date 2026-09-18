@@ -172,6 +172,13 @@ class IncomingMessage:
     event_id: str = ""
     #: 被动回复序号：同一条消息回复多条时递增（QQ 用它去重）。
     msg_seq: int | None = None
+    #: 收到这条消息的时刻（``time.time()``）。
+    #:
+    #: 被动回复是有**有效期**的（QQ：单聊 60 分钟、群聊 5 分钟），超时后平台会
+    #: 静默拒收带 ``msg_id`` 的回复。所以适配器要能算出「这条消息我还能被动回
+    #: 多久」，超了就得改走主动消息 —— 否则用户看到的就是「它明明干活了，却什么
+    #: 都没发回来」。
+    received_at: float = 0.0
     attachments: list[dict[str, Any]] = field(default_factory=list)
     raw: dict[str, Any] = field(default_factory=dict)
 

@@ -393,3 +393,53 @@ async def test_runtime_inline_mode_sends_image_once():
     await rt.run(provider, msgs, "s", AgentRuntimeOptions(image_context_mode="inline"))
     # 第 2 次请求带上图片；之后不会重复携带（避免常驻计费）
     assert provider.image_parts_seen == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_same_image_is_not_re_read_with_a_reworded_prompt(monkeypatch):
+    """同一张图换着说法反复识图 → 复用上次结果，不再打模型。
+
+    现场（群聊 @ 一张图）：模型在同一轮里用 6 个微调过的 prompt 连识同一张图，
+    耗时近 5 分钟；而群聊的被动回复窗口只有 5 分钟 —— 等它想发结果时窗口已经
+    关了，用户看到的就是「识图成功了但什么都没收到」。
+    """
+    from openminis.settings import vision_service as vs
+
+    vs._LAST_OK_BY_PATH.clear()
+    vs._DESC_CACHE.clear()
+
+    calls = {"n": 0}
+
+    async def fake_describe(store, image_bytes, mime_type, *, prompt="", image_path=None):
+        calls["n"] += 1
+        return f"这是一张图（第 {calls['n']} 次识别的描述）"
+
+    monkeypatch.setattr(vs, "describe_image", fake_describe)
+
+    class Store:
+        def slot_binding(self, slot):
+            return ({"id": "p1"}, "vision-model")
+
+    store = Store()
+    path = "/var/minis/workspace/uploads/a.jpg"
+
+    first = await vs.describe_image_with_fallback(
+        store, b"x", "image/jpeg", prompt="描述这张图", image_path=path
+    )
+    assert "第 1 次" in first
+    assert calls["n"] == 1
+
+    # 换个说法问同一张图 —— 不该再打一次模型
+    second = await vs.describe_image_with_fallback(
+        store, b"x", "image/jpeg", prompt="详细描述图片内容", image_path=path
+    )
+    assert calls["n"] == 1, "换 prompt 不该绕过「同一张图」的复用"
+    assert "第 1 次" in second
+    assert "不要再用 read_image" in second
+
+    # 换一张图照常识别
+    await vs.describe_image_with_fallback(
+        store, b"y", "image/jpeg", prompt="描述这张图",
+        image_path="/var/minis/workspace/uploads/b.jpg",
+    )
+    assert calls["n"] == 2

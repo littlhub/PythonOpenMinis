@@ -113,6 +113,39 @@ def _mark_path_dead(path: str) -> None:
     _DEAD_PATHS[path] = time.monotonic()
 
 
+#: 「这张图刚识过」—— 路径 → (时刻, 描述)。
+#:
+#: 结果缓存是按 ``(路径, prompt)`` 存的，所以模型**把问题换个说法**就等于绕过缓存
+#: 再打一次 API。实测（群聊 @ 一张图）：它在同一轮里用 6 个微调过的 prompt 连识
+#: 同一张图，耗时近 5 分钟 —— 而群聊的被动回复窗口只有 5 分钟，等它想发结果时
+#: 窗口已经关了，用户看到的就是「识图成功了但什么都没收到」。
+#:
+#: 所以成功也按**路径**记一笔：短时间内再来问同一张图，直接把上次的描述回给它，
+#: 并明说别再调了。真要问别的角度，它基于已有描述回答即可。
+_LAST_OK_BY_PATH: dict[str, tuple[float, str]] = {}
+_SAME_IMAGE_TTL = 180.0
+
+
+def _same_image_recent(path: str) -> str | None:
+    hit = _LAST_OK_BY_PATH.get(path)
+    if hit is None:
+        return None
+    ts, text = hit
+    if time.monotonic() - ts > _SAME_IMAGE_TTL:
+        _LAST_OK_BY_PATH.pop(path, None)
+        return None
+    return text
+
+
+def _remember_ok(path: str, text: str) -> None:
+    if not path or not text:
+        return
+    if len(_LAST_OK_BY_PATH) >= _DESC_CACHE_MAX:
+        oldest = min(_LAST_OK_BY_PATH, key=lambda k: _LAST_OK_BY_PATH[k][0])
+        _LAST_OK_BY_PATH.pop(oldest, None)
+    _LAST_OK_BY_PATH[path] = (time.monotonic(), text)
+
+
 def _no_retry_note() -> str:
     return (
         f"（识图服务已连续失败 {_fail_state['streak']} 次，通常是模型限流；"
@@ -228,12 +261,23 @@ async def describe_image_with_fallback(
             f"{image_path} 刚识图失败过，{int(_DEAD_PATH_TTL / 60)} 分钟内不再重试"
             "（换 prompt 也没用：失败与问题无关）。直接告诉用户这次没读到这张图。"
         )
+    if image_path:
+        recent = _same_image_recent(image_path)
+        if recent:
+            # 同一张图刚识过（换了说法也算）—— 再打一次 API 只会把时间烧掉，
+            # 慢到超过平台的被动回复窗口就变成「干了活但发不出去」。
+            return (
+                recent
+                + "\n（同一张图刚识过，本次直接复用上次的描述、**没有**再调用识图模型。"
+                "请基于上面的描述回答用户，不要再用 read_image 重复问同一张图。）"
+            )
     text = await describe_image(
         store, image_bytes, mime_type, prompt=prompt, image_path=image_path
     )
     failed = text is None or any(m in (text or "") for m in _FAILURE_MARKERS)
     if not failed:
         _cache_put(key, text or "")
+        _remember_ok(str(image_path or ""), text or "")
         return text
     if image_path:
         _mark_path_dead(image_path)

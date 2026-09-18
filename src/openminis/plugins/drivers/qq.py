@@ -79,6 +79,14 @@ MAX_FILE_UPLOAD_BYTES = 20 * 1024 * 1024
 #: 被动回复次数上限：单聊每个周期 4 次、群聊 5 次。发图/发文件各算一次，
 #: 所以「带图的长回答」很容易顶到，逼近时提前告警。
 PASSIVE_REPLY_LIMIT = {"c2c": 4, "group": 5}
+#: 被动回复的**有效期**（官方：单聊 60 分钟、群聊 5 分钟）。
+#:
+#: 超时后带 ``msg_id`` 的回复会被平台静默拒收 —— 表现就是「它干活了但什么都没
+#: 发回来」。识图这类慢活儿（一次识图几十秒，模型还会反复调）很容易把群聊这 5
+#: 分钟耗尽，所以到点了要改走**主动消息**（不带 msg_id/msg_seq）。
+PASSIVE_REPLY_TTL = {"c2c": 3600.0, "group": 300.0}
+#: 提前这么多秒就判定被动窗口不可靠（留出上传富媒体的时间）。
+PASSIVE_REPLY_MARGIN = 20.0
 #: 提前多久刷新 token（官方 TTL 7200s）。
 TOKEN_MARGIN_SEC = 300
 REQUEST_TIMEOUT_SEC = 15.0
@@ -378,6 +386,23 @@ class QQAdapter(ChannelAdapter):
         self._heartbeat = asyncio.create_task(beat())
 
     # ---- 出站 -----------------------------------------------------------
+    def _passive_expired(self, msg: IncomingMessage | None) -> bool:
+        """这条消息的被动回复窗口还开着吗。
+
+        人不在电脑前时的典型场景：群里 @ 一张图 → 识图要几十秒、模型还反复调几次
+        → 等要发结果已经过了 5 分钟 → 平台静默拒收，用户只看到机器人「装死」。
+        到点就改走主动消息，宁可少一次被动额度、也要把结果送出去。
+        """
+        if msg is None or not msg.message_id:
+            return True  # 没有 msg_id 本来就是主动消息
+        if not msg.received_at:
+            # 不知道收到多久了 → 按正常被动回复走。宁可试一次带 msg_id 的，
+            # 也别在不知情时退化成主动消息（用户关掉「允许主动发送」的话，
+            # 那就真的发不出去了）。
+            return False
+        ttl = PASSIVE_REPLY_TTL.get(msg.scope, 300.0)
+        return (time.time() - msg.received_at) >= (ttl - PASSIVE_REPLY_MARGIN)
+
     def _endpoint(self, peer: str, scope: str) -> str:
         kind = "groups" if scope == "group" else "users"
         return f"/v2/{kind}/{peer}/messages"
@@ -395,26 +420,55 @@ class QQAdapter(ChannelAdapter):
         chunks = [c.strip() for c in chunks if c.strip()]
         if not chunks:
             return
+        passive = not self._passive_expired(msg)
+        if not passive and msg is not None and msg.message_id:
+            self.log(
+                f"这条消息的被动回复窗口已过（{msg.scope} 限 "
+                f"{PASSIVE_REPLY_TTL.get(msg.scope, 300.0) / 60:.0f} 分钟），"
+                "改走主动消息发出",
+                "warn",
+            )
         # 同一条入站消息可能被回好几条（流式分段、命令提示…），每条都要带
         # 互不相同的 msg_seq —— 官方按 (msg_id, msg_seq) 判重，重复会被丢弃。
-        base_seq = self._reserve_seq(msg, len(chunks))
+        base_seq = self._reserve_seq(msg, len(chunks)) if passive else None
         for index, chunk in enumerate(chunks):
             body: dict[str, Any] = {"content": chunk, "msg_type": 0}
-            if msg is not None and msg.message_id:
+            if passive and msg is not None and msg.message_id:
                 body["msg_id"] = msg.message_id
                 body["msg_seq"] = (base_seq or 0) + index
             try:
                 await self._api(self._endpoint(peer, scope), body=body)
             except QQBotError as exc:
+                if "msg_id" in body and await self._resend_proactive(peer, scope, body):
+                    continue
                 self.log(f"发送失败：{exc}", "error")
                 self.state.error = str(exc)
                 return
             if index + 1 < len(chunks):
                 await asyncio.sleep(float(self.config.get("sendChunkDelayMs") or 600) / 1000.0)
 
+    async def _resend_proactive(
+        self, peer: str, scope: str, body: dict[str, Any]
+    ) -> bool:
+        """带 ``msg_id`` 的被动回复失败了 → 去掉它，当主动消息再发一次。
+
+        兜住「窗口刚好在发送前一刻关闭 / 次数用尽」这类失败：官方对超时只会回
+        一个错误码，用户那边完全无感 —— 与其让答案烂在日志里，不如换条路送出去。
+        """
+        retry = {k: v for k, v in body.items() if k not in ("msg_id", "msg_seq")}
+        try:
+            await self._api(self._endpoint(peer, scope), body=retry)
+        except QQBotError as exc:
+            self.log(f"主动消息补发也失败（{exc}）", "warn")
+            return False
+        self.log("被动回复失败，已用主动消息补发成功", "warn")
+        return True
+
     async def send_typing(self, msg: IncomingMessage | None) -> None:
         if msg is None or not msg.message_id:
             return
+        if self._passive_expired(msg):
+            return  # 窗口已过，「正在输入」也发不出去，别白占一个 seq
         body = {
             "msg_type": 6,
             "input_notify": {"input_type": 1, "input_second": 5},
@@ -481,13 +535,16 @@ class QQAdapter(ChannelAdapter):
             "media": {"file_info": file_info},
             "content": "",
         }
-        if msg is not None and msg.message_id:
+        if msg is not None and msg.message_id and not self._passive_expired(msg):
             body["msg_id"] = msg.message_id
             # 附件也算一条出站，一样要占 seq，否则和文字那条撞号被官方丢掉。
             body["msg_seq"] = self._reserve_seq(msg, 1) or 1
         try:
             await self._api(self._endpoint(peer, scope), body=body)
         except QQBotError as exc:
+            if "msg_id" in body and await self._resend_proactive(peer, scope, body):
+                self.log(f"已发送{'图片' if is_image else '文件'}：{target.name}")
+                return True
             self.log(f"发送{'图片' if is_image else '文件'}失败：{exc}", "error")
             self.state.error = str(exc)
             return False
@@ -651,6 +708,7 @@ def normalize_event(event: str, data: dict[str, Any]) -> IncomingMessage | None:
             text=_clean_content(str(data.get("content") or "")),
             message_id=str(data.get("id") or data.get("msg_id") or ""),
             msg_seq=_as_int(data.get("msg_seq")),
+            received_at=time.time(),
             attachments=_attachments(data),
             raw=data,
         )
@@ -664,6 +722,7 @@ def normalize_event(event: str, data: dict[str, Any]) -> IncomingMessage | None:
             text=_clean_content(str(data.get("content") or "")),
             message_id=str(data.get("id") or data.get("msg_id") or ""),
             msg_seq=_as_int(data.get("msg_seq")),
+            received_at=time.time(),
             attachments=_attachments(data),
             raw=data,
         )
