@@ -74,6 +74,14 @@ hiddenimports = [
     "uvicorn.lifespan.on",
 ]
 
+# 通道驱动是按字符串动态导入的（``plugins/drivers/__init__.py`` 用 ``import_module``），
+# PyInstaller 的静态扫描看不见 —— 漏掉的症状是打包版里 QQ 机器人起不来：
+# "No module named 'openminis.plugins.drivers.qq'"。把驱动目录整个列进来，
+# 以后加新平台也不用再改这里。
+for _driver in sorted((PKG / "plugins" / "drivers").glob("*.py")):
+    if _driver.stem != "__init__":
+        hiddenimports.append("openminis.plugins.drivers." + _driver.stem)
+
 # Nothing in this project needs a GUI toolkit or a numerical stack. Excluding
 # them keeps the bundle honest instead of shipping dead weight — and a
 # stray import inside a try/except just warns, it does not break anything.
