@@ -29,6 +29,10 @@ class SkillEntry:
     source: str = "user"
     generated: bool = False
     scripts: tuple[str, ...] = ()
+    #: SKILL.md 里声明的环境变量名（``metadata.requires.env`` 等）。
+    #: 声明了不等于配好了 —— 界面据此把「还差哪一项」指出来，值本身存在
+    #: ``sandbox.envExtra`` 里，由 shell 注入。
+    env: tuple[str, ...] = ()
     body: str = ""
 
 

@@ -480,6 +480,39 @@ def _sample(text: str, limit: int = 24) -> str:
     return flat[:limit] + ("…" if len(flat) > limit else "")
 
 
+#: 低置信度规则 —— 只在「确实像个孤立的密钥」时才遮。
+#:
+#: 「长十六进制串」这条特别容易误伤：QQ / 微信 / 各类缓存的媒体文件大量用
+#: 哈希命名，而**文件名会随消息正文一起出站**。用户实测：
+#: ``20260918-073217-qq-dd1bf336-A39C8122FF85B3B700719B9836EA6C4D.jpg``
+#: 里的 32 位十六进制被当成密钥遮成「已拦截·敏感信息」，模型于是连图片路径都
+#: 看不到 —— 表现就是「图片被沙箱拦截了敏感信息，模型无法识别图片」。
+_LOW_CONFIDENCE_LABELS = frozenset({"长十六进制串（疑似密钥）"})
+
+#: 扩展名尾巴 —— 命中片段紧跟着它就说明这是**文件名**，不是密钥。
+_EXT_TAIL_RE = re.compile(r"\.[A-Za-z0-9]{1,8}(?![\w-])")
+
+#: 路径分隔符（含 markdown 引用里的 ``](``）。
+_PATH_LEFT_CHARS = "/\\"
+
+
+def _in_path_context(text: str, start: int, end: int) -> bool:
+    """命中片段是不是只是文件名 / 路径的一部分。
+
+    只看两处最可靠的特征，避免把真正的密钥放过去：
+
+    1. **紧跟着扩展名**（``…A39C8122FF85B3B700719B9836EA6C4D.jpg``）；
+    2. **紧挨着路径分隔符**（``C:/cache/9f8e…/a.png``、``/tmp/deadbeef…``）。
+
+    这两条之外的十六进制串照旧判为疑似密钥 —— 收紧的口子越小越安全。
+    """
+    tail = text[end : end + 12]
+    if _EXT_TAIL_RE.match(tail):
+        return True
+    left = text[max(0, start - 1) : start]
+    return left in _PATH_LEFT_CHARS
+
+
 def _find_secret_hits(text: str) -> list[tuple["re.Match[str]", str, int]]:
     """按模式优先级取**互不重叠**的命中。
 
@@ -497,6 +530,8 @@ def _find_secret_hits(text: str) -> list[tuple["re.Match[str]", str, int]]:
             if group > 0 and not _looks_like_real_secret(m.group(group) or ""):
                 continue
             s, e = m.span()
+            if label in _LOW_CONFIDENCE_LABELS and _in_path_context(text, s, e):
+                continue
             if any(not (e <= ts or s >= te) for ts, te in taken):
                 continue
             taken.append((s, e))
@@ -877,32 +912,47 @@ def check_shell_command(
 
 
 def sanitize_outbound(
-    text: str, *, where: str, session_id: str = "", tool: str = ""
+    text: str,
+    *,
+    where: str,
+    session_id: str = "",
+    tool: str = "",
+    scrub_paths: bool = False,
 ) -> str:
     """出站文本（发往 LLM / 前端 / 机器人通道）的敏感信息拦截。
 
     命中明文凭据时记一条 ``secret`` 事件，并返回**脱敏后**的文本；已被放行的
     场景直接原样返回。
+
+    ``scrub_paths=True`` 时顺带把本机绝对路径换成沙箱写法
+    （``C:/Users/<名>/…/workspace/x.png`` → ``/var/minis/workspace/x.png``）。
+    **只对发往模型的内容开**：前端拿这个路径去 ``/api/fs/raw`` 取图，换成沙箱
+    写法它就加载不出来了。
     """
     if not text or len(text) < 8:
         return text
     cleaned, hits = redact_secrets(text)
-    if not hits:
-        return text
-    key_cwd = f"outbound:{where}"
-    if guard.is_allowed(family="secret", session_id=session_id, targets=[], cwd=key_cwd):
-        return text
-    guard.record(
-        family="secret",
-        tool=tool or f"outbound:{where}",
-        session_id=session_id,
-        cwd=key_cwd,
-        targets=[],
-        reasons=[f"出站内容含明文凭据：{h.label}" for h in hits],
-        command="",
-        output=f"[{where}] " + "；".join(h.sample for h in hits),
-    )
-    return cleaned
+    if hits:
+        key_cwd = f"outbound:{where}"
+        if not guard.is_allowed(
+            family="secret", session_id=session_id, targets=[], cwd=key_cwd
+        ):
+            guard.record(
+                family="secret",
+                tool=tool or f"outbound:{where}",
+                session_id=session_id,
+                cwd=key_cwd,
+                targets=[],
+                reasons=[f"出站内容含明文凭据：{h.label}" for h in hits],
+                command="",
+                output=f"[{where}] " + "；".join(h.sample for h in hits),
+            )
+            text = cleaned
+    if scrub_paths:
+        from ..tools.path_utils import scrub_machine_paths
+
+        text = scrub_machine_paths(text)
+    return text
 
 
 def sanitize_message_parts(messages: Iterable[Any], *, session_id: str = "") -> int:
@@ -911,6 +961,10 @@ def sanitize_message_parts(messages: Iterable[Any], *, session_id: str = "") -> 
     ``Text.text`` / ``ToolResult.content`` / 纯文本 ``content`` 都会被扫描，
     命中明文凭据就换成部分显示；返回被改动的条数。用 ``dataclasses.replace``
     换新部件，保持原类型（ToolResult 的 id/name 等字段不能丢）。
+
+    这里同时把本机绝对路径换成沙箱写法（``scrub_paths=True``）—— 模型不需要
+    知道 ``C:/Users/<用户名>/…``，工作区内的东西用 ``/var/minis/workspace/…``
+    表达就够了，回填给工具也能解析回来。
     """
     import dataclasses
 
@@ -926,7 +980,9 @@ def sanitize_message_parts(messages: Iterable[Any], *, session_id: str = "") -> 
                 raw = getattr(part, attr, None)
                 if not isinstance(raw, str) or len(raw) < 8:
                     continue
-                cleaned = sanitize_outbound(raw, where="llm", session_id=session_id)
+                cleaned = sanitize_outbound(
+                    raw, where="llm", session_id=session_id, scrub_paths=True
+                )
                 if cleaned != raw:
                     try:
                         parts[i] = dataclasses.replace(part, **{attr: cleaned})
@@ -936,7 +992,9 @@ def sanitize_message_parts(messages: Iterable[Any], *, session_id: str = "") -> 
                 break
         content = getattr(msg, "content", None)
         if isinstance(content, str) and len(content) >= 8:
-            cleaned = sanitize_outbound(content, where="llm", session_id=session_id)
+            cleaned = sanitize_outbound(
+                content, where="llm", session_id=session_id, scrub_paths=True
+            )
             if cleaned != content:
                 try:
                     msg.content = cleaned

@@ -57,6 +57,26 @@ CONFIG_NAME = "config.json"
 #: 配置文件里记录「是否启用」的键（不是用户配置，属于插件状态）。
 ENABLED_KEY = "_enabled"
 
+#: 外部程序插件（``runtime == process``）自动获得的配置项：可执行文件搜索目录。
+#:
+#: 引擎进程往往是用户从 .bat / exe 起的，PATH 很干净；而 node 这类运行时经常只
+#: 装在某个用户目录里。``which`` 找不到就直接报「找不到可执行文件：node」，用户
+#: 不知道该改哪里 —— 所以每个外部程序插件都白送这一项，填一次即可。
+RUNTIME_PATH_KEY = "runtimePath"
+
+#: 上面那一项在界面上的样子（清单里没声明时自动补上）。
+RUNTIME_PATH_FIELD = {
+    "key": RUNTIME_PATH_KEY,
+    "label": "可执行文件搜索目录",
+    "type": "list",
+    "help": (
+        "一行一个目录。引擎会先在这些目录里找 startup 命令用到的程序"
+        "（node / npm / python…），并把它加进子进程的 PATH。"
+        "报「找不到可执行文件：node」时，把 node.exe 所在的目录填进来即可"
+        "（Windows 上通常是 C:\\Program Files\\nodejs）。"
+    ),
+}
+
 #: 一次插件工具调用的默认超时（秒）。
 DEFAULT_TOOL_TIMEOUT_SEC = 60
 #: 插件工具输出喂给模型的字符上限（超出截断，省上下文）。
@@ -350,6 +370,11 @@ class ChannelManifest:
         fields: list[FieldSpec] = []
         if isinstance(fields_raw, list):
             fields = [FieldSpec.from_dict(f) for f in fields_raw]
+        if runtime == RUNTIME_PROCESS and not any(
+            f.key == RUNTIME_PATH_KEY for f in fields
+        ):
+            # 外部程序插件一律自带「可执行文件搜索目录」—— 见 RUNTIME_PATH_KEY 的说明。
+            fields.append(FieldSpec.from_dict(RUNTIME_PATH_FIELD))
         return cls(
             id=plugin_id,
             name=str(raw.get("name") or plugin_id),
@@ -378,6 +403,8 @@ __all__ = [
     "MANIFEST_NAME",
     "CONFIG_NAME",
     "ENABLED_KEY",
+    "RUNTIME_PATH_KEY",
+    "RUNTIME_PATH_FIELD",
     "DEFAULT_TOOL_TIMEOUT_SEC",
     "TOOL_OUTPUT_MAX_CHARS",
     "RUNTIME_ENGINE",

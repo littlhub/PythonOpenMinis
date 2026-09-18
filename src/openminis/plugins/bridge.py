@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Callable, Awaitable
 
 from ..core import context
+from ..tools.path_utils import scrub_machine_paths
 from . import options
 from .base import ChannelAdapter, IncomingMessage, save_attachments
 
@@ -43,6 +44,20 @@ _MD_FILE_RE = re.compile(r"\[附件[:：]\s*[^\]]*\]\(([^)\s]+)\)")
 
 #: 流式文本的尾巴上最多压这么多字符，等一个可能被 chunk 切开的下半截引用。
 _REF_TAIL_HOLD = 400
+
+#: 连续 3 个以上换行 → 收敛成一段空行。
+#:
+#: 摘掉 ``![](路径)`` 之后原位置会留一串空行（模型习惯把引用单独成段），IM 里
+#: 看就是一大片空白 —— 必须收拾一下，否则每条带图的回复下面都拖着一段空。
+_BLANKS_RE = re.compile(r"\n[ \t]*\n(?:[ \t]*\n)+")
+
+
+def _tidy(text: str) -> str:
+    """把摘掉引用后留下的空行收敛掉，顺手统一换行符。"""
+    if not text:
+        return text
+    out = text.replace("\r\n", "\n").replace("\r", "\n")
+    return _BLANKS_RE.sub("\n\n", out)
 
 #: 尾巴上「可能是一条半截引用」的形状。命中就把这一段压住，等下一块拼上来
 #: 再判 —— 否则聊天里会漏出一串残废 markdown，或者把半截路径当图片去发。
@@ -100,6 +115,9 @@ class _AttachmentRefFilter:
 
         text = _MD_IMAGE_RE.sub(_sub("image"), self._buf)
         text = _MD_FILE_RE.sub(_sub("file"), text)
+        if found:
+            # 只在真的摘掉过东西时才收敛空行 —— 平时不碰用户的排版
+            text = _tidy(text)
         hold = _hold_from(text)
         if hold >= 0:
             self._buf = text[hold:]
@@ -115,7 +133,7 @@ class _AttachmentRefFilter:
         模型写了点什么。
         """
         body, self._buf = self._buf, ""
-        return body, []
+        return _tidy(body), []
 
 HELP_TEXT = """我可以直接聊天，也认这几条命令：
 /new      开一个新对话（之后的消息接着新对话走）
@@ -246,10 +264,18 @@ class ConversationBridge:
         return f"{refs}\n\n{text}" if text else refs
 
     async def _send(self, msg: IncomingMessage, text: str) -> None:
-        if not str(text or "").strip():
+        # 一律 strip：分块发送时常有一段以空行开头/结尾，IM 里就是一片空白，
+        # 看起来像「机器人发了条空消息」。
+        body = _tidy(str(text or "")).strip()
+        if not body:
             return
+        # 发到 IM 的正文也不带盘符：对方看到的应该是
+        # ``/var/minis/workspace/uploads/x.jpg`` 而不是 ``C:\\Users\\<名字>\\…``。
+        # 一是别把本机目录结构甩给聊天对象，二是和模型看到的是同一套写法，
+        # 出问题时对着排查不用做心算换算。
+        body = scrub_machine_paths(body)
         try:
-            await self.adapter.send_text(msg, text)
+            await self.adapter.send_text(msg, body)
         except Exception as exc:  # pragma: no cover - 发不出去只能记日志
             self.adapter.log(f"回复失败：{exc}", "error")
 
@@ -302,8 +328,7 @@ class ConversationBridge:
         async def flush_text() -> None:
             payload = "".join(buffer)
             buffer.clear()
-            if payload.strip():
-                await self.adapter.send_text(msg, payload)
+            await self._send(msg, payload)
 
         async def on_frame(frame: dict[str, Any]) -> None:
             kind_ = frame.get("type")
@@ -390,7 +415,7 @@ class ConversationBridge:
             buffer.clear()
             if payload.strip():
                 streamed["n"] += len(payload)
-                await self.adapter.send_text(msg, payload)
+                await self._send(msg, payload)
 
         async def on_event(event: dict[str, Any]) -> None:
             if event.get("type") != "subagentDelta":

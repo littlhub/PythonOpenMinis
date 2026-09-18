@@ -121,6 +121,19 @@ def attachment_kind(att: dict[str, Any]) -> str:
     return "file" if attachment_name(att) else ""
 
 
+def sandbox_form(path: str | Path) -> str:
+    """路径的「沙箱写法」—— 发给聊天对象时不该出现 ``C:\\Users\\<名字>\\…``。
+
+    平台适配器要发的是文件本身；只有在发不出去、退化成发路径文本时才用得上它。
+    """
+    try:
+        from ..tools.path_utils import to_sandbox_path
+
+        return to_sandbox_path(path)
+    except Exception:  # pragma: no cover - 路径工具不可用就原样给
+        return str(path)
+
+
 def channel_file_name(
     original: str, *, prefix: str = "im", fallback_suffix: str = ".bin"
 ) -> str:
@@ -258,7 +271,7 @@ class ChannelAdapter(abc.ABC):
         默认实现不支持富媒体 —— 退化成把路径当文本发出去。用户至少知道图生成
         在哪、能自己去拿，比静默丢掉强得多。支持图片的平台覆盖这个方法。
         """
-        await self.send_text(msg, f"[图片] {path}", **kwargs)
+        await self.send_text(msg, f"[图片] {sandbox_form(path)}", **kwargs)
         return False
 
     async def send_file(
@@ -269,7 +282,7 @@ class ChannelAdapter(abc.ABC):
         图片与文件分开是因为平台侧本来就是两套限制（QQ 的 ``file_type`` 不同、
         大小上限也不同），合成一个「发媒体」反而要在实现里再判一次类型。
         """
-        await self.send_text(msg, f"[附件] {path}", **kwargs)
+        await self.send_text(msg, f"[附件] {sandbox_form(path)}", **kwargs)
         return False
 
     async def fetch_attachment(
@@ -431,4 +444,5 @@ __all__ = [
     "attachment_kind",
     "channel_file_name",
     "save_attachments",
+    "sandbox_form",
 ]

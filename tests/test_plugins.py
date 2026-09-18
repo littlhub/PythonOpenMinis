@@ -1207,3 +1207,48 @@ def test_builtin_refresh_keeps_user_config(data_dir, tmp_path, monkeypatch):
     # 不传 refresh 时依旧幂等：不会把配置洗掉，也不会误报有更新
     store.install_builtin("gg")
     assert store.read_config("gg").get("token") == "secret-value"
+
+
+@pytest.mark.asyncio
+async def test_channel_reply_has_no_drive_letter(data_dir, monkeypatch):
+    """发到 IM 的正文不出现盘符 —— 对方看到的是沙箱写法。"""
+    from openminis.core import context
+    from openminis.server import chat_store, main as server_main
+
+    chat_store.set_database_path(data_dir / "plugins_path.db")
+    adapter = FakeAdapter(plugin_id="p", config={})
+    bridge = ConversationBridge(plugin_id="p", adapter=adapter)
+    ws = context.app_context().external_files_dir
+    raw = (ws / "image" / "a.png").as_posix()
+
+    async def fake_run_chat(client_id, msg):
+        sink = server_main.manager.active[client_id]
+        await sink.send_json({"type": "delta", "text": f"图在这儿：{raw}\n"})
+        await sink.send_json({"type": "done"})
+
+    monkeypatch.setattr(server_main, "_run_chat", fake_run_chat)
+    await bridge.handle(
+        IncomingMessage(scope="c2c", peer_id="u", sender_id="u", text="看图")
+    )
+    joined = "".join(adapter.sent)
+    assert "C:" not in joined and str(Path.home()) not in joined
+    assert "/var/minis/workspace/image/a.png" in joined
+
+
+@pytest.mark.asyncio
+async def test_channel_media_fallback_uses_sandbox_path(data_dir):
+    """平台发不了图时退回发路径文本 —— 那条文本也不带盘符。"""
+    from openminis.core import context
+
+    class PlainAdapter(FakeAdapter):
+        pass
+
+    adapter = PlainAdapter(plugin_id="p", config={})
+    # 退回基类实现（不支持富媒体）
+    adapter.send_image = ChannelAdapter.send_image.__get__(adapter, PlainAdapter)
+    raw = (context.app_context().external_files_dir / "image" / "b.png").as_posix()
+
+    ok = await adapter.send_image(None, raw)
+    assert ok is False
+    assert adapter.sent and "C:" not in adapter.sent[0]
+    assert adapter.sent[0].startswith("[图片] /var/minis/workspace/")

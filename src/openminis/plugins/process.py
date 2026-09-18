@@ -6,6 +6,11 @@ Python 进程里跑。所以引擎对它们做的是「管生命周期」：按�
 
 安全：命令与参数**分开传**，绝不拼 shell 字符串（插件目录里的文件名可能带
 空格甚至引号）；cwd 被限制在插件目录内。
+
+找 `node` 这件事单独费了点笔墨：引擎进程往往是用户从 .bat / exe 起的，PATH 很
+干净，而 Node 这类运行时经常只装在某个用户目录里（或由别的工具托管）。`which`
+找不到就直接报「找不到可执行文件：node」，用户根本不知道该改哪里。所以这里会
+主动扫一遍本机常见的安装位置，并允许在插件配置里显式指定搜索目录。
 """
 
 from __future__ import annotations
@@ -17,15 +22,161 @@ import sys
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
-from .manifest import ChannelManifest, ManifestError
+from .manifest import RUNTIME_PATH_KEY, ChannelManifest, ManifestError
 
 #: 日志环形缓冲的行数（界面「查看日志」用）。
 LOG_LINES = 300
 #: 自动重启的最小间隔，防「起不来就疯狂重启」。
 RESTART_BACKOFF_SEC = 5.0
 RESTART_MAX_SEC = 60.0
+
+#: Windows 上可执行文件的后缀。npm / yarn 是 ``.cmd``，node 是 ``.exe``，
+#: 所以按名字找的时候每个后缀都要试一遍。
+EXEC_SUFFIXES = ("", ".exe", ".cmd", ".bat", ".ps1")
+
+#: 需要 ``cmd /c`` 才能起的后缀 —— CreateProcess 不认批处理脚本，
+#: 不套一层 shell 会直接报「不是有效的应用程序」。
+SHELL_SUFFIXES = (".cmd", ".bat")
+
+#: 托管运行时的布局：``<home>/.workbuddy/binaries/<name>/versions/<ver>/``。
+#: 这是本地运行时管理器的约定，只作为兜底候选 —— 命中不了也不影响。
+_MANAGED_RUNTIMES = ("node", "python")
+
+
+def _version_dirs(root: Path) -> list[Path]:
+    """版本目录本身 + 它的 ``bin/``（unix 布局）；``current`` 软链优先。"""
+    out: list[Path] = []
+    current = root / "current"
+    if current.is_dir():
+        out.extend([current, current / "bin"])
+    try:
+        children = sorted(
+            (c for c in root.iterdir() if c.is_dir() and not c.name.startswith(".")),
+            key=lambda c: c.name,
+            reverse=True,
+        )
+    except OSError:
+        children = []
+    for child in children:
+        out.extend([child, child / "bin"])
+    return out
+
+
+def candidate_bin_dirs() -> list[Path]:
+    """本机「可能装了可执行文件但没进 PATH」的目录。
+
+    只在 ``which`` 失败后才用，所以宁可多列几个：多找一个目录的成本是几次
+    ``is_file()``，而漏找的代价是用户对着「找不到可执行文件：node」发呆。
+    """
+    out: list[Path] = []
+    home = Path.home()
+    env = os.environ
+
+    for name in _MANAGED_RUNTIMES:
+        out.extend(_version_dirs(home / ".workbuddy" / "binaries" / name / "versions"))
+    out.append(home / ".workbuddy" / "binaries" / "node" / "workspace" / "node_modules" / ".bin")
+
+    for key in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA", "APPDATA"):
+        base = env.get(key)
+        if not base:
+            continue
+        root = Path(base)
+        out.extend([
+            root / "nodejs",
+            root / "Programs" / "nodejs",
+            root / "nvm",
+            root / "Volta" / "bin",
+            root / "fnm_multishells",
+        ])
+        for version in ("Python310", "Python311", "Python312", "Python313"):
+            out.append(root / "Programs" / "Python" / version)
+
+    for key in ("NVM_HOME", "NVM_SYMLINK", "VOLTA_HOME", "PNPM_HOME", "MSYS2_HOME"):
+        value = env.get(key)
+        if value:
+            out.append(Path(value))
+
+    out.append(home / "scoop" / "shims")
+    out.append(home / "AppData" / "Local" / "Microsoft" / "WindowsApps")
+    out.append(Path("C:/ProgramData/chocolatey/bin"))
+    # 去重但保序（同名的先出现的优先）
+    seen: set[str] = set()
+    unique: list[Path] = []
+    for item in out:
+        key = str(item).lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+    return unique
+
+
+def extra_bin_dirs(config: dict[str, Any] | None) -> list[str]:
+    """配置里显式指定的可执行文件搜索目录（``runtimePath``，一行一个）。"""
+    raw = (config or {}).get(RUNTIME_PATH_KEY)
+    if isinstance(raw, str):
+        items: Iterable[Any] = raw.splitlines()
+    elif isinstance(raw, (list, tuple)):
+        items = raw
+    else:
+        return []
+    return [str(v).strip() for v in items if str(v or "").strip()]
+
+
+def _find_in_dir(directory: str | Path, command: str) -> str | None:
+    """在指定目录里按名字找可执行文件（带不带后缀都试）。"""
+    base = Path(str(directory).strip().strip('"'))
+    if not base.is_dir():
+        return None
+    for suffix in EXEC_SUFFIXES:
+        candidate = base / f"{command}{suffix}"
+        try:
+            if candidate.is_file():
+                return str(candidate)
+        except OSError:  # pragma: no cover - 权限/IO
+            continue
+    return None
+
+
+def resolve_executable(
+    command: str, extra_dirs: Iterable[str | Path] = ()
+) -> str | None:
+    """找可执行文件。``python`` 特意指回当前解释器（虚拟环境里才对）。
+
+    查找顺序：命令本来就是路径 → 用户指定的目录 → PATH → 本机常见安装位置。
+    用户显式指定的目录排在 PATH 前面，因为他多半就是想覆盖 PATH 里那份。
+    """
+    cmd = str(command or "").strip().strip('"')
+    if not cmd:
+        return None
+    if cmd in ("python", "python3", "py"):
+        return sys.executable
+
+    # 命令本身带路径（./start.sh、bin/node）—— 直接核一下在不在
+    if os.sep in cmd or "/" in cmd:
+        direct = Path(cmd)
+        if direct.is_file():
+            return str(direct)
+        if direct.suffix.lower() in ("", *EXEC_SUFFIXES):
+            for suffix in EXEC_SUFFIXES:
+                if Path(f"{cmd}{suffix}").is_file():
+                    return str(Path(f"{cmd}{suffix}"))
+
+    for directory in extra_dirs:
+        found = _find_in_dir(directory, cmd)
+        if found:
+            return found
+
+    found = shutil.which(cmd)
+    if found:
+        return found
+
+    for directory in candidate_bin_dirs():
+        found = _find_in_dir(directory, cmd)
+        if found:
+            return found
+    return None
 
 
 class ProcessRunner:
@@ -61,12 +212,19 @@ class ProcessRunner:
         if self.running:
             return
         command, args, cwd_rel = self.manifest.command_line()
-        exe = resolve_executable(command)
+        extra = extra_bin_dirs(self.config)
+        exe = resolve_executable(command, extra)
         if exe is None:
             self.state = "error"
-            self.error = f"找不到可执行文件：{command}"
+            self.error = (
+                f"找不到可执行文件：{command}。已找过 PATH 与本机常见安装位置；"
+                f"如果它装在别处，在插件的「可执行文件搜索目录」里填上它所在的目录。"
+            )
             self.log(self.error, "error")
             raise ManifestError(self.error)
+        if Path(exe).suffix.lower() in SHELL_SUFFIXES:
+            # CreateProcess 不认 .cmd/.bat，得套一层 cmd /c（npm / yarn 就是这种）
+            exe, args = os.environ.get("COMSPEC", "cmd.exe"), ["/c", exe, *args]
         base = self.manifest.path or Path.cwd()
         cwd = (base / cwd_rel).resolve() if cwd_rel not in ("", ".") else base.resolve()
         if base.resolve() not in cwd.parents and cwd != base.resolve():
@@ -77,7 +235,7 @@ class ProcessRunner:
         self._stopping = False
         self.state = "starting"
         self.error = ""
-        env = os.environ.copy()
+        env = self._child_env(extra, exe)
         for key, value in (self.manifest.process.get("env") or {}).items():
             if value is not None:
                 env[str(key)] = str(value)
@@ -94,6 +252,8 @@ class ProcessRunner:
             if self.manifest.process.get(key):
                 env.setdefault("PORT", str(self.manifest.process[key]))
 
+        for hint in self._preflight(cwd):
+            self.log(hint, "warn")
         self.log(f"启动：{exe} {' '.join(args)}（cwd={cwd}）")
         try:
             self._proc = await asyncio.create_subprocess_exec(
@@ -149,6 +309,40 @@ class ProcessRunner:
         self.log("已停止")
 
     # -- 内部 -------------------------------------------------------------
+    def _child_env(self, extra: list[str], exe: str) -> dict[str, str]:
+        """子进程环境：把可执行文件所在的目录顶到 PATH 最前面。
+
+        为什么非加不可：``npm`` 自己会去调 ``node``。光把 npm 的绝对路径给对还不
+        够 —— 子进程的 PATH 里没有 node，npm 一启动就报「找不到 node」，而且报的
+        是我们完全没写过的错。同理适用于 yarn/pnpm、以及各种 ``#!/usr/bin/env``
+        脚本。配置里指定的搜索目录也一并带上。
+        """
+        env = os.environ.copy()
+        parts: list[str] = []
+        for item in [*extra, str(Path(exe).parent)]:
+            if item and item not in parts:
+                parts.append(item)
+        current = env.get("PATH", "")
+        env["PATH"] = os.pathsep.join([*parts, current]) if parts else current
+        return env
+
+    def _preflight(self, cwd: Path) -> list[str]:
+        """启动前的常识性提醒 —— 只写日志，不阻断（有人就是 vendored 依赖）。"""
+        hints: list[str] = []
+        if (cwd / "package.json").is_file() and not (cwd / "node_modules").is_dir():
+            hints.append(
+                "这个插件是 Node 项目，但目录里没有 node_modules —— 依赖还没装。"
+                f"先在插件目录跑一次 npm install：{cwd}"
+            )
+        if (cwd / "requirements.txt").is_file() and not (
+            cwd / ".venv" if (cwd / ".venv").is_dir() else cwd / "site-packages"
+        ).exists():
+            hints.append(
+                "这个插件有 requirements.txt。若启动报缺模块，先装依赖："
+                f"pip install -r {cwd / 'requirements.txt'}"
+            )
+        return hints
+
     async def _pump_output(self, proc: asyncio.subprocess.Process) -> None:
         stream = proc.stdout
         if stream is None:
@@ -207,22 +401,10 @@ class ProcessRunner:
         }
 
 
-def resolve_executable(command: str) -> str | None:
-    """找可执行文件。``python`` 特意指回当前解释器（虚拟环境里才对）。"""
-    cmd = str(command or "").strip()
-    if not cmd:
-        return None
-    if cmd in ("python", "python3", "py"):
-        return sys.executable
-    found = shutil.which(cmd)
-    if found:
-        return found
-    # Windows 上 npm/yarn 这类是 .cmd，which 一般能补；补不到再试一次
-    for suffix in (".cmd", ".exe", ".bat"):
-        found = shutil.which(cmd + suffix)
-        if found:
-            return found
-    return None
-
-
-__all__ = ["ProcessRunner", "resolve_executable", "LOG_LINES"]
+__all__ = [
+    "ProcessRunner",
+    "resolve_executable",
+    "candidate_bin_dirs",
+    "extra_bin_dirs",
+    "LOG_LINES",
+]

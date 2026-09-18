@@ -440,3 +440,164 @@ def test_shell_reads_env_extra(monkeypatch, tmp_path):
     asyncio.run(tool.execute('{"command": "python run.py"}', "s1"))
     assert captured["env"] and captured["env"]["OPENAI_API_KEY"] == "sk-test"
     _prefs.get_prefs().set_now("sandbox.envExtra", "{}")
+
+
+# ---------------------------------------------------------------------------
+# 技能声明的环境变量（metadata.requires.env）
+# ---------------------------------------------------------------------------
+def test_declared_env_reads_all_three_conventions():
+    from openminis.skills.store import declared_env
+
+    # Claude Skills 的写法
+    assert declared_env(
+        {"metadata": {"requires": {"env": ["MODELSCOPE_API_KEY"]}}}
+    ) == ("MODELSCOPE_API_KEY",)
+    # 短一点的两处写法也认
+    assert declared_env({"metadata": {"env": ["A", "B"]}}) == ("A", "B")
+    assert declared_env({"env": "A, B\nC"}) == ("A", "B", "C")
+    # 去重保序；没声明就是空的
+    assert declared_env({"requiredEnv": ["X"]}) == ()
+    assert declared_env({"metadata": {"requires": {"env": ["A", "A", "B"]}}}) == ("A", "B")
+
+
+def test_skill_entry_exposes_declared_env(tmp_path, monkeypatch):
+    from openminis.core import context
+    from openminis.skills import SkillStore
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MINIS_HOME", str(home))
+    context.set_app_context(context.AppContext(data_dir=home, cache_dir=home))
+
+    skill = home / "skills" / "demo"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\n"
+        "name: demo\n"
+        "description: 演示\n"
+        "metadata:/n"
+        "  requires:/n"
+        "    env: [\"MODELSCOPE_API_KEY\"]\n"
+        "---\n\n正文\n",
+        encoding="utf-8",
+    )
+    entry = SkillStore().get("demo")
+    assert entry is not None
+    assert entry.env == ("MODELSCOPE_API_KEY",)
+
+
+# ---------------------------------------------------------------------------
+# 技能声明的环境变量（metadata.requires.env）
+# ---------------------------------------------------------------------------
+def test_declared_env_reads_all_three_conventions():
+    from openminis.skills.store import declared_env
+
+    # Claude Skills 的写法
+    assert declared_env(
+        {"metadata": {"requires": {"env": ["MODELSCOPE_API_KEY"]}}}
+    ) == ("MODELSCOPE_API_KEY",)
+    # 短一点的两处写法也认
+    assert declared_env({"metadata": {"env": ["A", "B"]}}) == ("A", "B")
+    assert declared_env({"env": "A, B\nC"}) == ("A", "B", "C")
+    # 去重保序；没声明就是空的
+    assert declared_env({"requiredEnv": ["X"]}) == ()
+    assert declared_env({"metadata": {"requires": {"env": ["A", "A", "B"]}}}) == ("A", "B")
+
+
+def test_skill_entry_exposes_declared_env(tmp_path, monkeypatch):
+    from openminis.core import context
+    from openminis.skills import SkillStore
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MINIS_HOME", str(home))
+    context.set_app_context(context.AppContext(data_dir=home, cache_dir=home))
+
+    skill = home / "skills" / "demo"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\n"
+        "name: demo\n"
+        "description: 演示\n"
+        "metadata:\n"
+        "  requires:\n"
+        "    env: [\"MODELSCOPE_API_KEY\"]\n"
+        "---\n\n正文\n",
+        encoding="utf-8",
+    )
+    entry = SkillStore().get("demo")
+    assert entry is not None
+    assert entry.env == ("MODELSCOPE_API_KEY",)
+
+
+def test_skill_env_api_roundtrip(tmp_path, monkeypatch):
+    """技能环境变量的读写：与设置页那份是同一处存储（sandbox.envExtra）。
+
+    技能在 SKILL.md 里声明 ``metadata.requires.env``，界面据此列出「还差哪一项」；
+    值本身走沙箱那套环境变量，shell 每次执行前整份注入 —— 所以填完不用重启。
+    """
+    import asyncio
+
+    from openminis.core import context
+    from openminis.server import skills_api
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MINIS_HOME", str(home))
+    context.set_app_context(context.AppContext(data_dir=home, cache_dir=home))
+
+    skill = home / "skills" / "img"
+    skill.mkdir(parents=True)
+    (skill / "SKILL.md").write_text(
+        "---\n"
+        "name: img\n"
+        "description: 生图\n"
+        "metadata:\n"
+        "  requires:\n"
+        "    env: [\"MODELSCOPE_API_KEY\"]\n"
+        "---\n\n正文\n",
+        encoding="utf-8",
+    )
+
+    info = asyncio.run(skills_api.skills_env())
+    assert [r["name"] for r in info["required"]] == ["MODELSCOPE_API_KEY"]
+    assert info["required"][0]["set"] is False
+    assert info["required"][0]["skills"] == ["img"]
+
+    saved = asyncio.run(
+        skills_api.skills_env_save(
+            skills_api.EnvRequest(values={"MODELSCOPE_API_KEY": "ms-abc123"})
+        )
+    )
+    assert saved["required"][0]["set"] is True
+    assert saved["values"]["MODELSCOPE_API_KEY"] == "ms-abc123"
+
+    # 空值 = 删掉该项
+    cleared = asyncio.run(
+        skills_api.skills_env_save(
+            skills_api.EnvRequest(values={"MODELSCOPE_API_KEY": ""})
+        )
+    )
+    assert cleared["required"][0]["set"] is False
+    assert "MODELSCOPE_API_KEY" not in cleared["values"]
+
+
+def test_skill_env_feeds_sandbox_shell(tmp_path, monkeypatch):
+    """填进去的值必须真的进得了沙箱命令的环境（不然填了等于没填）。"""
+    import asyncio
+
+    from openminis.core import context
+    from openminis.server import skills_api
+    from openminis.tools.shell_execute_tool import _load_env_extra
+
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("MINIS_HOME", str(home))
+    context.set_app_context(context.AppContext(data_dir=home, cache_dir=home))
+
+    asyncio.run(
+        skills_api.skills_env_save(
+            skills_api.EnvRequest(values={"MODELSCOPE_API_KEY": "ms-xyz"})
+        )
+    )
+    assert _load_env_extra() == {"MODELSCOPE_API_KEY": "ms-xyz"}

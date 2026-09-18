@@ -19,6 +19,7 @@ Installing from a directory or a ``.zip`` is supported for third-party skills.
 
 from __future__ import annotations
 
+import re
 import shutil
 import tempfile
 import zipfile
@@ -33,7 +34,13 @@ from .models import SkillEntry, ToolEntry
 
 logger = get_logger(__name__)
 
-__all__ = ["SkillStore", "SkillError", "SKILL_FILE", "BUILTIN_TOOLS_SKILL"]
+__all__ = [
+    "SkillStore",
+    "SkillError",
+    "SKILL_FILE",
+    "BUILTIN_TOOLS_SKILL",
+    "declared_env",
+]
 
 SKILL_FILE = "SKILL.md"
 BUILTIN_TOOLS_SKILL = "builtin-tools"
@@ -99,6 +106,43 @@ def _split_frontmatter(text: str) -> tuple[dict[str, Any], str]:
 def _skill_name(meta: dict[str, Any], fallback: str) -> str:
     name = str(meta.get("name") or "").strip()
     return name or fallback
+
+
+#: 技能声明「我需要这些环境变量」的三个位置，按优先级排列。
+#:
+#: ``metadata.requires.env`` 是 Claude Skills 的约定（``metadata.requires.bins``
+#: 是同一套），另外兼容更随意的两种写法。声明了不等于配好了 —— 引擎不会自己
+#: 变出密钥来，但至少能据此在界面上把「缺哪一项」指出来。
+_ENV_PATHS: tuple[tuple[str, ...], ...] = (
+    ("metadata", "requires", "env"),
+    ("metadata", "env"),
+    ("requires", "env"),
+    ("env",),
+)
+
+
+def declared_env(meta: dict[str, Any]) -> tuple[str, ...]:
+    """从 SKILL.md 的 frontmatter 里读出声明的环境变量名（去重、保序）。"""
+    found: list[str] = []
+    for path in _ENV_PATHS:
+        node: Any = meta
+        for key in path:
+            if not isinstance(node, dict):
+                node = None
+                break
+            node = node.get(key)
+        if node is None:
+            continue
+        raw = node
+        if isinstance(raw, str):
+            raw = [part for part in re.split(r"[,\s]+", raw) if part]
+        if not isinstance(raw, (list, tuple)):
+            continue
+        for item in raw:
+            name = str(item or "").strip()
+            if name and name not in found:
+                found.append(name)
+    return tuple(found)
 
 
 #: 技能根目录的配置文件（放数据目录下）。写 ``root: <路径>`` 即可把技能库
@@ -334,6 +378,7 @@ class SkillStore:
             source="builtin" if meta.get("builtin") else "user",
             generated=directory.name == BUILTIN_TOOLS_SKILL,
             scripts=scripts,
+            env=declared_env(meta),
             body=body,
         )
 

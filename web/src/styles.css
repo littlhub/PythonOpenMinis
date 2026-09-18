@@ -5933,6 +5933,21 @@ dl.facts.usage-detail {
   padding: 4px 8px;
 }
 
+/* 「或手填模型 id」—— 与上面的下拉并列，窄一点，别把下拉挤没了 */
+.fallback-row .fallback-manual {
+  flex: 0 1 150px;
+}
+
+/* 窄屏：一行塞不下三个控件，让手填那格换到下一行 */
+@media (max-width: 768px) {
+  .fallback-row {
+    flex-wrap: wrap;
+  }
+  .fallback-row .fallback-manual {
+    flex: 1 1 100%;
+  }
+}
+
 /* 没填完的兜底行（缺厂商实例或模型 id）—— 存不下来，先在界面上标出来。 */
 .fallback-row[data-incomplete] .fallback-idx {
   background: var(--danger-soft, rgba(220, 80, 80, 0.16));

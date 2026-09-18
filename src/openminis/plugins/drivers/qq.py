@@ -383,6 +383,11 @@ class QQAdapter(ChannelAdapter):
         if not peer:
             return
         chunks = self.split_text(text)
+        # 按上限切分会切出一堆以空行开头/结尾的碎片（按 ``\n`` 断句时尤其明显），
+        # 原样发出去 QQ 里就是「一条全是空白的消息」。先收拾干净再发。
+        chunks = [c.strip() for c in chunks if c.strip()]
+        if not chunks:
+            return
         # 同一条入站消息可能被回好几条（流式分段、命令提示…），每条都要带
         # 互不相同的 msg_seq —— 官方按 (msg_id, msg_seq) 判重，重复会被丢弃。
         base_seq = self._reserve_seq(msg, len(chunks))

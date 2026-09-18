@@ -84,6 +84,35 @@ def _cooldown_active() -> bool:
     ) < _COOLDOWN_SECONDS
 
 
+#: 「这张图问不出来」的封禁名单：路径 → 最后一次失败时刻。
+#:
+#: 结果缓存是按 ``(路径, prompt)`` 存的，模型只要**换个措辞**重问就绕过缓存再
+#: 打一次 API —— 实测它对同一张图连问 6 遍（prompt 每遍微调一下），把限流额度
+#: 烧完了还在问。所以再加一层按路径的封禁：同一张图失败过一次，TTL 内不再真调
+#: 模型，直接回一句「别再试了」。
+_DEAD_PATH_TTL = 300.0
+_DEAD_PATHS: dict[str, float] = {}
+
+
+def _path_dead(path: str) -> bool:
+    ts = _DEAD_PATHS.get(path)
+    if ts is None:
+        return False
+    if time.monotonic() - ts > _DEAD_PATH_TTL:
+        _DEAD_PATHS.pop(path, None)
+        return False
+    return True
+
+
+def _mark_path_dead(path: str) -> None:
+    if not path:
+        return
+    if len(_DEAD_PATHS) >= _DESC_CACHE_MAX:
+        oldest = min(_DEAD_PATHS, key=lambda k: _DEAD_PATHS[k])
+        _DEAD_PATHS.pop(oldest, None)
+    _DEAD_PATHS[path] = time.monotonic()
+
+
 def _no_retry_note() -> str:
     return (
         f"（识图服务已连续失败 {_fail_state['streak']} 次，通常是模型限流；"
@@ -102,13 +131,31 @@ def vision_slot_ready(store: Any) -> bool:
 def _build_vision_provider(store: Any, conf: dict[str, Any], model_id: str):
     """Instantiate the provider for the vision slot's instance + model.
 
+    **包上兜底链**：识图槽原来只绑一个模型，一撞限流（429）整条识图能力就瞎了。
+    主对话早就有兜底链，识图却只有单点 —— 而识图恰恰是最容易被限流的那条路
+    （请求里带图，额度更紧）。所以这里复用 ``agent.fallbackModels``：
+    不识图的人不用配，配了的人两边一起受益。
+
     Imported lazily: ``chat_service`` imports the provider engines and the
     catalog, and this module is reachable from the tool registry — a top-level
     import would risk a cycle.
     """
-    from .chat_service import build_provider
+    from .chat_service import _apply_fallback_chain, build_provider
 
-    return build_provider(str(conf.get("id") or ""), {**conf, "model": model_id})
+    pid = str(conf.get("id") or "")
+    primary = build_provider(pid, {**conf, "model": model_id})
+    try:
+        agent_cfg = store.agent_config()
+        return _apply_fallback_chain(store, primary, agent_cfg, pid)
+    except Exception as exc:  # pragma: no cover - 兜底链起不来不该拖垮识图主路
+        logger.warning("vision fallback chain unavailable: %s", exc)
+        return primary
+
+
+def _active_label(provider: Any, fallback: str) -> str:
+    """兜底链实际用上的模型名 —— 报错/标注时要写清楚是谁答的。"""
+    label = getattr(provider, "active_label", "") or ""
+    return str(label) if str(label).strip() else fallback
 
 
 #: describe_image 失败时 failure_text 里的可识别标记 —— 用来判断「这条路没走通」。
@@ -175,6 +222,12 @@ async def describe_image_with_fallback(
             + "\n（识图结果缓存命中，未重复调用识图模型；"
             "同一张图不要反复调用 read_image，直接引用已有描述回答。）"
         )
+    if image_path and _path_dead(image_path):
+        # 换个 prompt 重问绕过不了这一层 —— 失败原因跟问题无关，纯属烧额度。
+        return VisionGroupResolver.failure_text(
+            f"{image_path} 刚识图失败过，{int(_DEAD_PATH_TTL / 60)} 分钟内不再重试"
+            "（换 prompt 也没用：失败与问题无关）。直接告诉用户这次没读到这张图。"
+        )
     text = await describe_image(
         store, image_bytes, mime_type, prompt=prompt, image_path=image_path
     )
@@ -182,6 +235,8 @@ async def describe_image_with_fallback(
     if not failed:
         _cache_put(key, text or "")
         return text
+    if image_path:
+        _mark_path_dead(image_path)
     if _VISION_FALLBACK_DEPTH.get() > 0:
         return text
     token = _VISION_FALLBACK_DEPTH.set(1)
@@ -190,6 +245,8 @@ async def describe_image_with_fallback(
     finally:
         _VISION_FALLBACK_DEPTH.reset(token)
     if sub:
+        # 子代理那条路走通了 —— 把封禁撤掉，否则换个问题问同一张图会被误拦。
+        _DEAD_PATHS.pop(image_path or "", None)
         _cache_put(key, sub)
         return sub
     return text
@@ -283,8 +340,10 @@ async def _describe_image_inner(
     text = (getattr(resp, "text", "") or "").strip()
     if not text:
         return VisionGroupResolver.failure_text(f"{model_id} 返回了空描述")
+    # 走了兜底就写实际答话的那个模型名，别让用户照着错的配置去查。
+    answered_by = _active_label(provider, model_id)
     framed = VisionGroupResolver.framed_description_success(
-        VisionResult.Success(description=text, model_name=model_id),
+        VisionResult.Success(description=text, model_name=answered_by),
         question=prompt if prompt.strip() else None,
     )
     if image_path:

@@ -234,10 +234,22 @@ def _resolve_session_host_path(session_id: str, path: str) -> Path | None:
     candidate = path.strip()
     if not candidate:
         return None
-    for prefix in ("/var/minis/workspace", "/workspace", "/var/minis"):
-        if candidate.startswith(prefix):
-            candidate = candidate[len(prefix) :]
-            break
+
+    # ``/var/minis/workspace/...`` 是**工作区根**（不是会话根）。
+    #
+    # 这条路径形态是引擎自己造出来的：出站给模型看的内容里，机器绝对路径会被
+    # 换成沙箱写法（见 ``path_utils.scrub_machine_paths``），不出现
+    # ``C:/Users/<名>/…``。模型原样回填时，若按「会话相对」去
+    # ``workspace/<sid>/…`` 里找，必然找不到 —— 用户现场就是「图生成了、也告诉
+    # 了模型路径，它却读不到」。
+    from .path_utils import split_sandbox_prefix
+
+    rooted = split_sandbox_prefix(candidate)
+    if rooted is not None:
+        candidate = rooted
+        base_root = workspace
+    else:
+        base_root = session_root
 
     # 绝对路径：只要落在工作区内就原样接受。上传的附件用的是绝对路径
     # （``<workspace>/uploads/...``），不认这一段的话 read_image 就拿不到图。
@@ -252,8 +264,8 @@ def _resolve_session_host_path(session_id: str, path: str) -> Path | None:
     candidate = candidate.lstrip("/") or ""
 
     # Reject escape attempts before touching the filesystem.
-    resolved = (session_root / candidate).resolve() if candidate else session_root.resolve()
-    root = session_root.resolve()
+    resolved = (base_root / candidate).resolve() if candidate else base_root.resolve()
+    root = base_root.resolve()
     if resolved != root and root not in resolved.parents:
         # 技能库是只读白名单根：让模型能读 SKILL.md / 技能脚本。
         from .path_utils import readonly_roots

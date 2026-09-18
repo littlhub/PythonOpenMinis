@@ -36,6 +36,7 @@ import type {
   SettingsInfo,
   SettingsPayload,
   SkillDetail,
+  SkillEnvInfo,
   SkillInfo,
   SkillsList,
   StorageInfo,
@@ -227,6 +228,16 @@ export const api = {
 
   // -- skills (技能) ----------------------------------------------
   skillsList: () => request<SkillsList>('/skills'),
+
+  /** 技能声明的环境变量 + 当前值（与设置页的「环境变量」是同一份存储）。 */
+  skillsEnv: () => request<SkillEnvInfo>('/skills/env'),
+
+  /** 整份覆盖环境变量。空值 = 删掉该项；存完沙箱命令立刻能用。 */
+  skillsEnvSave: (values: Record<string, string>) =>
+    request<{ ok: boolean } & SkillEnvInfo>('/skills/env', {
+      method: 'PUT',
+      body: JSON.stringify({ values }),
+    }),
 
   skillGet: (name: string) =>
     request<SkillDetail>(`/skills/${encodeURIComponent(name)}`),

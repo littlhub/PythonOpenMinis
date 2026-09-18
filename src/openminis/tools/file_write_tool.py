@@ -135,16 +135,25 @@ def _resolve_session_host_path(session_id: str, path: str) -> Path | None:
     candidate = path.strip()
     if not candidate:
         return None
-    for prefix in ("/var/minis/workspace", "/workspace", "/var/minis"):
-        if candidate.startswith(prefix):
-            candidate = candidate[len(prefix) :]
-            break
+
+    # ``/var/minis/workspace/...`` = **工作区根**（不是会话根）。引擎出站时会把
+    # 机器绝对路径换成这个沙箱写法（不出现 ``C:/Users/<名>/…``），模型原样回填
+    # 时必须解析得回来。详见 ``file_read_tool._resolve_session_host_path``。
+    from .path_utils import split_sandbox_prefix
+
+    rooted = split_sandbox_prefix(candidate)
+    if rooted is not None:
+        candidate = rooted
+        base_root = workspace
+    else:
+        base_root = session_root
+
     candidate = candidate.lstrip("/") or ""
 
     resolved = (
-        (session_root / candidate).resolve() if candidate else session_root.resolve()
+        (base_root / candidate).resolve() if candidate else base_root.resolve()
     )
-    root = session_root.resolve()
+    root = base_root.resolve()
     if resolved != root and root not in resolved.parents:
         logger.warning("file_write rejected path outside session root: %s", path)
         return None

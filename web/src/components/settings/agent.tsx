@@ -1502,6 +1502,9 @@ export function AgentConfigPage(props: { onBack: () => void }) {
               )}
               {(cfg.fallbackModels ?? []).map((m, i) => {
                 const inst = providers.find((p) => p.id === m.instance)
+                // 已保存的模型 id 在不在这个实例的清单里 —— 决定下拉要不要为它
+                // 补一个选项（不在清单里也要显示得出来，不能被静默换成别的）。
+                const knownModel = (inst?.models ?? []).some((mo) => mo.id === m.model)
                 const patch = (next: { instance: string; model: string }) => {
                   const list = [...(cfg.fallbackModels ?? [])]
                   list[i] = next
@@ -1536,20 +1539,34 @@ export function AgentConfigPage(props: { onBack: () => void }) {
                         </option>
                       ))}
                     </select>
-                    <input
-                      list={`fb-models-${i}`}
-                      placeholder="模型 id(可直接输入)"
-                      value={m.model}
-                      title="兜底用的模型 id"
+                    {/*
+                      模型也做成下拉（与「用途分槽」同一套做法）—— 之前是个
+                      datalist 输入框，等于每次都要自己回去翻模型 id，明明清单
+                      就在手边。已保存但不在清单里的 id 补一个选项，绝不静默丢掉。
+                    */}
+                    <select
+                      value={knownModel ? m.model : ''}
+                      disabled={!m.instance}
+                      title="兜底用的模型"
                       onChange={(e) => patch({ ...m, model: e.target.value })}
-                    />
-                    <datalist id={`fb-models-${i}`}>
+                    >
+                      <option value="">选择模型…</option>
                       {(inst?.models ?? []).map((mo) => (
                         <option key={mo.id} value={mo.id}>
                           {mo.name || mo.id}
                         </option>
                       ))}
-                    </datalist>
+                      {m.model && !knownModel && (
+                        <option value={m.model}>{m.model}（不在清单里）</option>
+                      )}
+                    </select>
+                    <input
+                      className="fallback-manual"
+                      placeholder="或手填模型 id"
+                      value={m.model}
+                      title="清单里没有的模型（私有部署 / 代理改名）直接填这里"
+                      onChange={(e) => patch({ ...m, model: e.target.value })}
+                    />
                     <button
                       type="button"
                       className="fallback-del"

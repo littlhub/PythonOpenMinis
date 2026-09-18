@@ -681,9 +681,25 @@ export interface SkillInfo {
   /** Generated bundles (builtin-tool manifest) can't be uninstalled. */
   generated: boolean
   scripts: string[]
+  /** SKILL.md 里声明的环境变量名（`metadata.requires.env` 等）。 */
+  env?: string[]
   path: string
   /** In the main agent's skill scope (可被调用). */
   active: boolean
+}
+
+/** 技能声明的环境变量 —— 哪个技能要它、现在配了没有。 */
+export interface SkillEnvVar {
+  name: string
+  skills: string[]
+  set: boolean
+}
+
+/** `/api/skills/env` 的返回：声明清单 + 当前值（与设置页的 envExtra 同一份）。 */
+export interface SkillEnvInfo {
+  required: SkillEnvVar[]
+  values: Record<string, string>
+  count: number
 }
 
 /** A builtin tool exposed to the agent loop. */

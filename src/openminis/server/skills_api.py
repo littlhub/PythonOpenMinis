@@ -19,6 +19,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import json
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
@@ -37,6 +39,10 @@ class InstallRequest(BaseModel):
     force: bool = False
 
 
+class EnvRequest(BaseModel):
+    values: dict[str, str] = {}
+
+
 def _is_active(entry: Any, active: set[str]) -> bool:
     return entry.name in active or Path(entry.path).name in active
 
@@ -48,6 +54,8 @@ def _skill_dict(entry: Any, active: set[str] | None = None) -> dict[str, Any]:
         "source": entry.source,
         "generated": entry.generated,
         "scripts": list(entry.scripts),
+        # SKILL.md 里声明的环境变量名（``metadata.requires.env`` …）
+        "env": list(getattr(entry, "env", ()) or ()),
         "path": entry.path,
         "active": bool(active) and _is_active(entry, active or set()),
     }
@@ -72,6 +80,71 @@ async def skills_list() -> dict[str, Any]:
         "dir": str(store.root),
         "active": sorted(active),
     }
+
+
+# -- 环境变量 ---------------------------------------------------------------
+# 技能会在 SKILL.md 里声明「我需要这些环境变量」（``metadata.requires.env``，
+# 如 modelscope-image 的 MODELSCOPE_API_KEY）。引擎不会自己变出密钥，但可以把
+# 「哪些技能需要什么、现在缺哪些」摆到界面上，用户填一次就够。
+#
+# 值存的是**同一份** ``sandbox.envExtra`` —— 设置页那个「环境变量」编辑器读写的
+# 就是它，沙箱 shell 每次执行前会整份注入（``shell_execute_tool._load_env_extra``）。
+# 所以在这里填完，技能脚本里的 ``os.getenv`` / ``$VAR`` 立刻就能拿到，不用重启。
+def _env_values() -> dict[str, str]:
+    from ..core.prefs import get_prefs
+
+    raw = get_prefs().get_string("sandbox.envExtra") or ""
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        logger.warning("sandbox.envExtra 不是合法 JSON，按空处理")
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items()}
+
+
+def _env_values_save(values: dict[str, str]) -> None:
+    from ..core.prefs import get_prefs
+
+    get_prefs().set_now(
+        "sandbox.envExtra", json.dumps(values, ensure_ascii=False, indent=2)
+    )
+
+
+@router.get("/env")
+async def skills_env() -> dict[str, Any]:
+    """技能声明的环境变量 + 当前值 + 有没有配。"""
+    values = _env_values()
+    needs: dict[str, list[str]] = {}
+    for entry in SkillStore().list():
+        if entry.generated:
+            continue
+        for name in getattr(entry, "env", ()) or ():
+            needs.setdefault(name, []).append(entry.name)
+    return {
+        "required": [
+            {"name": name, "skills": sorted(skills), "set": bool(values.get(name))}
+            for name, skills in sorted(needs.items())
+        ],
+        "values": values,
+        "count": len(values),
+    }
+
+
+@router.put("/env")
+async def skills_env_save(req: EnvRequest) -> dict[str, Any]:
+    """整份覆盖环境变量（与设置页那份是同一处存储）。空值 = 删掉该项。"""
+    clean = {
+        str(k).strip(): str(v)
+        for k, v in (req.values or {}).items()
+        if str(k).strip() and str(v or "").strip()
+    }
+    _env_values_save(clean)
+    logger.info("skill env updated: %d 项", len(clean))
+    return {"ok": True, **await skills_env()}
 
 
 @router.post("/install")

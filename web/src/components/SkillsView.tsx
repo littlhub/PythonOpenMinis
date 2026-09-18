@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { api } from '../api'
-import type { SkillDetail, SkillInfo, SkillToolInfo } from '../types'
+import type { SkillDetail, SkillEnvInfo, SkillInfo, SkillToolInfo } from '../types'
 
 type Filter = 'all' | 'active' | 'builtin' | 'user' | 'tools'
 
@@ -24,6 +24,9 @@ export function SkillsView() {
   const [installPath, setInstallPath] = useState('')
   const [force, setForce] = useState(false)
   const [busy, setBusy] = useState(false)
+  const [envInfo, setEnvInfo] = useState<SkillEnvInfo | null>(null)
+  const [envDraft, setEnvDraft] = useState<Record<string, string>>({})
+  const [showEnv, setShowEnv] = useState(false)
 
   const load = async () => {
     setLoading(true)
@@ -37,6 +40,32 @@ export function SkillsView() {
       setError(e instanceof Error ? e.message : String(e))
     } finally {
       setLoading(false)
+    }
+    // 环境变量是另一条口子 —— 读不到不该把整页拖成「加载失败」。
+    try {
+      const env = await api.skillsEnv()
+      setEnvInfo(env)
+      setEnvDraft(env.values)
+    } catch {
+      setEnvInfo(null)
+    }
+  }
+
+  const missingEnv = (skill: SkillInfo) =>
+    (skill.env ?? []).filter((name) => !(envInfo?.values?.[name] || '').trim())
+
+  const saveEnv = async () => {
+    setBusy(true)
+    setNotice('')
+    try {
+      const res = await api.skillsEnvSave(envDraft)
+      setEnvInfo({ required: res.required, values: res.values, count: res.count })
+      setEnvDraft(res.values)
+      setNotice(`已保存 ${res.count} 个环境变量（新命令立刻生效）`)
+    } catch (e) {
+      setNotice(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
     }
   }
 
@@ -180,6 +209,62 @@ export function SkillsView() {
 
         {dir && <div className="pathline muted">技能目录：{dir}</div>}
 
+        {/* 环境变量：技能在 SKILL.md 里声明「我需要什么」，这里填值。
+            存的就是设置 → 系统 →「环境变量」那一份，沙箱命令立刻可见。 */}
+        {envInfo && envInfo.required.length > 0 && (
+          <div className="set-section" style={{ marginTop: 10 }}>
+            <div className="set-title">
+              环境变量
+              {envInfo.required.some((r) => !r.set) && (
+                <span className="kb-count">
+                  {' '}
+                  还差 {envInfo.required.filter((r) => !r.set).length} 项
+                </span>
+              )}
+              <button
+                className="memory-action-btn"
+                style={{ marginLeft: 8 }}
+                onClick={() => setShowEnv((v) => !v)}
+              >
+                {showEnv ? '收起' : '填写'}
+              </button>
+            </div>
+            {showEnv && (
+              <div className="plugin-form" style={{ marginTop: 8 }}>
+                {envInfo.required.map((r) => (
+                  <label className="plugin-field" key={r.name}>
+                    <span className="plugin-field-label">
+                      {r.name}
+                      {!r.set && <i className="req">*</i>}
+                      <span className="muted"> · {r.skills.join('、')} 用</span>
+                    </span>
+                    <input
+                      type="password"
+                      value={envDraft[r.name] ?? ''}
+                      placeholder={r.set ? '已填' : '还没填'}
+                      onChange={(e) =>
+                        setEnvDraft({ ...envDraft, [r.name]: e.target.value })
+                      }
+                    />
+                  </label>
+                ))}
+                <div className="plugin-form-foot">
+                  <button
+                    className="plugin-btn primary"
+                    disabled={busy}
+                    onClick={() => void saveEnv()}
+                  >
+                    {busy ? '保存中…' : '保存'}
+                  </button>
+                  <span className="muted" style={{ fontSize: 11 }}>
+                    技能脚本读 os.getenv / $VAR 取的就是这里；保存后新命令立刻生效
+                  </span>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {filter === 'tools' ? (
           <div className="kb-list">
             {filteredTools.map((t) => (
@@ -215,6 +300,11 @@ export function SkillsView() {
                   <div className="skill-desc">
                     {skill.description || '（无描述）'}
                   </div>
+                  {missingEnv(skill).length > 0 && (
+                    <div className="muted" style={{ fontSize: 11, color: 'var(--danger)' }}>
+                      缺环境变量：{missingEnv(skill).join('、')}
+                    </div>
+                  )}
                   <div className="kb-item-footer muted">
                     {skill.source === 'builtin' ? '内置' : '自定义'}
                     {skill.scripts.length > 0 && ` · 脚本 ${skill.scripts.length}`}
