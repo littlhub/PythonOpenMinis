@@ -15,7 +15,9 @@
 from __future__ import annotations
 
 import base64
+import contextvars
 import json
+import re
 import time
 import uuid
 from pathlib import Path
@@ -37,6 +39,19 @@ MAX_COUNT = 8
 #: 该引擎是否支持 OpenAI 兼容的生图端点。
 _IMAGE_ENGINES = {"openai"}
 
+#: 生图委派深度标记：子代理内部再调 image_gen 时（Depth>0）直接走槽直出，
+#: 避免「image_gen → 委派子代理 → 子代理又调 image_gen → …」无限嵌套。
+_IMAGE_SUBAGENT_DEPTH: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "image_subagent_depth", default=0
+)
+
+#: 子代理回包里常见的「生成路径」文本（``generated/img_xxx.png``），据此把
+#: 文件名还原成绝对路径，让工具返回值能直接送图。
+_GEN_PATH_RE = re.compile(
+    r"generated[\\/]([A-Za-z0-9_.\-]+\.(?:png|jpg|jpeg|webp))",
+    re.IGNORECASE,
+)
+
 
 def _generated_dir() -> Path:
     p = app_context().external_files_dir / "generated"
@@ -49,6 +64,78 @@ def _not_configured_text() -> str:
         "生图未启用：还没有绑定「生图」模型的槽位。请打开 设置 → 模型服务 → "
         "用途分槽，把「生图」槽指向一个生图模型（如 dall-e-3 / gpt-image-1 / "
         "flux / 即梦），然后重试。"
+    )
+
+
+def _extract_generated_path(text: str) -> Path | None:
+    """从子代理回包里抠出 ``generated/img_xxx.png``，还原成绝对路径。"""
+    m = _GEN_PATH_RE.search(text or "")
+    if not m:
+        return None
+    p = _generated_dir() / m.group(1)
+    return p if p.is_file() else None
+
+
+async def _try_delegate_image(
+    session_id: str,
+    tool_title: str,
+    prompt: str,
+    size: str,
+    count: int,
+) -> ToolExecutionResult | None:
+    """生图委派子代理。开关没开 / 没配生图子代理 / 失败 → 返回 ``None``，
+    调用方保留槽直出这条路。走通则返回子代理生成的图。
+    """
+    try:
+        from ..settings.store import SettingsStore
+
+        store = SettingsStore.get()
+        if not (store.agent_config() or {}).get("imageSubagent"):
+            return None
+        from ..agent.subagents import find_image_subagent, run_subagent
+
+        sid = find_image_subagent(store)
+        if not sid:
+            return None
+    except Exception:  # pragma: no cover - 配置/子代理不可读
+        logger.debug("image subagent lookup failed", exc_info=True)
+        return None
+
+    ask = (
+        f"请用 image_gen 工具生成图片。\n"
+        f"prompt：{prompt}\n"
+        f"size：{size or DEFAULT_SIZE}，count：{count}（说一张就只生成一张）\n"
+        "完成后把 image_gen 打印的图片文件路径（generated/xxx）原样告诉我。"
+    )
+    token = _IMAGE_SUBAGENT_DEPTH.set(1)
+    try:
+        out = await run_subagent(store, sid, ask, session_id or "image-gen-fallback")
+    except Exception:  # pragma: no cover - 子代理执行异常
+        logger.debug("image subagent run failed", exc_info=True)
+        return None
+    finally:
+        _IMAGE_SUBAGENT_DEPTH.reset(token)
+
+    if not out:
+        return None
+    path = _extract_generated_path(out)
+    header = f"[image_gen → 生图子代理 {sid}]"
+    if path is None:
+        # 子代理生成了但没带路径：把它的结论原样交还，自动预览（toolEnd）仍能把
+        # 新落盘的图找出来送给客户，不影响 send。
+        return ToolExecutionResult(output=f"{header}\n{out}", success=True,
+                                   tool_title=tool_title)
+    try:
+        raw = path.read_bytes()
+    except OSError:  # pragma: no cover - 文件刚被删
+        raw = None
+    return ToolExecutionResult(
+        output=f"{header}\n{out}",
+        success=True,
+        image_data=raw,
+        image_mime_type="image/png",
+        image_file_path=str(path),
+        tool_title=tool_title,
     )
 
 
@@ -120,6 +207,16 @@ class ImageGenTool:
         except (TypeError, ValueError):
             count = 1
         count = max(1, min(count, MAX_COUNT))
+
+        # 生图走子代理开关（agent.imageSubagent）：开了且有匹配的生图子代理
+        # → 委派子代理（用子代理自己绑定的模型生成）。子代理内部再调
+        # image_gen 时深度标记>0，不会再次委派。没开/没子代理则走下方槽直出。
+        if _IMAGE_SUBAGENT_DEPTH.get() == 0:
+            delegated = await _try_delegate_image(
+                session_id, tool_title, prompt, size, count
+            )
+            if delegated is not None:
+                return delegated
 
         # 读取生图槽 —— 槽位/存储是运行时的单一事实来源
         try:

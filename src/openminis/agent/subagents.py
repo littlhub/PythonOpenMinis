@@ -43,6 +43,7 @@ __all__ = [
     "plan_subagent",
     "run_subagent",
     "find_vision_subagent",
+    "find_image_subagent",
     "group_block",
 ]
 
@@ -686,6 +687,56 @@ def find_vision_subagent(store) -> str | None:
         elif _subagent_model_sees(store, cfg, CAP_VISION):
             weak = sid
     return strong or weak
+
+
+#: 生图技能强信号：名字里明确就是「生图」，优先级最高。
+_GENERATE_SKILL_STRONG_HINTS = ("生图", "图像生成", "imagegen", "modelscope", "魔搭")
+#: 生图技能弱信号：可能是生图，也可能是看图（image 要往生图方向碰运气）。
+_GENERATE_SKILL_WEAK_HINTS = ("image", "图像", "图片", "draw", "t2i")
+
+
+def find_image_subagent(store) -> str | None:
+    """挑一个能「生图」的子代理 id，没有就返回 ``None``。
+
+    按分类匹配，**先窄后宽、逐级扩大**（搜不到才往下一级扩范围）：
+    1. 窄 —带 ``image_gen`` 且技能名明确是生图类（生图 / 图像生成 / 魔搭）；
+    2. 中 —带 ``image_gen`` 且技能名含 image / 图像 / 图片，或它绑定的模型
+           自带生图能力；
+    3. 宽 —只要带 ``image_gen`` 工具。
+    前一级一个都搜不到才向下一级扩大；搜到即停。
+    """
+    try:
+        from ..settings.model_capability import CAP_IMAGE
+    except Exception:  # pragma: no cover
+        CAP_IMAGE = "image"
+
+    def _skills(cfg: dict[str, Any]) -> list[str]:
+        return [str(s).lower() for s in (cfg.get("skills") or [])]
+
+    def _has_gen_tool(cfg: dict[str, Any]) -> bool:
+        return "image_gen" in (cfg.get("tools") or [])
+
+    def _strong(cfg: dict[str, Any]) -> bool:
+        return any(h in s for s in _skills(cfg) for h in _GENERATE_SKILL_STRONG_HINTS)
+
+    def _weak(cfg: dict[str, Any]) -> bool:
+        return any(h in s for s in _skills(cfg) for h in _GENERATE_SKILL_WEAK_HINTS)
+
+    # 第 1 级（窄）：明确生图技能。
+    for cfg in list_subagents(store):
+        if _has_gen_tool(cfg) and _strong(cfg):
+            return str(cfg.get("id") or "")
+    # 第 2 级（中）：技能提示或模型自带生图能力。
+    for cfg in list_subagents(store):
+        if not _has_gen_tool(cfg):
+            continue
+        if _weak(cfg) or _subagent_model_sees(store, cfg, CAP_IMAGE):
+            return str(cfg.get("id") or "")
+    # 第 3 级（宽）：只要带 image_gen 工具。
+    for cfg in list_subagents(store):
+        if _has_gen_tool(cfg):
+            return str(cfg.get("id") or "")
+    return None
 
 
 def _subagent_model_sees(store, cfg: dict[str, Any], cap_vision: str) -> bool:
