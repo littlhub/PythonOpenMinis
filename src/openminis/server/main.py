@@ -1131,6 +1131,11 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
             await _safe_send(client_id, ev)
 
         emitter_token = set_emitter(_on_agent_event)
+        # 交付台账按轮归零：`send` 靠它做「同一轮同一文件只交付一次」，以及
+        # 「你交付的是较旧那张」的提醒（模型会抓错历史里的 `![生成图](…)`）。
+        from ..tools import send_tool
+
+        send_tool.begin_turn(f"db-{sid}")
         try:
             await runtime.run(
                 provider,
@@ -1139,6 +1144,7 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
                 options=options,
             )
         finally:
+            send_tool.end_turn(f"db-{sid}")
             reset_emitter(emitter_token)
             await _persist_sub_turns(sid, sub_turns)
         # persist the final assistant text (intermediate tool rounds live only

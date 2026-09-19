@@ -271,6 +271,23 @@ class ChannelAdapter(abc.ABC):
         """「正在输入」。平台不支持时什么都不做。"""
         return None
 
+    async def send_ack(self, msg: IncomingMessage | None, text: str) -> bool:
+        """收到消息先回一句「收到，正在处理…」，返回「真的发出去了吗」。
+
+        为什么要有这一步：收附件（下载几 MB）+ 跑一轮（动辄几分钟，生图更久）
+        期间，用户在 IM 里看不到任何东西 —— 体感就是「消息发丢了」。先给回执，
+        比结果早到几秒更重要。
+
+        默认就是发一条普通文本。**有额度限制的平台要覆盖它**（QQ 的被动回复
+        群聊只有 5 次）：额度不足时宁可返回 False 不发这一句，也不能把真正的
+        结果挤掉。
+        """
+        try:
+            await self.send_text(msg, text)
+        except Exception:  # pragma: no cover - 回执失败不该打断正事
+            return False
+        return True
+
     async def send_image(
         self, msg: IncomingMessage | None, path: str | Path, **kwargs: Any
     ) -> bool:

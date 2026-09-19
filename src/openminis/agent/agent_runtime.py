@@ -90,6 +90,15 @@ def _round_dedup_key(params: dict[str, Any]) -> str:
         return repr(sorted(payload.items(), key=lambda kv: kv[0]))
 
 
+#: 同一**回合**内只放行一次的只读工具（同参、且上次成功）。
+#:
+#: 现场：一轮 6 分 23 秒的会话里，「加载同一个技能」被调了 5 次、「读同一张图」
+#: 2 次 —— 每次都要多一轮 LLM 往返（十几秒），纯浪费。同轮去重（``seen_in_round``）
+#: 看不见跨轮的重复，失败的调用则必须允许重试，所以这里只认**无副作用**且
+#: **上次成功**的那两个：写文件、发消息、跑命令、生图一律不碰。
+_TURN_DEDUP_TOOLS = frozenset({"skill_use", "read_image"})
+
+
 def _skill_mistake_hint(name: str) -> str | None:
     """When the model calls a skill name as a tool, explain the right way.
 
@@ -291,6 +300,8 @@ class AgentRuntime:
         if repeat_guard is not None:
             # 按轮计数的护栏在这里归零（「一张就停」），检测器的跨轮历史不动。
             repeat_guard.begin_turn()
+        #: 本回合内「已经成功跑过、且无副作用」的工具指纹（见 _TURN_DEDUP_TOOLS）。
+        turn_dedup: set[tuple] = set()
         tool_defs = self.tool_definitions()
 
         final_text: list[str] = []
@@ -468,6 +479,14 @@ class AgentRuntime:
                         "拿到重复结果，请直接引用已有结果继续或总结收尾。",
                     )
                 seen_in_round.add(dedup_key)
+                # 跨轮的同参重复：同轮集合每轮清空，看不见「上一轮刚成功调过」。
+                if not gate.is_blocking and dedup_key in turn_dedup:
+                    gate = LoopCheckResult(
+                        LoopLevel.CRITICAL,
+                        f"[LOOP BLOCKED] 本回合已经成功执行过 {tu.name}"
+                        "（参数完全相同），结果就在上面的上下文里 —— "
+                        "直接引用它继续，不要重复调用。",
+                    )
                 if gate.is_blocking:
                     blocked_any = True
                     if (gate.warning_key or "") == "imagebudget":
@@ -535,6 +554,8 @@ class AgentRuntime:
                                       error_message=None if result.success
                                       else result.output,
                                       tool_call_id=tu.id)
+                if result.success and tu.name in _TURN_DEDUP_TOOLS:
+                    turn_dedup.add((tu.name, _round_dedup_key(tu.input)))
                 extra_rec = (
                     repeat_guard.record(tu.name, tu.input, result.output,
                                         error_message=None if result.success
@@ -675,7 +696,12 @@ class AgentRuntime:
                                 else:
                                     finish_results.append(ToolResult(
                                         id=tu.id, name=tu.name,
-                                        content="[loop protection] 收尾阶段只允许 send。",
+                                        content=(
+                                            "[loop protection] 本轮已经结束，"
+                                            "不要再调用任何工具。本轮产出的图片/文件"
+                                            "会由系统自动交付给用户，你只需要直接输出"
+                                            "最终答复（把已经拿到的结论说清楚）。"
+                                        ),
                                         is_error=True,
                                     ))
                                 await self._emit(LLMStreamChunk.ToolResult(

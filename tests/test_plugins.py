@@ -16,6 +16,7 @@ import asyncio
 import base64
 import json
 import re
+import time
 import zipfile
 from pathlib import Path
 
@@ -342,7 +343,8 @@ async def test_bridge_maps_conversation_and_replies(data_dir, monkeypatch):
     msg = IncomingMessage(scope="c2c", peer_id="u1", sender_id="u1", text="在吗",
                           message_id="m1")
     await bridge.handle(msg)
-    assert adapter.sent == ["你好"]
+    # 第一条是「收到」回执（先响应再干活），然后是真正的回复
+    assert adapter.sent == ["收到，正在处理…", "你好"]
 
     sid = bridge.active_session("c2c:u1")
     assert sid
@@ -509,7 +511,8 @@ async def test_bridge_hands_turn_to_subagent(data_dir, monkeypatch):
     await bridge.handle(
         IncomingMessage(scope="c2c", peer_id="u", sender_id="u", text="帮我查一下")
     )
-    assert adapter.sent == ["查到了三条"]      # 尾巴补一条，不重复整段
+    # 回执在最前，尾巴补一条，不重复整段
+    assert adapter.sent == ["收到，正在处理…", "查到了三条"]
 
 
 @pytest.mark.asyncio
@@ -1438,3 +1441,188 @@ def test_media_scan_is_recursive(data_dir):
     img.write_bytes(b"x")
     found = collect_recent_images(since=_time.time() - 5)
     assert str(img) in found, found
+
+
+@pytest.mark.asyncio
+async def test_bridge_tops_up_newest_when_model_delivered_a_stale_image(data_dir):
+    """模型发错图时的兜底：本轮没有新产物、但它已经交付过 → 把**最新那张**补上。
+
+    现场：用户说「发过来」，模型从会话历史里抄了上一轮的路径（几个钟头前那张），
+    而本轮压根没有新落盘的图 —— 只按「本轮新图」扫是扫不到的，用户就只收到一张
+    错图。既然模型已经表露了交付意图，把最近的那张也送到。
+    """
+    from openminis.core import context
+
+    adapter = FakeAdapter(plugin_id="p", config={})
+    bridge = ConversationBridge(plugin_id="p", adapter=adapter)
+
+    out_dir = context.app_context().external_files_dir / "image" / "modelscope"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stale = out_dir / "yesterday.jpg"
+    stale.write_bytes(b"\xff\xd8\xff\xe0")
+    newest = out_dir / "just_now.jpg"
+    newest.write_bytes(b"\xff\xd8\xff\xe0")
+    # 真实的「昨天的图」和「刚生成的图」差着几个钟头；同一秒落盘会让 mtime 打平，
+    # 排序退化 —— 这里把时间差显式造出来。
+    import os
+
+    old = time.time() - 3600
+    os.utime(stale, (old, old))
+
+    msg = IncomingMessage(scope="c2c", peer_id="u", sender_id="u", text="发过来")
+    sent = {str(stale)}                      # 模型交付了那张旧的
+    await bridge._deliver_new_images(msg, time.time(), sent)
+    assert adapter.images == [str(newest)], adapter.images
+
+
+@pytest.mark.asyncio
+async def test_bridge_does_not_top_up_when_nothing_was_delivered(data_dir):
+    """本轮没有产物、模型也没有交付意图 → 什么都别补（否则闲聊也会蹦出图）。"""
+    from openminis.core import context
+
+    adapter = FakeAdapter(plugin_id="p", config={})
+    bridge = ConversationBridge(plugin_id="p", adapter=adapter)
+    out_dir = context.app_context().external_files_dir / "image" / "modelscope"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "old.jpg").write_bytes(b"\xff\xd8\xff\xe0")
+
+    msg = IncomingMessage(scope="c2c", peer_id="u", sender_id="u", text="在吗")
+    await bridge._deliver_new_images(msg, time.time(), set())
+    assert adapter.images == []
+
+
+@pytest.mark.asyncio
+async def test_bridge_only_blames_capability_when_adapter_cannot_send_media(data_dir):
+    """适配器**实现了**富媒体、只是这次失败（窗口/权限）时，别把日志写成
+    「这个通道不支持直接发附件」—— 那句话把平台问题说成了能力问题，误导排障。
+    """
+    from openminis.core import context
+
+    class FailingMedia(FakeAdapter):
+        async def send_image(self, msg, path, **kw):
+            return False          # 实现了，但这次发不出去
+
+    adapter = FailingMedia(plugin_id="p", config={})
+    bridge = ConversationBridge(plugin_id="p", adapter=adapter)
+    img = context.app_context().external_files_dir / "image" / "x.jpg"
+    img.parent.mkdir(parents=True, exist_ok=True)
+    img.write_bytes(b"\xff\xd8\xff\xe0")
+
+    msg = IncomingMessage(scope="c2c", peer_id="u", sender_id="u", text="x")
+    await bridge._send_attachments(msg, [("image", str(img))], set())
+    logs = "".join(str(row["text"]) for row in adapter.logs())
+    assert "不支持直接发附件" not in logs
+
+    # 而真正「没实现」的适配器还是要说明白（基类默认实现会退回发路径文本）
+    class PlainAdapter(ChannelAdapter):
+        """只实现文字，不实现富媒体 —— 基类的 send_image 会退回发路径文本。"""
+
+        driver = "plain"
+
+        async def start(self):
+            pass
+
+        async def stop(self):
+            pass
+
+        async def send_text(self, msg, text, **kw):
+            self.texts = getattr(self, "texts", [])
+            self.texts.append(text)
+
+    plain = PlainAdapter(plugin_id="p", config={})
+    bridge2 = ConversationBridge(plugin_id="p", adapter=plain)
+    await bridge2._send_attachments(msg, [("image", str(img))], set())
+    logs2 = "".join(str(row["text"]) for row in plain.logs())
+    assert "不支持直接发附件" in logs2
+
+
+# ---------------------------------------------------------------------------
+# 「先响应，再干活」
+# ---------------------------------------------------------------------------
+@pytest.mark.asyncio
+async def test_bridge_acks_before_running_the_turn(data_dir, monkeypatch):
+    """收到消息立刻回一句 —— 否则一轮跑几分钟，用户以为消息发丢了。
+
+    现场：群里 @ 机器人生图，屏幕上什么都没有（「正在输入」只活几秒、群里也不
+    显眼），用户中途又发了一条「发过来」。
+    """
+    from openminis.server import chat_store, main as server_main
+
+    chat_store.set_database_path(data_dir / "ack.db")
+    adapter = FakeAdapter(plugin_id="p", config={})
+    bridge = ConversationBridge(plugin_id="p", adapter=adapter)
+
+    async def fake_run_chat(client_id, msg):
+        # 模仿「干活很慢」：此时回执应该已经发出去了。
+        assert adapter.sent and adapter.sent[0] == "收到，正在处理…"
+
+    monkeypatch.setattr(server_main, "_run_chat", fake_run_chat)
+    await bridge.handle(
+        IncomingMessage(scope="c2c", peer_id="u", sender_id="u", text="画一只猫")
+    )
+    assert adapter.sent[0] == "收到，正在处理…"
+    logs = "".join(str(row["text"]) for row in adapter.logs())
+    assert "已回执" in logs
+
+
+@pytest.mark.asyncio
+async def test_bridge_ack_is_configurable_and_skips_commands(data_dir, monkeypatch):
+    from openminis.server import chat_store, main as server_main
+
+    chat_store.set_database_path(data_dir / "ack2.db")
+
+    async def fake_run_chat(client_id, msg):
+        return None
+
+    monkeypatch.setattr(server_main, "_run_chat", fake_run_chat)
+
+    # 关掉：一条回执都不发
+    off = FakeAdapter(plugin_id="p", config={"ackText": ""})
+    await ConversationBridge(plugin_id="p", adapter=off).handle(
+        IncomingMessage(scope="c2c", peer_id="u", sender_id="u", text="在吗")
+    )
+    assert "收到，正在处理…" not in off.sent
+
+    # 自定义文案
+    custom = FakeAdapter(plugin_id="p", config={"ackText": "稍等，我看一下"})
+    await ConversationBridge(plugin_id="p", adapter=custom).handle(
+        IncomingMessage(scope="c2c", peer_id="u", sender_id="u", text="在吗")
+    )
+    assert custom.sent[0] == "稍等，我看一下"
+
+    # 斜杠命令秒回，不需要回执（纯噪音）
+    cmd = FakeAdapter(plugin_id="p", config={})
+    await ConversationBridge(plugin_id="p", adapter=cmd).handle(
+        IncomingMessage(scope="c2c", peer_id="u", sender_id="u", text="/help")
+    )
+    assert "收到，正在处理…" not in cmd.sent
+    assert cmd.sent                       # 但 /help 自己得有回复
+
+
+@pytest.mark.asyncio
+async def test_qq_ack_gives_way_to_the_real_result():
+    """额度不足时放弃回执 —— 不能为了「收到」把结果挤掉（群聊只有 5 次）。"""
+    from openminis.plugins.drivers.qq import QQAdapter
+
+    adapter = QQAdapter(plugin_id="qq", config={"appId": "1", "clientSecret": "s"})
+    sent: list[str] = []
+
+    async def fake_api(path, *, method="POST", body=None):
+        sent.append(str((body or {}).get("content") or ""))
+        return {}
+
+    adapter._api = fake_api  # type: ignore[assignment]
+    msg = IncomingMessage(scope="group", peer_id="G1", sender_id="U1", text="x",
+                          message_id="m1", received_at=time.time())
+    assert await adapter.send_ack(msg, "收到，正在处理…") is True
+    assert sent == ["收到，正在处理…"]
+
+    # 已经回掉了多半额度（5 次里用掉 3 次）→ 回执让位
+    sent.clear()
+    adapter._replies["m2"] = (3, time.time())
+    msg2 = IncomingMessage(scope="group", peer_id="G1", sender_id="U1", text="x",
+                           message_id="m2", received_at=time.time())
+    assert await adapter.send_ack(msg2, "收到，正在处理…") is False
+    assert sent == []
+    logs = "".join(str(row["text"]) for row in adapter.logs())
+    assert "留给结果" in logs

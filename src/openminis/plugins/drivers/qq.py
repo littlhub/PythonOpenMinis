@@ -86,7 +86,13 @@ PASSIVE_REPLY_LIMIT = {"c2c": 4, "group": 5}
 #: 分钟耗尽，所以到点了要改走**主动消息**（不带 msg_id/msg_seq）。
 PASSIVE_REPLY_TTL = {"c2c": 3600.0, "group": 300.0}
 #: 提前这么多秒就判定被动窗口不可靠（留出上传富媒体的时间）。
-PASSIVE_REPLY_MARGIN = 20.0
+#:
+#: 原来是 20 秒 —— 实测太保守：现场那张图在用户消息后 4 分 36 秒落盘，距 5 分钟
+#: 窗口还剩 24 秒，却被判成「已过期」，于是转走主动消息、撞上「无权限」，图就丢了。
+#: 富媒体上传确实要留余量，但 10 秒足够（本机实测上传 + 发送 < 3 秒）。
+PASSIVE_REPLY_MARGIN = 10.0
+#: 被判「没有主动消息权限」之后，多久之内不再尝试主动消息（秒）。
+PROACTIVE_DENIED_TTL = 600.0
 #: 提前多久刷新 token（官方 TTL 7200s）。
 TOKEN_MARGIN_SEC = 300
 REQUEST_TIMEOUT_SEC = 15.0
@@ -129,6 +135,14 @@ class QQAdapter(ChannelAdapter):
         self._seq_for_msg: dict[str, tuple[int, float]] = {}
         #: ``msg_id -> 已经回了几条``（被动回复有次数上限，见 PASSIVE_REPLY_LIMIT）。
         self._replies: dict[str, tuple[int, float]] = {}
+        #: ``(scope, peer) -> 上次被平台拒「无权限」的时间``。
+        #:
+        #: 群聊被动窗口只有 5 分钟，超了就只能走**主动消息**；而主动消息要在开放
+        #: 平台单独申请，多数机器人并没有。用户现场：一轮跑了 6 分 23 秒，窗口过期
+        #: 后 3 个附件 + 一段正文全撞「主动消息失败, 无权限」，日志里三连错误、
+        #: 用户那边一片空白。拒过一次就记下来，同一批发送不再重复撞墙，并且把真实
+        #: 原因写成人话（而不是让人以为是代码坏了）。
+        self._proactive_denied: dict[tuple[str, str], float] = {}
 
     # ---- 配置快照 -------------------------------------------------------
     @property
@@ -421,6 +435,15 @@ class QQAdapter(ChannelAdapter):
         if not chunks:
             return
         passive = not self._passive_expired(msg)
+        if not passive and self._proactive_blocked(scope, peer):
+            # 已经确认这个机器人没有主动消息权限（刚被平台拒过）。再试也只是把
+            # 一模一样的 400 刷三遍 —— 如实说明原因，让用户再发一句重开窗口。
+            self.log(
+                "这条内容超出被动回复窗口，且该机器人没有主动消息权限，发不出去；"
+                "让用户再发一句即可重开窗口。",
+                "warn",
+            )
+            return
         if not passive and msg is not None and msg.message_id:
             self.log(
                 f"这条消息的被动回复窗口已过（{msg.scope} 限 "
@@ -441,7 +464,11 @@ class QQAdapter(ChannelAdapter):
             except QQBotError as exc:
                 if "msg_id" in body and await self._resend_proactive(peer, scope, body):
                     continue
-                self.log(f"发送失败：{exc}", "error")
+                if _is_permission_error(exc):
+                    # 本来就是主动消息（窗口已过），被拒就是**没有主动消息权限**。
+                    self._note_proactive_denied(peer, scope, exc)
+                else:
+                    self.log(f"发送失败：{exc}", "error")
                 self.state.error = str(exc)
                 return
             if index + 1 < len(chunks):
@@ -459,9 +486,57 @@ class QQAdapter(ChannelAdapter):
         try:
             await self._api(self._endpoint(peer, scope), body=retry)
         except QQBotError as exc:
-            self.log(f"主动消息补发也失败（{exc}）", "warn")
+            if _is_permission_error(exc):
+                self._note_proactive_denied(peer, scope, exc)
+            else:
+                self.log(f"主动消息补发也失败（{exc}）", "warn")
             return False
         self.log("被动回复失败，已用主动消息补发成功", "warn")
+        return True
+
+    def _proactive_blocked(self, scope: str, peer: str) -> bool:
+        """刚被平台拒过「无权限」吗（TTL 内不再重复撞墙）。"""
+        at = self._proactive_denied.get((scope, peer))
+        return bool(at) and (time.time() - at) < PROACTIVE_DENIED_TTL
+
+    def _note_proactive_denied(self, peer: str, scope: str, exc: Exception) -> None:
+        """主动消息被平台拒了 —— 记一次，并把真实原因说成人话。
+
+        这不是代码坏了：QQ 开放平台的**主动消息**要单独申请权限，多数机器人没有。
+        群聊被动回复窗口只有 5 分钟，超了就只能主动消息 ⇒ 长任务（生图几分钟）
+        一旦拖过窗口，结果就必然送不出去。日志里说清楚，排障时不用再猜。
+        """
+        self._proactive_denied[(scope, peer)] = time.time()
+        ttl_min = PASSIVE_REPLY_TTL.get(scope, 300.0) / 60
+        self.log(
+            f"主动消息被平台拒绝（{exc}）—— 这个机器人没有主动消息权限。"
+            f"{'群聊' if scope == 'group' else '单聊'}被动回复窗口只有 "
+            f"{ttl_min:.0f} 分钟，超出之后这条内容就发不出去了；"
+            "让用户再发一句（会重新开一个新窗口）即可。",
+            "error",
+        )
+
+    async def send_ack(self, msg: IncomingMessage | None, text: str) -> bool:
+        """回执也要占一次被动回复额度，所以额度不足时**主动放弃**这一句。
+
+        群聊只有 5 次（正文分段 + 每张图各占一次）。现场一次回答很容易用掉 1–2
+        次；为了「收到」把结果挤掉是本末倒置。留 3 次余量：不足就跳过，用户看到
+        的顶多是晚几秒的结果，而不是「只收到一句收到」。
+        """
+        if msg is None or not msg.message_id:
+            return False
+        if self._passive_expired(msg) or self._proactive_blocked(msg.scope, msg.peer_id):
+            return False
+        limit = PASSIVE_REPLY_LIMIT.get(msg.scope, 4)
+        used = self._replies.get(msg.message_id, (0, 0.0))[0]
+        if used > limit - 3:
+            self.log("跳过「收到」回执：被动回复额度要留给结果", "info")
+            return False
+        try:
+            await self.send_text(msg, text)
+        except Exception as exc:  # pragma: no cover - 回执失败不该打断正事
+            self.log(f"回执发送失败：{exc}", "warn")
+            return False
         return True
 
     async def send_typing(self, msg: IncomingMessage | None) -> None:
@@ -521,6 +596,15 @@ class QQAdapter(ChannelAdapter):
                      f"不存在：{target}", "warn")
             return False
         is_image = file_type == FILE_TYPE_IMAGE
+        passive = msg is not None and bool(msg.message_id) and not self._passive_expired(msg)
+        if not passive and self._proactive_blocked(scope, peer):
+            # 已确认没有主动消息权限，就别再白上传一遍（上传本身就十几秒）。
+            self.log(
+                f"{'图片' if is_image else '文件'} {target.name} 超出被动回复窗口，"
+                "且该机器人没有主动消息权限，发不出去；让用户再发一句可重开窗口。",
+                "warn",
+            )
+            return False
         try:
             file_info = await self._upload_media(
                 scope, peer, target, file_type=file_type, is_image=is_image
@@ -535,7 +619,7 @@ class QQAdapter(ChannelAdapter):
             "media": {"file_info": file_info},
             "content": "",
         }
-        if msg is not None and msg.message_id and not self._passive_expired(msg):
+        if passive and msg is not None:
             body["msg_id"] = msg.message_id
             # 附件也算一条出站，一样要占 seq，否则和文字那条撞号被官方丢掉。
             body["msg_seq"] = self._reserve_seq(msg, 1) or 1
@@ -545,7 +629,10 @@ class QQAdapter(ChannelAdapter):
             if "msg_id" in body and await self._resend_proactive(peer, scope, body):
                 self.log(f"已发送{'图片' if is_image else '文件'}：{target.name}")
                 return True
-            self.log(f"发送{'图片' if is_image else '文件'}失败：{exc}", "error")
+            if _is_permission_error(exc):
+                self._note_proactive_denied(peer, scope, exc)
+            else:
+                self.log(f"发送{'图片' if is_image else '文件'}失败：{exc}", "error")
             self.state.error = str(exc)
             return False
         self.log(f"已发送{'图片' if is_image else '文件'}：{target.name}")
@@ -825,6 +912,20 @@ def _to_supported_image(data: bytes, suffix: str) -> bytes:
         return buf.getvalue()
     except Exception:  # pragma: no cover - Pillow 缺失 / 文件损坏
         return data
+
+
+def _is_permission_error(exc: Exception) -> bool:
+    """这个失败是「没有主动消息权限」吗。
+
+    官方对主动消息无权限回的是 ``400 主动消息失败, 无权限``（也会出现 ``no
+    permission`` / ``forbidden`` 之类的英文写法）。这是**平台权限**问题，不是
+    代码或网络问题 —— 认出来才能给出可执行的提示，也才能不再重复撞墙。
+    """
+    text = str(exc)
+    if "无权限" in text or "没有权限" in text:
+        return True
+    low = text.lower()
+    return "no permission" in low or "forbidden" in low
 
 
 def _as_int(value: Any) -> int | None:

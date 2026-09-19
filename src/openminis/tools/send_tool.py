@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from pathlib import Path
 
 from ..core.logging import get_logger
@@ -30,7 +31,7 @@ from .tool_execution_result import ToolExecutionResult
 
 logger = get_logger(__name__)
 
-__all__ = ["SendTool"]
+__all__ = ["SendTool", "begin_turn", "end_turn"]
 
 _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico", ".avif"}
 _VIDEO_EXTS = {".mp4", ".mov", ".webm", ".mkv", ".avi"}
@@ -41,6 +42,74 @@ _DOC_EXTS = {
 }
 
 _WIN_ABS_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+#: 本轮交付台账：``session_id`` → ``{"started": 轮次开始时间, "sent": {已交付路径}}``。
+#:
+#: 为什么需要（两起用户现场）：
+#:
+#: 1. **同一批次里把同一个 ``send`` 连打 14 次**。并发批次里 ``repeat_guard`` 的
+#:    「同参第一次重复就停」互相看不见 —— 每个调用做检查时，别的还没被记录，
+#:    于是护栏一直到第 10 次才出声，用户在界面上看到一屏「执行中…」。这里在
+#:    **await 之前**先占位，同一轮同一路径第二次直接拒。
+#: 2. **交付错文件**。路径是模型凭记忆写的：会话里出现过两张 ``![生成图](…)``
+#:    （上一轮那张 + 刚生成那张），它挑了**上一轮**的，用户收到的是几小时前的图；
+#:    而工具只检查「文件在不在」→ ``ok=True``，模型以为交付成功，再也不会改。
+#:    所以交付图片时对照一下工作区有没有**更新的**图，有就当场提醒。
+_TURNS: dict[str, dict[str, object]] = {}
+
+#: 台账最多留多少个会话（老会话的台账没有用）。
+_MAX_TURNS = 200
+
+#: 「更新的图」的观察窗口（秒）。只在这个窗口内提醒，避免「用户特意要旧图」被唠叨。
+_RECENT_WINDOW = 1800.0
+
+
+def begin_turn(session_id: str) -> None:
+    """新的一轮开始 —— 交付台账归零。
+
+    由 ``server.main._run_chat`` 在每轮开跑前调用（在那之前工具拿不到「本轮」
+    这个概念）。只按轮去重：用户下一轮再说「发过来」，同一个文件还要能再发一次。
+    """
+    if not session_id:
+        return
+    if len(_TURNS) > _MAX_TURNS:
+        _TURNS.clear()
+    _TURNS[session_id] = {"started": time.time(), "sent": set()}
+
+
+def end_turn(session_id: str) -> None:
+    """一轮结束 —— 收掉台账（失败也不该把会话一直挂在内存里）。"""
+    _TURNS.pop(session_id, None)
+
+
+def _newer_images(host: Path) -> list[str]:
+    """工作区里比 ``host`` 更新、且是最近半小时内产生的图片（新 → 旧）。
+
+    取不到工作区、目录空、IO 出错一律返回空 —— 这个提醒是锦上添花，绝不能
+    因为它让交付本身失败。
+    """
+    try:
+        from ..server.media_scan import collect_recent_images
+
+        candidates = collect_recent_images(since=time.time() - _RECENT_WINDOW)
+        mtime = host.stat().st_mtime
+    except Exception:  # pragma: no cover - 上下文未就绪 / 文件刚被删
+        return []
+    newer: list[str] = []
+    for raw in candidates:
+        try:
+            if Path(raw).stat().st_mtime > mtime:
+                newer.append(raw)
+        except OSError:  # pragma: no cover
+            continue
+    # 用**沙箱写法**列出来：模型在别处看到的路径都是 ``/var/minis/…``，这里也不
+    # 例外，免得它拿到一个 ``G:\…`` 又要换算（两条写法 send 都收，但一致更省事）。
+    try:
+        from .path_utils import to_sandbox_path
+
+        return [to_sandbox_path(p) for p in reversed(newer)]
+    except Exception:  # pragma: no cover - 映射失败就用原样
+        return list(reversed(newer))
 
 
 def _kind_of(path: Path) -> str:
@@ -160,6 +229,20 @@ class SendTool:
         name = host.name
         posix = host.as_posix()
 
+        # 本轮同一路径只交付一次。**先占位再 await**：工具调用是并发批次的，
+        # 中间只要有一次 await，同批次的重复调用就会挤进来（实测 14 次）。
+        state = _TURNS.get(session_id)
+        if state is not None:
+            sent = state["sent"]
+            if isinstance(sent, set):
+                if posix in sent:
+                    return ToolExecutionResult(
+                        f"本轮已经交付过这个文件了（{name}），不要再重复调用 send。"
+                        "直接把引用那一行放进回复、写两句总结，然后结束这一轮。",
+                        False, tool_title=tool_title,
+                    )
+                sent.add(posix)
+
         # 图片用 ![]()；其它文件用 [附件: name]()，前端两种都认。
         ref = f"![{caption or name}]({posix})" if kind == "图片" else f"[附件: {name}]({posix})"
         output = (
@@ -167,6 +250,17 @@ class SendTool:
             f"请把下面这一行**原样**放进你给用户的回复里（单独成行），"
             f"用户界面上才会显示：\n{ref}"
         )
+        if kind == "图片":
+            # 模型挑文件靠的是会话历史里的 `![生成图](…)` 字面量，一旦有过两张就
+            # 容易抓错（实测发了上一轮那张）。这里把「更新的图」摆到它眼前。
+            newer = _newer_images(host)
+            if newer:
+                listing = "\n".join(f"  {p}" for p in newer[:3])
+                output += (
+                    f"\n\n⚠️ 你交付的是工作区里**较旧**的一张（{name}）。"
+                    f"最近半小时内还产出过更新的图：\n{listing}\n"
+                    "如果用户要的是刚生成的那张，请改用上面的路径再调一次 send。"
+                )
         return ToolExecutionResult(
             output,
             success=True,

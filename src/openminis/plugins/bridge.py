@@ -35,6 +35,22 @@ from .base import ChannelAdapter, IncomingMessage, save_attachments
 #: 累积到这么多字符就先发一段（长回答不必等到全部跑完）。
 DEFAULT_CHUNK_CHARS = 900
 
+#: 「最近的产物」观察窗口（秒）—— 只在「模型交付了旧文件」的兜底里用。
+#:
+#: 模型交付时用的路径是从会话历史里的 ``![生成图](…)`` 抄的，会话里攒了两张就会
+#: 抄成上一轮那张。此时按「本轮落盘」扫是空的（那张图是上一轮生成的），所以放宽到
+#: 这个窗口、把**最新的一张**补上。
+RECENT_ARTIFACT_WINDOW = 1800.0
+
+#: 收到消息后立刻回的这句「先响应」。
+#:
+#: 用户现场：群里 @ 机器人生图，一轮跑几分钟，屏幕上**什么都没有** —— 他以为
+#: 消息根本没发出去（平台的「正在输入」只活几秒，在群里也不显眼）。先回一句
+#: 回执照样重要：知道「它收到了、正在干」，比结果早到几秒有用得多。
+#:
+#: 文案可在插件配置里改（``ackText``），设成空字符串就关掉。
+DEFAULT_ACK_TEXT = "收到，正在处理…"
+
 #: 正文里形如 ``![说明](路径)`` 的图片引用。
 _MD_IMAGE_RE = re.compile(r"!\[[^\]]*\]\(([^)\s]+)\)")
 
@@ -203,6 +219,14 @@ class ConversationBridge:
     # -- 入站 -------------------------------------------------------------
     async def handle(self, msg: IncomingMessage) -> None:
         """适配器收到消息后调这里。"""
+        # 先确认「有活可干」：纯空消息（既没文字也没附件）不值得回执 —— 否则用户
+        # 会收到一句「收到，正在处理…」然后什么也没有。
+        if not (msg.text or "").strip() and not msg.attachments:
+            return
+        # **先响应再干活**。下面这两步都可能很慢：收附件要下载（图片几 MB）、
+        # 跑一轮动辄几分钟（生图更久）。期间用户在 IM 里什么都看不到，只会认为
+        # 「消息发丢了 / 卡住了」—— 所以第一件事就是给一句回执。
+        await self._ack(msg)
         text = (msg.text or "").strip()
         text = await self._attach_incoming_attachments(msg, text)
         blocked = [str(x) for x in (msg.raw.get("_blockedAttachments") or [])]
@@ -228,6 +252,31 @@ class ConversationBridge:
             await self._send(msg, "（上一条还在处理，这条排在后面）")
         async with lock:
             await self._run_turn(msg, text)
+
+    async def _ack(self, msg: IncomingMessage) -> None:
+        """收到消息立刻回一句（「先响应，再干活」）。
+
+        跳过两类：斜杠命令（``/new`` 之类本来就秒回，再加一句回执纯属噪音）、
+        以及配置里把 ``ackText`` 设成空字符串的情况。
+
+        额度问题交给适配器自己判断（见 ``ChannelAdapter.send_ack``）：QQ 的被动
+        回复次数有限（群聊 5 次），额度不够时**宁可少这一句**，也不能把真正的
+        结果挤掉。
+        """
+        raw = self.adapter.config.get("ackText")
+        text = DEFAULT_ACK_TEXT if raw is None else str(raw)
+        text = text.strip()
+        if not text:
+            return
+        if (msg.text or "").strip().startswith("/"):
+            return
+        try:
+            sent = await self.adapter.send_ack(msg, text)
+        except Exception as exc:  # pragma: no cover - 回执失败绝不能影响正事
+            self.adapter.log(f"回执发送失败：{exc}", "warn")
+            return
+        if sent:
+            self.adapter.log(f"已回执：{text}")
 
     async def _attach_incoming_attachments(
         self, msg: IncomingMessage, text: str
@@ -291,13 +340,31 @@ class ConversationBridge:
         技能脚本生图（shell 里跑）不会带 ``toolEnd`` 的 images 元数据，模型又常
         忘记调 ``send`` —— 用户那边只看到「画好了」却收不到图。这里按落盘时间扫
         一遍工作区的生图目录兜底；正文引用与 toolEnd 已经发过的路径不会重复发。
+
+        还有第二种漏法（用户现场「发过来 → 收到一张昨天的图」）：模型交付的路径
+        是**从会话历史里抄的** ``![生成图](…)``，会话里攒了两张就抄错，把上一轮那张
+        发了出去；而本轮压根没有新落盘的图，按 ``since`` 扫自然是空的。此时模型已经
+        表露了「要交付图片」的意图（``sent`` 非空），就把**最近的那张产物**也兜上
+        —— 用户先收到错的那张、紧接着收到对的那张，总好过只收到错的。
         """
         try:
             from ..server.media_scan import collect_recent_images
 
             images = collect_recent_images(since=since)
-        except Exception:  # pragma: no cover - 兜底失败不影响这一轮
-            self.adapter.log("本轮新图兜底扫描失败", "warn")
+            if not images and sent:
+                recent = collect_recent_images(since=time.time() - RECENT_ARTIFACT_WINDOW)
+                # 只补**最新那一张**：放宽窗口会把一堆旧图也捞进来，那才是真的刷屏。
+                # 显式按 mtime 取最大，别依赖返回顺序（同一秒内落盘的图顺序不稳）。
+                if recent:
+                    newest = max(
+                        recent, key=lambda p: Path(p).stat().st_mtime, default=None
+                    )
+                    if newest is not None and newest not in sent:
+                        images = [newest]
+        except Exception as exc:  # pragma: no cover - 兜底失败不影响这一轮
+            # 带上异常文本：这里曾经把 ``NameError`` 一起吞掉，表现为「兜底悄无声息
+            # 地不生效」，排障时全靠猜。
+            self.adapter.log(f"本轮新图兜底扫描失败：{exc}", "warn")
             return
         fresh = [p for p in images if p not in sent]
         if not fresh:
@@ -344,15 +411,16 @@ class ConversationBridge:
             if not key or key in sent:
                 continue
             sent.add(key)
+            handler = self.adapter.send_file if kind == "file" else self.adapter.send_image
+            # 适配器有没有实现富媒体？（基类默认实现是「把路径当文本发」并返回 False）
+            base = ChannelAdapter.send_file if kind == "file" else ChannelAdapter.send_image
+            unsupported = getattr(type(self.adapter), base.__name__, None) is base
             try:
-                if kind == "file":
-                    ok = await self.adapter.send_file(msg, key)
-                else:
-                    ok = await self.adapter.send_image(msg, key)
+                ok = await handler(msg, key)
             except Exception as exc:  # pragma: no cover - 平台侧各种意外
                 self.adapter.log(f"发附件失败：{exc}", "error")
                 continue
-            if ok is False:
+            if ok is False and unsupported:
                 self.adapter.log("这个通道不支持直接发附件，已退回把路径当文本发", "warn")
 
     # -- 跑一轮 -----------------------------------------------------------

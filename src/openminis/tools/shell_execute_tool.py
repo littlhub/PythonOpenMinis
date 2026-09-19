@@ -30,6 +30,20 @@ logger = get_logger(__name__)
 
 __all__ = ["ShellExecuteTool"]
 
+#: 命令里出现这些片段就认定是「生图」（技能脚本形式）。
+_IMAGE_CMD_MARKERS = (
+    "image_generation", "image_gen", "agnes-image", "agnes_image", "imagegen",
+)
+
+#: 生图命令的最小 timeout（秒）。实测 90–150 秒，留足余量。
+_IMAGE_CMD_MIN_TIMEOUT = 300
+
+
+def _looks_like_image_gen(command: str) -> bool:
+    """这条命令是生图脚本吗（按命令文本判断，跟 repeat_guard 用同一组标记）。"""
+    low = (command or "").lower()
+    return any(marker in low for marker in _IMAGE_CMD_MARKERS)
+
 
 class ShellExecuteTool:
     """Kotlin ``shell_execute`` tool definition + execution."""
@@ -191,6 +205,20 @@ class ShellExecuteTool:
             timeout = int(args.get("timeout", 900))
         except (TypeError, ValueError):
             timeout = 900
+        # 生图命令（技能脚本）实测要 90–150 秒，有时候接近 3 分钟。模型经常随手
+        # 给 timeout=120 —— 那是**必然**被杀：工具在 120 秒整中止，模型只能重跑
+        # 一遍，白扔两分钟（现场就是这样把 QQ 群聊的 5 分钟被动窗口耗光的）。
+        # 这是确定性的失败配置，直接抬到安全值并说明，而不是让模型自己去悟。
+        timeout_note = ""
+        if timeout < _IMAGE_CMD_MIN_TIMEOUT and _looks_like_image_gen(command):
+            timeout_note = (
+                f"[已自动把 timeout 从 {timeout}s 抬到 "
+                f"{_IMAGE_CMD_MIN_TIMEOUT}s：生图实测 90–150 秒，"
+                f"{timeout}s 必然被杀、只能重跑。]\n"
+            )
+            logger.info("raised shell timeout for image gen: %ss -> %ss",
+                        timeout, _IMAGE_CMD_MIN_TIMEOUT)
+            timeout = _IMAGE_CMD_MIN_TIMEOUT
         try:
             delay = int(args.get("delay", 0))
         except (TypeError, ValueError):
@@ -207,7 +235,9 @@ class ShellExecuteTool:
             env_vars=env,
         )
 
-        output = result.output or "(no output)"
+        output = (timeout_note + (result.output or "(no output)")) if timeout_note else (
+            result.output or "(no output)"
+        )
         if result.exit_code == -1 and "[Write error" not in output:
             # 持久 shell 没跑成（app 的事件循环拓扑下偶发秒死，exit=-1）。
             # 兜底：用一次性 ``bash -c`` 在工作线程里同步执行 —— 不依赖
