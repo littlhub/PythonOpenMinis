@@ -238,6 +238,10 @@ class RepeatGuard:
             "（例如 `--count 2`），而不是反复串行重跑同一个命令。"
             "现在立刻停止生成，把已经拿到的图片用 "
             "`![简短说明](图片绝对路径)` 写进你的回复交出产物并总结收尾。"
+            # 实测（通道场景）：模型被拦后容易一直重试生成、不肯收尾，结果用户
+            # 一张图都收不到。明说「已出的图会自动交出去」能明显减少这种空转。
+            "（本轮已经产出的图片**会自动交给用户**，不必反复重跑；"
+            "你只需要用文字总结即可。）"
         )
         logger.warning("CRITICAL image_budget_exhausted tool=%s done=%s budget=%s",
                        tool_name, self._turn_image_success, budget)

@@ -283,6 +283,29 @@ class ConversationBridge:
         except Exception as exc:  # pragma: no cover - 发不出去只能记日志
             self.adapter.log(f"回复失败：{exc}", "error")
 
+    async def _deliver_new_images(
+        self, msg: IncomingMessage, since: float, sent: set[str]
+    ) -> None:
+        """把本轮新生成的图片补发给用户（去重后）。
+
+        技能脚本生图（shell 里跑）不会带 ``toolEnd`` 的 images 元数据，模型又常
+        忘记调 ``send`` —— 用户那边只看到「画好了」却收不到图。这里按落盘时间扫
+        一遍工作区的生图目录兜底；正文引用与 toolEnd 已经发过的路径不会重复发。
+        """
+        try:
+            from ..server.media_scan import collect_recent_images
+
+            images = collect_recent_images(since=since)
+        except Exception:  # pragma: no cover - 兜底失败不影响这一轮
+            self.adapter.log("本轮新图兜底扫描失败", "warn")
+            return
+        fresh = [p for p in images if p not in sent]
+        if not fresh:
+            return
+        await self._send_attachments(
+            msg, [("image", p) for p in fresh], sent
+        )
+
     def _start_typing_heartbeat(self, msg: IncomingMessage) -> asyncio.Task[Any] | None:
         """跑一轮期间持续刷新「正在输入」。
 
@@ -390,6 +413,7 @@ class ConversationBridge:
 
         server_main.manager.attach(client_id, _Sink(on_frame))
         typing: asyncio.Task[Any] | None = None
+        turn_started = time.time()
         try:
             await self.adapter.send_typing(msg)
             typing = self._start_typing_heartbeat(msg)
@@ -398,6 +422,13 @@ class ConversationBridge:
                 # 「由哪个 agent 接待」= 固定人设 + 工具集，不跟着网页端当前身份变
                 payload["identityId"] = target
             await server_main._run_chat(client_id, payload)
+            # 收尾兜底：本轮新落盘的图，凡是还没发过的都补发。
+            #
+            # 为什么需要：技能脚本（shell 里跑生图）产出的图**不带** toolEnd 的
+            # images 元数据，模型又常忘记调 send、也不一定写 markdown 引用 ——
+            # 用户在 QQ 那边只看到「画好了」却什么也没收到。这里按落盘时间兜一次，
+            # 与正文引用/toolEnd 已发过的路径去重，不会重复发。
+            await self._deliver_new_images(msg, turn_started, sent_atts)
         except Exception as exc:
             self.adapter.log(f"跑一轮失败：{exc}", "error")
             await self._send(msg, f"出错了：{exc}")

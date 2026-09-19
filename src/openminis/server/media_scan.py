@@ -54,7 +54,10 @@ def collect_recent_images(
         if not directory.is_dir():
             continue
         try:
-            entries = list(directory.iterdir())
+            # **递归**：技能脚本会把图写进子目录（魔搭写 ``image/modelscope/``，
+            # agnes 写 ``image/``），只扫一层就会漏掉 —— 用户现场就是
+            # 「图生成了，但前端气泡下没出现、通道那边也没发」。
+            entries = [p for p in directory.rglob("*") if p.is_file()]
         except OSError:  # pragma: no cover - 权限/IO
             continue
         for path in entries:

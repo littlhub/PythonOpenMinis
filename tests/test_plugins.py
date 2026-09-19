@@ -1391,3 +1391,50 @@ async def test_bridge_refreshes_typing_while_running(data_dir, monkeypatch):
     await asyncio.sleep(2.6)
     task.cancel()
     assert count["n"] >= 2          # 至少刷了两次，不是开头打一下就没了
+
+
+@pytest.mark.asyncio
+async def test_bridge_delivers_images_the_model_forgot_to_send(data_dir, monkeypatch):
+    """模型没调 send、也没写引用时，本轮新出的图也要送到用户手里。
+
+    现场：技能脚本生图（2 分 06 秒那条 shell）成功、read_image 也成功，但整轮
+    **没有任何 send** —— 用户在 QQ 那侧只看到「画好了」，一张图都没有。
+    """
+    import time as _time
+    from openminis.core import context
+
+    adapter = FakeAdapter(plugin_id="p", config={})
+    bridge = ConversationBridge(plugin_id="p", adapter=adapter)
+
+    ws = context.app_context().external_files_dir
+    # 技能脚本会把图写进子目录（魔搭写 image/modelscope/）
+    out_dir = ws / "image" / "modelscope"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    img = out_dir / "made_by_skill.jpg"
+    img.write_bytes(b"\xff\xd8\xff\xe0")
+    started = _time.time() - 1
+
+    msg = IncomingMessage(scope="c2c", peer_id="u", sender_id="u", text="画一只猫")
+    sent: set[str] = set()
+    await bridge._deliver_new_images(msg, started, sent)
+    assert adapter.images == [str(img)], adapter.images
+    assert str(img) in sent
+
+    # 已经发过的（正文引用 / toolEnd 帧发过）不能重复发
+    await bridge._deliver_new_images(msg, started, sent)
+    assert adapter.images == [str(img)]
+
+
+def test_media_scan_is_recursive(data_dir):
+    """扫描要递归 —— 魔搭把图写在 image/modelscope/ 子目录里。"""
+    import time as _time
+    from openminis.core import context
+    from openminis.server.media_scan import collect_recent_images
+
+    root = Path(context.app_context().external_files_dir)
+    nested = root / "image" / "modelscope"
+    nested.mkdir(parents=True, exist_ok=True)
+    img = nested / "sub_dir_image.jpg"
+    img.write_bytes(b"x")
+    found = collect_recent_images(since=_time.time() - 5)
+    assert str(img) in found, found
