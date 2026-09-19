@@ -95,22 +95,31 @@ def _workspace() -> Path:
 def _resolve_local(src: str) -> Path | None:
     """把引用里的 src 解析成本机路径 —— 只认工作区以内的。
 
-    与 ``file_read_tool._resolve_session_host_path`` 同一套围栏：绝对路径必须
-    落在 workspace 里，``/var/minis/...`` 前缀按工作区相对路径处理。
+    与 ``file_read_tool._resolve_session_host_path`` 同一套围栏。三种写法都认：
+
+    - 机器绝对路径（``C:\\…``，网页端与上传附件用的就是它）；
+    - 沙箱写法（``/var/minis/workspace|data|home/…``，出站时引擎自己造的形态，
+      模型在回复里回填的就是它 —— 不还原的话「图在 QQ 里发不出去」）；
+    - 工作区相对路径。
     """
     raw = (src or "").strip()
     if not raw or raw.startswith(("data:", "http://", "https://")):
         return None
     workspace = _workspace().resolve()
-    for prefix in ("/var/minis/workspace", "/workspace", "/var/minis"):
-        if raw.startswith(prefix):
-            raw = raw[len(prefix):]
-            break
-    candidate = Path(raw)
-    if candidate.is_absolute():
-        resolved = candidate.resolve()
+
+    from ..tools.path_utils import split_sandbox_root
+
+    split = split_sandbox_root(raw)
+    if split is not None:
+        root, rest = split
+        resolved = Path(root, *[p for p in rest.split("/") if p]).resolve()
     else:
-        resolved = (workspace / raw.lstrip("/")).resolve()
+        candidate = Path(raw)
+        if candidate.is_absolute():
+            resolved = candidate.resolve()
+        else:
+            resolved = (workspace / raw.replace("\\", "/").lstrip("/")).resolve()
+
     if resolved == workspace or workspace in resolved.parents:
         return resolved
     logger.warning("attachment rejected (outside workspace): %s", src)

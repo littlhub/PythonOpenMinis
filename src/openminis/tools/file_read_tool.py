@@ -235,19 +235,20 @@ def _resolve_session_host_path(session_id: str, path: str) -> Path | None:
     if not candidate:
         return None
 
-    # ``/var/minis/workspace/...`` 是**工作区根**（不是会话根）。
+    # ``/var/minis/workspace|data|home/...`` 是**沙箱写法**，各自指向工作区根 /
+    # 数据目录 / 用户主目录，不是「会话相对」。
     #
-    # 这条路径形态是引擎自己造出来的：出站给模型看的内容里，机器绝对路径会被
-    # 换成沙箱写法（见 ``path_utils.scrub_machine_paths``），不出现
-    # ``C:/Users/<名>/…``。模型原样回填时，若按「会话相对」去
-    # ``workspace/<sid>/…`` 里找，必然找不到 —— 用户现场就是「图生成了、也告诉
-    # 了模型路径，它却读不到」。
-    from .path_utils import split_sandbox_prefix
+    # 这个形态是引擎自己造出来的：出站给模型看的内容里，机器绝对路径会被换成
+    # 沙箱写法（见 ``path_utils.scrub_machine_paths``）。模型原样回填时若按
+    # 「会话相对」去 ``workspace/<sid>/…`` 里找，必然找不到 —— 用户现场就是
+    # 「图生成了、也告诉了模型路径，它却读不到」；技能目录（``/var/minis/data/
+    # skills/xxx``）也一样，这是魔搭生图跑不起来的直接原因。
+    from .path_utils import split_sandbox_root
 
-    rooted = split_sandbox_prefix(candidate)
-    if rooted is not None:
-        candidate = rooted
-        base_root = workspace
+    split = split_sandbox_root(candidate)
+    rooted = split is not None
+    if split is not None:
+        base_root, candidate = split
     else:
         base_root = session_root
 
@@ -255,7 +256,7 @@ def _resolve_session_host_path(session_id: str, path: str) -> Path | None:
     # （``<workspace>/uploads/...``），不认这一段的话 read_image 就拿不到图。
     # 工作区外的绝对路径不走这条捷径，仍按下面的相对规则处理。
     raw_path = Path(candidate)
-    if raw_path.is_absolute():
+    if not rooted and raw_path.is_absolute():
         ws_resolved = workspace.resolve()
         resolved_abs = raw_path.resolve()
         if resolved_abs == ws_resolved or ws_resolved in resolved_abs.parents:

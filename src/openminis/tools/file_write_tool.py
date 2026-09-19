@@ -136,15 +136,14 @@ def _resolve_session_host_path(session_id: str, path: str) -> Path | None:
     if not candidate:
         return None
 
-    # ``/var/minis/workspace/...`` = **工作区根**（不是会话根）。引擎出站时会把
-    # 机器绝对路径换成这个沙箱写法（不出现 ``C:/Users/<名>/…``），模型原样回填
-    # 时必须解析得回来。详见 ``file_read_tool._resolve_session_host_path``。
-    from .path_utils import split_sandbox_prefix
+    # ``/var/minis/workspace|data|home/...`` = 沙箱写法，各自指向工作区根 / 数据
+    # 目录 / 用户主目录（不是会话根）。引擎出站时会把机器绝对路径换成这个形态，
+    # 模型原样回填时必须解析得回来。详见 ``file_read_tool``。
+    from .path_utils import split_sandbox_root
 
-    rooted = split_sandbox_prefix(candidate)
-    if rooted is not None:
-        candidate = rooted
-        base_root = workspace
+    split = split_sandbox_root(candidate)
+    if split is not None:
+        base_root, candidate = split
     else:
         base_root = session_root
 

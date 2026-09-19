@@ -515,7 +515,7 @@ class QQAdapter(ChannelAdapter):
         peer = str(kwargs.get("peer") or (msg.peer_id if msg else ""))
         if not peer:
             return False
-        target = Path(path)
+        target = _media_path(path)
         if not target.is_file():
             self.log(f"要发的{'图片' if file_type == FILE_TYPE_IMAGE else '文件'}"
                      f"不存在：{target}", "warn")
@@ -759,6 +759,25 @@ def _attachments(data: dict[str, Any]) -> list[dict[str, Any]]:
             if isinstance(nested, list):
                 out.extend(a for a in nested if isinstance(a, dict))
     return out
+
+
+def _media_path(path: str | Path) -> Path:
+    """要发出去的附件路径 → 本机路径。
+
+    模型在回复里回填的常常是**沙箱写法**（``/var/minis/workspace/generated/x.png``
+    —— 那是引擎出站时自己换的形态），而 Windows 上没有这个目录。不还原就会
+    「文件找不到、只剩一句文本发出去」。还原不了（本来就是本机路径）就原样用。
+    """
+    raw = str(path or "")
+    try:
+        from ...tools.path_utils import to_host_path
+
+        host = to_host_path(raw)
+        if host is not None:
+            return host
+    except Exception:  # pragma: no cover - 路径工具不可用不该拦住发图
+        pass
+    return Path(raw)
 
 
 def describe_inbound(data: dict[str, Any]) -> str:

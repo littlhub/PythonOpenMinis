@@ -51,6 +51,8 @@ class ExecutionCoordinator:
         # Names injected per session on the last apply_environment call, so the
         # next one can unset whatever the user has since removed.
         self._last_injected_keys: dict[str, set[str]] = {}
+        # 上一次注入的**完整键值**：值没变就不必再走一次 shell 往返。
+        self._last_injected_env: dict[str, dict[str, str]] = {}
         # Process-wide extra env merged into every spawned shell (read from the
         # ``sandbox.envExtra`` config field; safe to set empty).
         self._extra_env: dict[str, str] = dict(extra_env or {})
@@ -107,17 +109,35 @@ class ExecutionCoordinator:
         env_vars: Optional[dict[str, str]] = None,
     ) -> CommandResult:
         """Kotlin ``execute(sessionId, command, timeout, lineCallback)``."""
+        # 兜底：把沙箱写法还原成本机路径。
+        #
+        # 主路径已经在 ``ShellExecuteTool`` 里换过了（那里换是**为了守卫能看到真
+        # 实路径**，技能库白名单才匹配得上）；这里再兜一次是因为 coordinator 也会
+        # 被别的调用方直接用。已经换过的文本里不含 ``/var/minis``，等于空操作。
+        try:
+            from ..tools.path_utils import unscrub_sandbox_paths
+
+            command = unscrub_sandbox_paths(command)
+        except Exception:  # pragma: no cover - 路径工具不可用就不换
+            logger.debug("unscrub sandbox paths failed", exc_info=True)
         lock = self._locks.setdefault(session_id, asyncio.Lock())
         async with lock:
             start = time.monotonic()
             shell = await self._get_or_create_shell(session_id)
 
             # Full-snapshot env injection (T124a semantics).
+            #
+            # 只在**真的变了**的时候才注入：注入本身是一次完整的 shell 往返
+            # （``export …`` 要等回显标记），本机实测每次 ~400ms。而配置了
+            # ``sandbox.envExtra`` 的用户，环境变量几乎每轮都不变 —— 每次都重发
+            # 等于给每个工具调用白加一次往返。会话第一次执行仍会注入
+            # （``_last_injected_env`` 在新建 shell 时被清掉）。
             env = dict(env_vars or {})
             previous = self._last_injected_keys.get(session_id, set())
-            if env or previous:
+            if (env or previous) and self._last_injected_env.get(session_id) != env:
                 await shell.apply_environment(env, previous_keys=previous)
                 self._last_injected_keys[session_id] = set(env)
+                self._last_injected_env[session_id] = dict(env)
 
             raw_output, exit_code = await shell.execute_command(
                 command, timeout=timeout, line_callback=line_callback
@@ -147,12 +167,32 @@ class ExecutionCoordinator:
             cwd=self._cwd_overrides.get(session_id),
             env=self._extra_env or None,
         )
+        # 新 shell 里什么都没有 —— 让下一次 execute 重新注入一遍环境变量。
+        self._last_injected_env.pop(session_id, None)
+        self._last_injected_keys.pop(session_id, None)
         await shell.ensure_started()
         if shell.is_alive or shell._process is not None:  # noqa: SLF001
             self._shells[session_id] = shell
         else:
             logger.error("ExecutionCoordinator[%s]: shell failed to start", session_id)
         return shell
+
+    async def warm(self, session_id: str) -> None:
+        """预热会话的 shell。
+
+        首条命令要连 bash 启动一起等（本机实测 ~1.1s，之后每条 ~0.4s）。轮次一
+        开始就在后台叫一声，用户的第一条工具命令就不必再等这段启动时间 ——
+        带工具的回合动辄十几条命令，这一段是白等。
+
+        注意：光 ``ensure_started()`` 不够（它只 spawn 不等就绪，几十毫秒就返回），
+        得**真跑一条空命令**把启动开销吃在这里。``echo`` 在 bash 与 cmd 下都成立。
+        """
+        try:
+            shell = await self._get_or_create_shell(session_id)
+            if shell is not None:
+                await shell.execute_command("echo", timeout=15)
+        except Exception:  # pragma: no cover - 预热失败不影响正常执行
+            logger.debug("shell warm-up failed for %s", session_id, exc_info=True)
 
     async def stop_session(self, session_id: str) -> None:
         """Kill a session's shell (e.g. session deletion)."""

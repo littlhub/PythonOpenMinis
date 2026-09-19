@@ -1104,6 +1104,16 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
         except Exception:  # pragma: no cover
             logger.debug("sandbox dir override failed for %s", sid)
 
+    # 后台预热这个会话的 shell：首条命令要连 bash 启动一起等（实测 ~1.1s），而带
+    # 工具的回合动辄十几条命令 —— 轮次刚开始就叫起来，第一刀不白等。没入组的会话
+    # 同样受益（它的 shell 落在工作区默认目录里）。
+    try:
+        from ..tools.shell_execute_tool import get_coordinator
+
+        _spawn_bg(get_coordinator().warm(f"db-{sid}"))
+    except Exception:  # pragma: no cover - 预热失败不该影响对话
+        logger.debug("shell warm-up dispatch failed for %s", sid)
+
     try:
         # 群聊可视化：把「子代理活动」接到同一条推流上。装在这里（而不是 sink
         # 里）是因为 agent 派生的工具任务会继承**当前任务**的 contextvars ——

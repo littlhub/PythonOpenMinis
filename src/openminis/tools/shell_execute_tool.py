@@ -161,6 +161,17 @@ class ShellExecuteTool:
             return ToolExecutionResult("Error: 'command' is required", True,
                                        tool_title=tool_title)
 
+        # 把沙箱写法还原成本机路径再执行。
+        #
+        # 为什么必须做：出站给模型的内容里，机器路径被统一换成
+        # ``/var/minis/workspace|data|home/…``（见 path_utils.scrub_machine_paths），
+        # 模型照着这个形态拼命令是**必然**的 —— 而 Windows 上根本没有
+        # ``/var/minis``，于是 ``cd /var/minis/data/skills/xxx`` 一律
+        # "No such file or directory"。实测这就是技能脚本跑不起来的原因。
+        from .path_utils import unscrub_sandbox_paths
+
+        command = unscrub_sandbox_paths(command)
+
         # 沙箱守卫：异常删除 / 敏感信息（读密钥、外传凭据）先在这里拦下。
         # 拦下后记一条事件，用户在「沙箱」页可以手动放行。
         try:

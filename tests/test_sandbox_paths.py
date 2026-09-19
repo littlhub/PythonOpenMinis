@@ -13,6 +13,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -113,3 +114,98 @@ def test_sandbox_path_is_idempotent(workspace):
     """已经是沙箱写法就不要再动它。"""
     text = "看图 /var/minis/workspace/uploads/a.jpg"
     assert scrub_machine_paths(text) == text
+
+
+# ---------------------------------------------------------------------------
+# 反向：沙箱写法 → 本机路径（模型照着出站看到的路径拼命令，必须能用）
+# ---------------------------------------------------------------------------
+def test_unscrub_rewrites_shell_commands(workspace):
+    """``cd /var/minis/data/skills/x`` 这种命令要换成真实路径再执行。
+
+    实测这就是「魔搭生图技能跑不起来」的直接原因：出站把技能目录写成
+    ``/var/minis/data/skills/modelscope-image``，模型照着 cd —— Windows 上没有
+    ``/var/minis``，于是 "No such file or directory"。
+    """
+    from openminis.tools.path_utils import unscrub_sandbox_paths
+
+    data = context.app_context().data_dir
+    out = unscrub_sandbox_paths(
+        "cd /var/minis/data/skills/modelscope-image/scripts && python image_generation.py"
+    )
+    assert "/var/minis" not in out
+    assert str(data).replace("\\", "/") in out
+    assert "modelscope-image/scripts" in out
+
+    ws_out = unscrub_sandbox_paths("ls /var/minis/workspace/generated")
+    assert str(workspace).replace("\\", "/") in ws_out
+    home_out = unscrub_sandbox_paths("ls /var/minis/home/Desktop")
+    assert str(Path.home()).replace("\\", "/") in home_out
+
+    # 不含沙箱写法的命令原样不动
+    assert unscrub_sandbox_paths("python -m pytest -q") == "python -m pytest -q"
+    # 别从半个目录名中间咬一口
+    assert unscrub_sandbox_paths("echo /var/minis/workspaceX") == "echo /var/minis/workspaceX"
+
+
+def test_to_host_path_covers_three_roots(workspace):
+    from openminis.tools.path_utils import to_host_path
+
+    data = context.app_context().data_dir
+    assert to_host_path("/var/minis/workspace/uploads/a.jpg") == workspace / "uploads" / "a.jpg"
+    assert to_host_path("/var/minis/data/skills/x") == data / "skills" / "x"
+    assert to_host_path("/var/minis/data") == data
+    assert to_host_path("/var/minis/home/Desktop/a.txt") == Path.home() / "Desktop" / "a.txt"
+    assert to_host_path("C:/tmp/other/a.txt") is None
+    assert to_host_path("") is None
+
+
+def test_data_dir_paths_reach_the_skills_root(workspace):
+    """技能目录在数据目录下，file_read 得能顺着沙箱写法找到它。"""
+    skills = context.app_context().data_dir / "skills" / "demo"
+    skills.mkdir(parents=True)
+    (skills / "SKILL.md").write_text("---\nname: demo\n---\n", encoding="utf-8")
+    resolved = read_resolver("s1", "/var/minis/data/skills/demo/SKILL.md")
+    assert resolved == (skills / "SKILL.md").resolve()
+
+
+def test_attachment_ref_from_sandbox_form(workspace):
+    """模型在回复里回填的沙箱图片路径要还原，否则图发不出去。"""
+    from openminis.settings.attachments import _resolve_local
+
+    img = workspace / "generated" / "a.png"
+    img.parent.mkdir(parents=True, exist_ok=True)
+    img.write_bytes(b"\x89PNG")
+    assert _resolve_local("/var/minis/workspace/generated/a.png") == img.resolve()
+    assert _resolve_local(img.as_posix()) == img.resolve()
+    # 工作区外面的还是不认
+    assert _resolve_local("/var/minis/home/secret.png") is None
+
+
+@pytest.mark.asyncio
+async def test_shell_tool_rewrites_before_executing(workspace):
+    """真实工具入口：命令在交给 shell 之前已经被换成真实路径。"""
+    from openminis.sandbox.execution_coordinator import CommandResult
+    from openminis.tools.shell_execute_tool import ShellExecuteTool, install_coordinator
+
+    recorded: list[str] = []
+
+    class Recording:
+        def cwd_for(self, session_id: str) -> str:
+            return ""
+
+        async def execute(self, session_id, command, timeout=0.0,
+                          line_callback=None, env_vars=None):
+            recorded.append(command)
+            return CommandResult(output="ok", exit_code=0, duration_ms=0)
+
+    install_coordinator(Recording())  # type: ignore[arg-type]
+    tool = ShellExecuteTool()
+    await tool.execute(
+        json.dumps({
+            "tool_title": "跑技能",
+            "command": "cd /var/minis/data/skills/modelscope-image/scripts && ls",
+        }),
+        "s1",
+    )
+    assert recorded and "/var/minis" not in recorded[0]
+    assert str(context.app_context().data_dir).replace("\\", "/") in recorded[0]
