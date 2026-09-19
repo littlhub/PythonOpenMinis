@@ -162,6 +162,7 @@ def main() -> None:
 
     print(f"创建/更新 release {tag} @ {commitish} ...")
     rel = _find_release(tag)
+    existed = rel is not None
     if rel is None:
         rel = api("POST", f"/repos/{REPO}/releases", {
             "tag_name": tag,
@@ -202,6 +203,14 @@ def main() -> None:
     except urllib.error.HTTPError as e:
         raise SystemExit(f"上传失败 {e.code}\n{e.read().decode()[:800]}") from None
     print("资产已上传:", resp.get("browser_download_url"))
+
+    if existed:
+        # 附件换完了，但 **GitHub 的 release 列表显示的是 ``published_at``**，
+        # 而 PATCH 改不动它 —— 不重新发布的话页面上的日期还是上一版那天，用户会
+        # 以为「没更新」。转草稿再发布一次即可刷新（标签与资产都保持不动）。
+        api("PATCH", f"/repos/{REPO}/releases/{rid}", {"draft": True})
+        fresh = api("PATCH", f"/repos/{REPO}/releases/{rid}", {"draft": False})
+        print("已重新发布，发布时间:", fresh.get("published_at"))
 
 
 if __name__ == "__main__":
