@@ -16,9 +16,33 @@ API = "https://api.github.com"
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _git() -> str:
+    """找到 git 可执行文件。
+
+    本机 PATH 时不时没有 git（沙箱/终端各不一样），直接 ``["git", …]`` 会
+    ``FileNotFoundError: [WinError 2]``。所以先 ``which``，再退回已知安装位置。
+    """
+    import shutil
+    from pathlib import Path
+
+    found = shutil.which("git")
+    if found:
+        return found
+    candidates = [
+        *sorted(Path.home().glob(
+            ".workbuddy/binaries/PortableGit/versions/*/cmd/git.exe"), reverse=True),
+        Path("C:/Program Files/Git/cmd/git.exe"),
+        Path("C:/Program Files (x86)/Git/cmd/git.exe"),
+    ]
+    for cand in candidates:
+        if cand.is_file():
+            return str(cand)
+    return "git"  # 交给 subprocess 去报错，信息更真实
+
+
 def _token() -> str:
     out = subprocess.run(
-        ["git", "credential", "fill"],
+        [_git(), "credential", "fill"],
         input="protocol=https\nhost=github.com\n\n",
         capture_output=True, text=True, cwd=REPO_DIR,
     ).stdout
@@ -44,9 +68,33 @@ def api(method, path, payload=None, binary=False):
     )
     try:
         with opener.open(req, timeout=120) as r:
-            return r.read() if binary else json.loads(r.read().decode())
+            raw = r.read()
+            if binary:
+                return raw
+            # DELETE 之类返回 204 空体 —— 别拿空字符串去 json.loads
+            return json.loads(raw.decode()) if raw else {}
     except urllib.error.HTTPError as e:
         raise SystemExit(f"API {method} {path} -> {e.code}\n{e.read().decode()[:800]}") from None
+
+
+def _find_release(tag: str):
+    """已存在的同名 release（重发同一个版本号时要更新，而不是被 422 顶回来）。"""
+    try:
+        return api("GET", f"/repos/{REPO}/releases/tags/{tag}")
+    except SystemExit as exc:
+        if "-> 404" in str(exc):
+            return None
+        raise
+
+
+def _move_tag(tag: str, commitish: str) -> None:
+    """把 tag 强制挪到 commitish —— 重发时让 tag 落在最新提交上。"""
+    try:
+        api("PATCH", f"/repos/{REPO}/git/refs/tags/{tag}",
+            {"sha": commitish, "force": True})
+        print(f"tag {tag} → {commitish[:8]}")
+    except SystemExit as exc:  # pragma: no cover - 权限或分支保护
+        print(f"（tag 没挪动，请手动确认：{exc}）")
 
 
 def _body(version: str, zip_name: str) -> str:
@@ -112,15 +160,27 @@ def main() -> None:
     version = tag.lstrip("v")
     body = _body(version, os.path.basename(zip_path))
 
-    print(f"创建 release {tag} @ {commitish} ...")
-    rel = api("POST", f"/repos/{REPO}/releases", {
-        "tag_name": tag,
-        "target_commitish": commitish,
-        "name": tag,
-        "body": body,
-        "draft": False,
-        "prerelease": False,
-    })
+    print(f"创建/更新 release {tag} @ {commitish} ...")
+    rel = _find_release(tag)
+    if rel is None:
+        rel = api("POST", f"/repos/{REPO}/releases", {
+            "tag_name": tag,
+            "target_commitish": commitish,
+            "name": tag,
+            "body": body,
+            "draft": False,
+            "prerelease": False,
+        })
+    else:
+        # 已存在（比如上一次发到一半/需要补新修复）→ 更新说明、把 tag 挪到新提交、
+        # 清掉旧资产再传。否则 POST 会被 422 already_exists 顶回来，只能手工收拾。
+        print(f"release {tag} 已存在（id={rel['id']}）→ 更新说明并替换资产")
+        api("PATCH", f"/repos/{REPO}/releases/{rel['id']}",
+            {"body": body, "name": tag})
+        _move_tag(tag, commitish)
+        for asset in rel.get("assets") or []:
+            print("  删除旧资产:", asset["name"])
+            api("DELETE", f"/repos/{REPO}/releases/assets/{asset['id']}")
     rid = rel["id"]
     print(f"release id={rid}")
 
