@@ -175,8 +175,10 @@ def main() -> None:
         # 已存在（比如上一次发到一半/需要补新修复）→ 更新说明、把 tag 挪到新提交、
         # 清掉旧资产再传。否则 POST 会被 422 already_exists 顶回来，只能手工收拾。
         print(f"release {tag} 已存在（id={rel['id']}）→ 更新说明并替换资产")
+        # ``target_commitish`` 一并更新：GitHub 只在**创建**时认真对待它，之后
+        # 不动就会留下「tag 指着新提交、release 却写着老提交」的不一致。
         api("PATCH", f"/repos/{REPO}/releases/{rel['id']}",
-            {"body": body, "name": tag})
+            {"body": body, "name": tag, "target_commitish": commitish})
         _move_tag(tag, commitish)
         for asset in rel.get("assets") or []:
             print("  删除旧资产:", asset["name"])
