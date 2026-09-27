@@ -54,13 +54,14 @@ def collect_recent_images(
         if not directory.is_dir():
             continue
         try:
-            # **递归**：技能脚本会把图写进子目录（魔搭写 ``image/modelscope/``，
-            # agnes 写 ``image/``），只扫一层就会漏掉 —— 用户现场就是
-            # 「图生成了，但前端气泡下没出现、通道那边也没发」。
-            entries = [p for p in directory.rglob("*") if p.is_file()]
+            # 递归（rglob）：生图产物常落在子目录里，如 image/modelscope/xxx.jpg，
+            # 只扫顶层会有图却找不到、发不出来。
+            files = list(directory.rglob("*"))
         except OSError:  # pragma: no cover - 权限/IO
             continue
-        for path in entries:
+        for path in files:
+            if not path.is_file():
+                continue
             if path.suffix.lower() not in IMAGE_EXTS:
                 continue
             try:

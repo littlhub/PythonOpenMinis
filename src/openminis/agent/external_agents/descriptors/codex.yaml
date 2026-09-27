@@ -1,0 +1,69 @@
+# ============================================================================
+# 外部 agent 协议描述符 —— 示例模板
+#
+# 这是一份**可以直接用的** Codex 接入示例。想启用它：
+#   1. 确认 `codex` 在 PATH 上（`codex --version`）；
+#   2. 把本文件复制到 ~/openminis/agents/codex.yaml 并把 enabled 改成 true
+#      （或直接改这里的 enabled）。
+#
+# 放一份这样的文件到 ~/openminis/agents/ 即可接入任意外部 agent；
+# 应用会把它当成一个内置子代理列出来，委派时按本文件调用并回传信息。
+# 字段全集与语义见 ../PROTOCOL.md 。
+#
+# 默认 enabled: false —— 没装 codex 的用户不该在子代理列表里看到一个必然失败的项。
+# ============================================================================
+version: 1
+
+id: codex
+name: Codex
+emoji: 🌀
+description: OpenAI Codex CLI —— 把编程任务交给 Codex 的独立执行环境
+persona: 你是 Codex 编程代理，在自己的沙箱里读写代码、执行命令并给出结论。
+builtin: false
+enabled: false
+
+# internal（进程内 Python）| stdio（起 CLI 子进程）| http（POST 到服务）
+transport: stdio
+
+stdio:
+  # 命令里的 {{task}} 等占位符由运行器注入（见 PROTOCOL.md「模板变量」）。
+  command: ["codex", "exec", "--json", "--skip-git-repo-check"]
+  input:
+    # argv-template: 任务作为命令行参数追加
+    # stdin-text:    任务原文写进 stdin
+    # stdin-json:    {"task":..., "sessionId":..., "workspace":..., "config":...} 写进 stdin
+    mode: argv-template
+    args: ["{{task}}"]
+  env:
+    CODEX_QUIET: "1"
+  # workspace（默认，= 当前会话工作区）| 具体路径
+  cwd: workspace
+  timeoutSeconds: 900
+
+# 回传解析：CLI 把结果打成 JSON 时按路径取值，避免把整坨日志塞回对话。
+output:
+  format: json-lines
+  textPath: $.msg.content
+  errorPath: $.error
+
+# 该 agent 自己声明的工具（仅用于界面展示与子代理配置；执行由它自己内部完成）
+tools:
+  - id: codex_exec
+    name: Exec
+    description: 在 Codex 沙箱里执行一段编程任务
+    input_schema:
+      type: object
+      properties:
+        task:
+          type: string
+          description: 要交给 Codex 完成的任务描述
+      required: [task]
+
+skills:
+  roots: ["~/.codex/skills"]
+
+# 与主智能体互借（外部 CLI agent 通常自带工具与技能，这里默认关闭；
+# 打开后应用侧勾选的宿主工具/技能会以环境与新参数的形式传给它 —— 详见 PROTOCOL.md）。
+borrow:
+  tools: false
+  skills: false

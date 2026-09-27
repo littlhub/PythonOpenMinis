@@ -22,6 +22,7 @@ forward compatibility and always comes back empty in the registry.
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 from typing import Any
@@ -34,7 +35,11 @@ logger = get_logger(__name__)
 __all__ = [
     "SubagentError",
     "DEFAULT_FIELDS",
+    "EXTERNAL_OVERRIDABLE_FIELDS",
+    "ZCODE_OVERRIDABLE_FIELDS",
     "slugify_name",
+    "system_subagent_ids",
+    "is_external_subagent",
     "list_subagents",
     "get_subagent",
     "upsert_subagent",
@@ -43,12 +48,94 @@ __all__ = [
     "plan_subagent",
     "run_subagent",
     "find_vision_subagent",
-    "find_image_subagent",
     "group_block",
 ]
 
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 _JSON_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+
+# ---------------------------------------------------------------------------
+# 外部 agent 子代理 —— 描述符驱动
+#
+# 接入一个外部 agent（ZCode 内置、Codex、Claude Code、自研 CLI、远端服务…）
+# **不需要改这个文件**：在 ``~/openminis/agents/`` 放一份 YAML/JSON 协议描述符，
+# 下次加载时它会自动出现在子代理列表里，委派时按描述符调用并把回传带回对话。
+#
+# 外部 agent 与普通子代理的区别（用户给定的设计基线）：
+#   - tool / mcp / skill / loop / prompt **都是它自己那一套**，不共享主智能体的；
+#   - 因此它可以**独立运行**，``run_subagent`` 走描述符链路而不是 ``AgentRuntime``；
+#   - 配置上只有「选模型、挂哪些工具技能、人设补充」可改（覆盖层，见下）。
+#
+# 协议字段全集见 ``openminis/agent/external_agents/PROTOCOL.md``。
+# ---------------------------------------------------------------------------
+def _external_descriptors() -> dict[str, Any]:
+    """已注册的外部 agent 描述符（id → descriptor）。加载失败视为「一个都没有」。"""
+    try:
+        from .external_agents import load_descriptors
+
+        return dict(load_descriptors())
+    except Exception:  # pragma: no cover - 描述符层不可用不该拖垮子代理面
+        logger.debug("external agent descriptors unavailable", exc_info=True)
+        return {}
+
+
+def _active_external_descriptors() -> dict[str, Any]:
+    """启用的外部 agent（``enabled: false`` 的描述符不进列表、不可委派）。"""
+    return {aid: d for aid, d in _external_descriptors().items() if d.enabled}
+
+
+def system_subagent_ids() -> set[str]:
+    """系统内置（外部 agent）子代理 id 集合 —— 由描述符目录决定，不是硬编码。"""
+    return set(_active_external_descriptors())
+
+
+def is_external_subagent(sid: str) -> bool:
+    """该 id 是否由外部 agent 描述符提供。"""
+    return str(sid) in _external_descriptors()
+
+
+#: 允许用户覆盖的外部 agent 配置字段。**故意不含** ``loop`` / ``prompt``：
+#: 它们是外部 agent 内核的一部分（外部 agent 的循环与系统提示不该由主智能体的配置面
+#: 改写），``persona`` 只是追加在它系统提示之后的补充说明。
+EXTERNAL_OVERRIDABLE_FIELDS: tuple[str, ...] = (
+    "name",
+    "emoji",
+    "description",
+    "persona",
+    "providerId",
+    "providerType",
+    "model",
+    "tools",
+    "skills",
+    "mcpServers",
+    "maxRounds",
+)
+
+#: 兼容旧名：ZCode 是最早接入的外部 agent，历史调用点用的是这个常量名。
+ZCODE_OVERRIDABLE_FIELDS = EXTERNAL_OVERRIDABLE_FIELDS
+
+#: 这些字段由**后端**从描述符合成出来（``_external_builtin``），是给界面看的只读信息。
+#: 界面「编辑」是把整条 ``SubagentInfo`` 塞进表单再回传的，所以它们一定会出现在
+#: PUT 载荷里 —— 一律**静默忽略**，不能当成「试图修改不支持字段」而报错。
+#: 真正的越界（``loop`` / ``prompt`` / ``entry``）不在这个名单里，仍会被拒。
+EXTERNAL_DERIVED_FIELDS: frozenset[str] = frozenset({
+    "id",
+    "builtin",
+    "configurable",
+    "external",
+    "transport",
+    "selfManagedTools",
+    "ownTools",
+    "ownSkills",
+    "borrowedTools",
+    "borrowedSkills",
+    "skillRoots",
+    "toolRoots",
+    "source",
+    "systemPrompt",
+    "borrowTools",
+    "borrowSkills",
+})
 
 DEFAULT_FIELDS: dict[str, Any] = {
     "emoji": "🤖",
@@ -103,13 +190,192 @@ def _with_instance_id(store, cfg: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _external_override(store, sid: str) -> dict[str, Any]:
+    """用户对某个外部 agent 子代理的覆盖层（存在 ``subagents.<id>`` 里）。
+
+    覆盖层只保存用户**真的改过**的字段，其余仍走描述符默认值 —— 这样描述符升级
+    （新增工具、改默认人设）能自动惠及没动过那些字段的用户。
+    """
+    raw = _table(store).get(sid)
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _external_own_tools(descriptor) -> list[str]:
+    """外部 agent **自带**的工具 id：描述符声明 + ``tools.roots`` 目录导入。
+
+    目录导入让「把工具清单文件放进一个目录」就等于接入工具 —— 与技能根的用法
+    完全一致，不用把每个工具手写进描述符。
+    """
+    try:
+        from .external_agents import external_agent_tool_surface
+
+        surface = external_agent_tool_surface(descriptor, os.getcwd())
+        return [str(t["id"]) for t in surface["items"] if t.get("id")]
+    except Exception:  # pragma: no cover - 目录扫描不可用时只剩声明式工具
+        logger.debug("external tool surface unavailable", exc_info=True)
+        return list(descriptor.default_tools)
+
+
+def _external_own_skills(descriptor) -> list[str]:
+    """外部 agent **自带**的技能名（描述符 ``skills.roots`` 里发现的那几个）。
+
+    只扫它自己的根（``discover_skills_at_roots`` 不并宿主技能库），所以返回的就是
+    「它自己这套技能」。这些技能在配置界面上是**锁定项**：与它自带工具一样，只增
+    不减 —— 用户能往里加（借宿主技能），但不能把它们删掉。
+    """
+    if not getattr(descriptor, "skill_roots", None):
+        return []
+    try:
+        from .zcode.integration import discover_skills_at_roots
+
+        outcome = discover_skills_at_roots(
+            list(descriptor.skill_roots), workspace=os.getcwd()
+        )
+        return [str(s.name) for s in outcome.skills if getattr(s, "name", "")]
+    except Exception:  # pragma: no cover - 扫描不可用时视为「没有自带技能」
+        logger.debug("external own skills unavailable", exc_info=True)
+        return []
+
+
+def _external_tool_ids(descriptor) -> list[str]:
+    """外部 agent 默认可勾选的工具：只保留**工具目录里真实存在**的 id。
+
+    描述符/工具目录里声明的是「能力面」；其中有依赖未移植端口的（如 WebSearch），
+    注册出来必然是个一调就报错的壳 —— 所以这里按目录取交集，界面从此不会给出会
+    失败的工具。（ZCode 的 10 个工具都已注册，所以它拿到完整工具链。）
+    """
+    try:
+        from ..settings.catalog import known_tool_ids
+
+        known = known_tool_ids()
+    except Exception:  # pragma: no cover - 目录不可用时退回空（界面会提示无工具）
+        logger.debug("tool catalog unavailable", exc_info=True)
+        return []
+    return [t for t in _external_own_tools(descriptor) if t in known]
+
+
+def _backfill_provider(store, cfg: dict[str, Any]) -> None:
+    """内置外部 agent 默认跟随「当前激活的模型服务实例」。"""
+    data = store.load()
+    active = str(data.get("activeProviderId") or "").strip()
+    instances = list(store.provider_instances())
+    conf = next((c for c in instances if str(c.get("id")) == active), None)
+    if conf is None and instances:
+        conf = instances[0]
+    if conf is None:
+        return
+    cfg["providerId"] = str(conf.get("id") or active)
+    ptype = str(conf.get("type") or "")
+    if ptype:
+        cfg["providerType"] = ptype
+    cfg["model"] = str(cfg.get("model") or conf.get("model") or "")
+
+
+def _external_builtin(store, descriptor) -> dict[str, Any]:
+    """外部 agent 子代理的活体副本：描述符默认值 + 用户覆盖层。
+
+    内置项**不必**落库，但用户改过的部分会以覆盖层形式留在 ``subagents.<id>``；
+    这里负责把两层合成出「当前生效」的那一份。绑定的 provider 缺席（还没配 Key）
+    时 providerId 留空，前端显示「未配模型」。
+
+    工具与技能的合并规则是**只增不减**：外部 agent 自称的那套（``ownTools`` /
+    ``ownSkills``）永远生效，覆盖层里存的只是用户额外借来的宿主工具/技能。这与它
+    作为「独立 agent」的定位一致 —— 借东西可以，改它的本体不行。
+    """
+    own_tools = _external_own_tools(descriptor)
+    own_skills = _external_own_skills(descriptor)
+    cfg: dict[str, Any] = {
+        "id": descriptor.id,
+        "name": descriptor.name,
+        "emoji": descriptor.emoji,
+        "description": descriptor.description,
+        "persona": descriptor.persona,
+        "providerId": "",
+        "providerType": "",
+        "model": "",
+        "tools": _external_tool_ids(descriptor),
+        "skills": list(own_skills),
+        "mcpServers": [],
+        "maxRounds": 12,
+        # ── 外部 agent 自己的东西（界面据此区分「它自带工具链」而不是「没工具」）──
+        "builtin": bool(descriptor.builtin),
+        "external": True,
+        "transport": descriptor.transport,
+        #: 它自己带的工具名（描述符声明 + tools.roots 目录导入；不一定在本应用的
+        #: 工具目录里 —— CLI agent 的工具在自己进程里）
+        "selfManagedTools": own_tools,
+        #: 它自带的工具/技能（界面渲染成**锁定项**：只增不减）
+        "ownTools": own_tools,
+        "ownSkills": own_skills,
+        #: 用户额外**借来**的宿主工具/技能（覆盖层净增量）
+        "borrowedTools": [],
+        "borrowedSkills": [],
+        "skillRoots": list(descriptor.skill_roots),
+        "toolRoots": list(descriptor.tool_roots),
+        "systemPrompt": descriptor.resolved_system_prompt(),
+        "source": descriptor.source_path,
+        #: 与主智能体的互借开关（工具/技能）。
+        "borrowTools": bool(descriptor.borrow_tools),
+        "borrowSkills": bool(descriptor.borrow_skills),
+    }
+    _backfill_provider(store, cfg)
+
+    # 用户覆盖层最后合并：改过什么就用什么。
+    override = _external_override(store, descriptor.id)
+    for key in EXTERNAL_OVERRIDABLE_FIELDS:
+        if key not in override:
+            continue
+        if key in ("tools", "skills"):
+            # 工具与技能是**只增不减**的：它自称的那套永远生效（界面上也删不掉），
+            # 覆盖层里存的只是「额外借来的」——见下面两行合并。
+            continue
+        if key in ("mcpServers", "persona", "description"):
+            # 空值是合法取值（用户主动清空人设/描述），不能当成「没改」。
+            cfg[key] = override[key]
+        elif override[key] not in (None, ""):
+            cfg[key] = override[key]
+
+    # 「借用」的净增量单独算出来：界面用它把「自带的」与「借来的」分开画，
+    # 运行时也据此只把**勾中的那几个**宿主技能拿给外部 agent。
+    borrowed_tools = [
+        str(t) for t in (override.get("tools") or []) if str(t) not in cfg["tools"]
+    ]
+    borrowed_skills = [
+        str(s) for s in (override.get("skills") or []) if str(s) not in cfg["skills"]
+    ]
+    cfg["tools"] = [*cfg["tools"], *borrowed_tools]
+    cfg["skills"] = [*cfg["skills"], *borrowed_skills]
+    cfg["borrowedTools"] = borrowed_tools
+    cfg["borrowedSkills"] = borrowed_skills
+    cfg["id"] = descriptor.id
+    # 界面据此知道这张卡可以编辑（只是不可删除）。
+    cfg["configurable"] = True
+    return cfg
+
+
 def list_subagents(store) -> list[dict[str, Any]]:
-    return [_with_instance_id(store, cfg) for cfg in _table(store).values()]
+    descriptors = _active_external_descriptors()
+    # 内置项（随包分发）排在前，其余按 id —— 顺序稳定，界面不会每次刷新跳来跳去。
+    ordered = sorted(descriptors.values(), key=lambda d: (not d.builtin, d.id))
+    out = [_external_builtin(store, d) for d in ordered]
+    out.extend(
+        _with_instance_id(store, cfg)
+        for key, cfg in _table(store).items()
+        if key not in descriptors
+    )
+    return out
 
 
 def get_subagent(store, sid: str) -> dict[str, Any] | None:
+    descriptor = _active_external_descriptors().get(str(sid))
+    if descriptor is not None:
+        # 必须走合成（覆盖层可能已经改过 name/tools/…），不能返回表里的原始行。
+        return _external_builtin(store, descriptor)
     cfg = _table(store).get(sid)
-    return _with_instance_id(store, cfg) if cfg else None
+    if cfg:
+        return _with_instance_id(store, cfg)
+    return None
+
 
 
 def slugify_name(name: str) -> str:
@@ -202,14 +468,117 @@ def _validate(store, cfg: dict[str, Any], existing: bool) -> None:
         cfg["persona"] = f"你是「{name}」。基于给定的任务专注、可靠地完成工作，用中文回复。"
 
 
+def _upsert_external_override(
+    store, descriptor, payload: dict[str, Any], sid: str
+) -> dict[str, Any]:
+    """保存外部 agent 子代理的**覆盖层**（而不是整条替换）。
+
+    外部 agent 的关键区别：它跑的是自己的 loop / prompt / 工具链，所以能改的只有
+    「选哪个模型、挂哪些工具与技能、人设补充」这几项；``loop``/``prompt`` 不在可改
+    名单里 —— 让主智能体去改外部 agent 的循环与系统提示，只会造出一个四不像。
+
+    与普通 subagent 的另一处不同：``providerId`` **允许留空**，表示继续跟随当前
+    激活的模型服务实例（内置项默认就是这个语义）。
+    """
+    from ..settings.catalog import known_tool_ids
+
+    data = store.load()
+    sub = data.setdefault("subagents", {})
+    existing = dict(sub.get(sid) or {})
+
+    rejected = [
+        key
+        for key in payload
+        if key not in EXTERNAL_OVERRIDABLE_FIELDS
+        and key not in EXTERNAL_DERIVED_FIELDS
+    ]
+    if rejected:
+        raise SubagentError(
+            f"外部 agent 子代理 {sid} 不支持修改这些字段: {', '.join(sorted(rejected))}"
+            f"（可改: {', '.join(EXTERNAL_OVERRIDABLE_FIELDS)}）"
+        )
+
+    cfg: dict[str, Any] = {**existing}
+    for key, value in (payload or {}).items():
+        if key in EXTERNAL_OVERRIDABLE_FIELDS:
+            cfg[key] = value
+
+    if "name" in cfg and not str(cfg.get("name") or "").strip():
+        raise SubagentError("name 不能为空")
+    # 工具/技能：界面把「自带的 + 借来的」整份回传（它就是照着当前生效那份画的），
+    # 落库前**减掉自带的那一份**，只留净增的借用项。这样「删不掉自己的」是结构保证，
+    # 而不是靠界面不给按钮。
+    own_tools = set(_external_own_tools(descriptor))
+    own_skills = set(_external_own_skills(descriptor))
+    if "tools" in cfg:
+        picked = _clean_tools(cfg.get("tools"), known_tool_ids(), sid)
+        cfg["tools"] = [t for t in picked if t not in own_tools]
+    if "skills" in cfg:
+        picked = _clean_strings("skills", cfg.get("skills"), sid, "skills")
+        cfg["skills"] = [s for s in picked if s not in own_skills]
+    if "mcpServers" in cfg:
+        cfg["mcpServers"] = _clean_strings("mcpServers", cfg.get("mcpServers"), sid, "mcpServers")
+    if "maxRounds" in cfg:
+        try:
+            cfg["maxRounds"] = max(1, min(int(cfg.get("maxRounds", 12)), 12))
+        except (TypeError, ValueError) as exc:
+            raise SubagentError("maxRounds 必须是整数(1-12)") from exc
+    if "emoji" in cfg:
+        cfg["emoji"] = str(cfg.get("emoji") or "🤖")[:4]
+    if "description" in cfg:
+        cfg["description"] = str(cfg.get("description") or "")[:200]
+
+    if "providerId" in payload or "providerType" in payload:
+        pid = str(cfg.get("providerId") or cfg.get("providerType") or "").strip()
+        if pid:
+            instances = store.provider_instances()
+            conf = next((c for c in instances if c.get("id") == pid), None)
+            if conf is None:
+                conf = next((c for c in instances if c.get("type") == pid), None)
+            if conf is None or not str(conf.get("apiKey") or "").strip():
+                raise SubagentError(f"模型服务未配置或未填 Key: {pid}")
+            cfg["providerId"] = str(conf.get("id") or pid)
+            if conf.get("type"):
+                cfg["providerType"] = str(conf["type"])
+        else:
+            # 清空 → 回到「跟随当前激活实例」的内置语义，覆盖层里不留空值。
+            cfg.pop("providerId", None)
+            cfg.pop("providerType", None)
+
+    cfg["id"] = sid
+    cfg["builtin"] = bool(descriptor.builtin)
+    sub[sid] = cfg
+    store.save(data)
+    return _external_builtin(store, descriptor)
+
+
 def upsert_subagent(store, payload: dict[str, Any], sid: str | None = None) -> dict[str, Any]:
-    """Create (sid None or new) or replace an existing subagent config."""
+    """Create (sid None or new) or replace an existing subagent config.
+
+    Note: 外部 agent 子代理（内置 ZCode、描述符注册的 Codex…）**可以被修改**，但改的
+    是覆盖层而不是整条配置（见 ``_upsert_external_override``）；它们仍然**不可删除**。
+    """
+    descriptor = _active_external_descriptors().get(str(sid)) if sid is not None else None
+    if descriptor is not None:
+        return _upsert_external_override(store, descriptor, payload or {}, str(sid))
+    if sid is not None and is_external_subagent(str(sid)):
+        # 描述符存在但被 enabled: false 关掉了 —— 不要让它悄悄变成一条普通子代理。
+        raise SubagentError(
+            f"外部 agent '{sid}' 当前未启用（描述符 enabled: false），"
+            "请先启用后再修改配置"
+        )
     data = store.load()
     sub = data.setdefault("subagents", {})
     cfg = {
         **DEFAULT_FIELDS,
         **(payload or {}),
     }
+    new_id = str(cfg.get("id") or sid or "").strip()
+    if is_external_subagent(new_id):
+        raise SubagentError(
+            f"id '{new_id}' 已被外部 agent 描述符占用（工具/技能/循环由它自己提供），"
+            "请换一个 id"
+        )
     if sid is not None:
         if sid not in sub:
             raise SubagentError(f"subagent 不存在: {sid}")
@@ -223,6 +592,24 @@ def upsert_subagent(store, payload: dict[str, Any], sid: str | None = None) -> d
 
 
 def delete_subagent(store, sid: str) -> bool:
+    """Delete a subagent. 外部 agent 子代理不可删除。
+
+    注意：不可删除 ≠ 不可配置 —— 改配置走 ``upsert_subagent`` 的覆盖层。
+    想彻底移除一个描述符驱动的外部 agent，删掉它那份描述符文件即可（下面会把
+    具体路径指出来）。
+    """
+    if is_external_subagent(str(sid)):
+        descriptor = _external_descriptors().get(str(sid))
+        shipped = bool(getattr(descriptor, "builtin", False))
+        if shipped:
+            raise SubagentError(
+                f"子代理 '{sid}' 随应用分发，不可删除；但可以修改配置"
+            )
+        source = str(getattr(descriptor, "source_path", "") or "")
+        where = f"删掉描述符文件 {source} 即可移除" if source else (
+            "删掉 ~/openminis/agents/ 里对应的描述符文件即可移除"
+        )
+        raise SubagentError(f"子代理 '{sid}' 由外部 agent 描述符提供 —— {where}")
     data = store.load()
     sub = data.get("subagents") or {}
     if sid not in sub:
@@ -247,7 +634,6 @@ def build_registry(store) -> dict[str, Any]:
         PROVIDER_TYPES,
         all_tool_catalog,
     )
-    from ..skills import SkillStore
 
     data = store.load()
     active_pid = data.get("activeProviderId")
@@ -292,10 +678,42 @@ def build_registry(store) -> dict[str, Any]:
 
     skills = []
     try:
+        # 技能库依赖 pyyaml；导不进来时注册表**照常返回**（技能那一栏空着），
+        # 而不是让整个「可用资源注册表」连带子代理规划一起失败。
+        from ..skills import SkillStore
+
         for entry in SkillStore().list():
             skills.append({"name": entry.name, "description": entry.description})
     except Exception:  # pragma: no cover - never break registry over skills
         logger.debug("skill list unavailable", exc_info=True)
+
+    # 外部 agent 的技能来自**另一套技能根**（描述符里的 ``skills.roots``，如
+    # ``.zcode/skills`` / ``.agents/skills``）。与上面主智能体的技能取并集展示：
+    # 同名也不合并 —— 它们的正文与作用域可能不同，合并会让用户以为是一个技能，
+    # 实则外部 agent 加载的是另一份。
+    try:
+        from .zcode.integration import discover_skills_at_roots
+
+        workspace = os.getcwd()
+        seen = {s["name"] for s in skills}
+        for descriptor in _active_external_descriptors().values():
+            if not descriptor.skill_roots:
+                continue
+            outcome = discover_skills_at_roots(
+                list(descriptor.skill_roots), workspace=workspace
+            )
+            for skill in outcome.skills:
+                skills.append({
+                    "name": skill.name,
+                    "description": skill.description,
+                    "source": "external",
+                    "agentId": descriptor.id,
+                    "scope": skill.scope,
+                    "path": skill.path,
+                    "shadowed": skill.name in seen,
+                })
+    except Exception:  # pragma: no cover - 外部技能不可用不该拖垮注册表
+        logger.debug("external skill discovery unavailable", exc_info=True)
 
     return {
         "providers": providers,
@@ -303,9 +721,35 @@ def build_registry(store) -> dict[str, Any]:
         "tools": all_tool_catalog(),
         "skills": skills,
         "mcpServers": [],
+        # 外部 agent（描述符驱动）：界面据此展示「已接入哪些外部 agent」及其协议来源。
+        "externalAgents": _external_agent_views(),
+        # 主智能体的工具对外部 agent 的**可借用**清单（互借的工具那一半）。
+        "borrowedTools": _borrowed_tool_catalog(),
         # human note for the UI / planner about the MCP gap
         "mcpNote": "本引擎暂未移植 MCP 客户端，mcpServers 字段仅作预留",
     }
+
+
+def _external_agent_views() -> list[dict[str, Any]]:
+    """外部 agent 摘要（描述符层不可用时返回空列表）。"""
+    try:
+        from .external_agents import list_external_agent_views
+
+        return list_external_agent_views()
+    except Exception:  # pragma: no cover
+        logger.debug("external agent views unavailable", exc_info=True)
+        return []
+
+
+def _borrowed_tool_catalog() -> list[dict[str, Any]]:
+    """可被外部 agent 借用的宿主工具（ZCode 桥接层登记）。"""
+    try:
+        from .zcode.integration import borrowed_tool_catalog
+
+        return borrowed_tool_catalog()
+    except Exception:  # pragma: no cover
+        logger.debug("borrowed tool catalog unavailable", exc_info=True)
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -486,6 +930,109 @@ def group_block(store, ids: list[str], humans: list[str] | None = None) -> str:
 
 
 # ---------------------------------------------------------------------------
+# ZCode 外部 agent —— 独立运行链路
+# ---------------------------------------------------------------------------
+def _session_workspace(session_id: str) -> str:
+    """会话的工作区根（与 ``file_*`` 工具同一套映射）。"""
+    import os
+
+    try:
+        from ..core.context import app_context
+
+        root = app_context().external_files_dir / str(session_id)
+        root.mkdir(parents=True, exist_ok=True)
+        return str(root)
+    except Exception:  # pragma: no cover - 无 AppContext（CLI/测试）时退回 cwd
+        logger.debug("session workspace unavailable, falling back to cwd", exc_info=True)
+        return os.getcwd()
+
+
+def _resolve_provider_for(store, cfg: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """解析子代理绑定的模型服务实例；空则跟随当前激活实例。"""
+    pid = str(cfg.get("providerId") or cfg.get("providerType") or "")
+    data = store.load()
+    conf = dict(data["providers"].get(pid) or {})
+    if not conf:
+        conf = next(
+            (dict(c) for c in store.provider_instances() if c.get("type") == pid),
+            {},
+        )
+    if not conf:
+        active = str(data.get("activeProviderId") or "")
+        conf = dict(data["providers"].get(active) or {})
+        if not conf:
+            conf = next((dict(c) for c in store.provider_instances()), {})
+        pid = str(conf.get("id") or active)
+    if not conf:
+        raise SubagentError("没有可用的模型服务：请先在 设置 → 模型服务 配好 API Key")
+    conf["model"] = cfg.get("model") or conf.get("model", "")
+    return pid, conf
+
+
+async def _run_external_subagent(
+    store, descriptor, cfg: dict[str, Any], task: str, session_id: str
+) -> str:
+    """用外部 agent **自己的 loop / prompt / 工具链 / 技能**跑一轮（不经过 ``AgentRuntime``）。
+
+    这是「外部 agent 可以独立运行」的落点：
+    - **loop**：由描述符指向的实现提供（内置 ZCode 走 ``integration.agent``）；
+    - **prompt**：外部 agent 自己拼装，``cfg.persona`` 只作追加说明；
+    - **tools**：它自己的工具链 ∪（打开互借时）勾中的主智能体工具；
+    - **skills**：它自己的技能根 ∪（打开互借时）主智能体的技能库。
+
+    描述符一律从这里分发：``internal`` 走进程内入口，``stdio`` 起子进程，``http``
+    发请求 —— 三者都收敛成同一份回传文本（见 ``external_agents.runner``）。
+    """
+    from .external_agents import run_external_agent
+    from .subagent_events import project_for
+
+    # 只有进程内实现才需要宿主模型；CLI/HTTP agent 自带执行环境，不需要我们的 Key。
+    # （provider 层依赖 httpx 等运行环境库，能不起就不起 —— 一个纯 CLI 委派不该
+    #  因为聊天服务装不起来而失败。）
+    provider = None
+    if descriptor.transport == "internal":
+        from ..settings.chat_service import build_provider
+
+        pid, conf = _resolve_provider_for(store, cfg)
+        provider = build_provider(pid, conf)
+
+    cwd = _session_workspace(session_id)
+    project_dir = project_for(cfg.get("id") or descriptor.id)
+    if project_dir:
+        cwd = str(project_dir)
+
+    # 让外部 agent 的 shell 与应用自己的 shell 各自落在自己的键上（互不干扰），
+    # 但目录一致 —— 借来的宿主工具也因此落在同一个工作区。
+    try:
+        from pathlib import Path
+
+        from ..tools.shell_execute_tool import get_coordinator
+
+        get_coordinator().set_session_cwd(f"{session_id}:{descriptor.id}", Path(cwd))
+    except Exception:  # pragma: no cover - 目录不可用不该打断运行
+        logger.debug("external agent session cwd failed", exc_info=True)
+
+    try:
+        result = await run_external_agent(
+            descriptor.id,
+            task,
+            session_id=session_id,
+            workspace=cwd,
+            config=cfg,
+            provider=provider,
+        )
+    finally:
+        close = getattr(provider, "aclose", None)
+        if callable(close):
+            try:
+                await close()
+            except Exception:  # pragma: no cover
+                pass
+
+    return result.as_text()
+
+
+# ---------------------------------------------------------------------------
 # 运行子代理 —— 主 agent 的 subagent_delegate 工具与后端「识图」都走这里。
 # ---------------------------------------------------------------------------
 async def run_subagent(
@@ -497,14 +1044,25 @@ async def run_subagent(
     本身（否则会无限委派）。空产出时返回一句可读的说明而不是抛异常 ——
     调用方（工具 / 识图链路）都要能把「没看到东西」如实告诉用户。
     """
+    cfg = get_subagent(store, subagent_id)
+    if cfg is None:
+        raise SubagentError(f"subagent 不存在: {subagent_id}")
+
+    # 外部 agent（内置 ZCode、描述符注册的 Codex…）是**独立 agent**：tool / mcp /
+    # skill / loop / prompt 都是它自己那一套，走描述符链路。这里必须早于下面的通用
+    # 分支返回，否则它会被当普通子代理塞进 ``AgentRuntime`` + 主智能体工具链，等于
+    # 把外部 agent 降级成普通人格。
+    #
+    # 注意：通用分支那几个 import（provider 层 / AgentRuntime）刻意放在这个早返回
+    # **之后** —— 一个纯 CLI 外部 agent 不该因为宿主聊天服务装不起来而委派失败。
+    descriptor = _active_external_descriptors().get(str(subagent_id))
+    if descriptor is not None:
+        return await _run_external_subagent(store, descriptor, cfg, task, session_id)
+
     from ..settings.catalog import build_tool_registry
     from ..settings.chat_service import build_provider
     from ..tools.subagent_tool import SubagentDelegateTool
     from .agent_runtime import AgentRuntime, AgentRuntimeOptions
-
-    cfg = get_subagent(store, subagent_id)
-    if cfg is None:
-        raise SubagentError(f"subagent 不存在: {subagent_id}")
 
     # cfg.providerId 指的是模型服务**实例**；老配置只有 providerType（协议），
     # 那就退回该协议下的第一个实例。
@@ -687,56 +1245,6 @@ def find_vision_subagent(store) -> str | None:
         elif _subagent_model_sees(store, cfg, CAP_VISION):
             weak = sid
     return strong or weak
-
-
-#: 生图技能强信号：名字里明确就是「生图」，优先级最高。
-_GENERATE_SKILL_STRONG_HINTS = ("生图", "图像生成", "imagegen", "modelscope", "魔搭")
-#: 生图技能弱信号：可能是生图，也可能是看图（image 要往生图方向碰运气）。
-_GENERATE_SKILL_WEAK_HINTS = ("image", "图像", "图片", "draw", "t2i")
-
-
-def find_image_subagent(store) -> str | None:
-    """挑一个能「生图」的子代理 id，没有就返回 ``None``。
-
-    按分类匹配，**先窄后宽、逐级扩大**（搜不到才往下一级扩范围）：
-    1. 窄 —带 ``image_gen`` 且技能名明确是生图类（生图 / 图像生成 / 魔搭）；
-    2. 中 —带 ``image_gen`` 且技能名含 image / 图像 / 图片，或它绑定的模型
-           自带生图能力；
-    3. 宽 —只要带 ``image_gen`` 工具。
-    前一级一个都搜不到才向下一级扩大；搜到即停。
-    """
-    try:
-        from ..settings.model_capability import CAP_IMAGE
-    except Exception:  # pragma: no cover
-        CAP_IMAGE = "image"
-
-    def _skills(cfg: dict[str, Any]) -> list[str]:
-        return [str(s).lower() for s in (cfg.get("skills") or [])]
-
-    def _has_gen_tool(cfg: dict[str, Any]) -> bool:
-        return "image_gen" in (cfg.get("tools") or [])
-
-    def _strong(cfg: dict[str, Any]) -> bool:
-        return any(h in s for s in _skills(cfg) for h in _GENERATE_SKILL_STRONG_HINTS)
-
-    def _weak(cfg: dict[str, Any]) -> bool:
-        return any(h in s for s in _skills(cfg) for h in _GENERATE_SKILL_WEAK_HINTS)
-
-    # 第 1 级（窄）：明确生图技能。
-    for cfg in list_subagents(store):
-        if _has_gen_tool(cfg) and _strong(cfg):
-            return str(cfg.get("id") or "")
-    # 第 2 级（中）：技能提示或模型自带生图能力。
-    for cfg in list_subagents(store):
-        if not _has_gen_tool(cfg):
-            continue
-        if _weak(cfg) or _subagent_model_sees(store, cfg, CAP_IMAGE):
-            return str(cfg.get("id") or "")
-    # 第 3 级（宽）：只要带 image_gen 工具。
-    for cfg in list_subagents(store):
-        if _has_gen_tool(cfg):
-            return str(cfg.get("id") or "")
-    return None
 
 
 def _subagent_model_sees(store, cfg: dict[str, Any], cap_vision: str) -> bool:

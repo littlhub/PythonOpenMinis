@@ -1,0 +1,84 @@
+# ============================================================================
+# 预留槽位：WorkBuddy
+#
+# 本文件是**预留位**，默认 enabled: false。WorkBuddy 的调用入口定了之后，按
+# 下面 3 步填好即可上线：
+#
+#   1. 把 stdio.command 换成它真实的 CLI（或改成 transport: http 指向它的接口）；
+#   2. 按它的回传形状改 output.textPath / output.errorPath；
+#   3. 把 enabled 改成 true。
+#
+# 也可以复制到 ~/openminis/agents/workbuddy.yaml 再改（同名 id 以用户目录为准）。
+# 字段全集见 ../PROTOCOL.md ；WorkBuddy 自身的文档见
+# https://www.workbuddy.cn/docs/workbuddy/Overview 。
+# ============================================================================
+version: 1
+
+id: workbuddy
+name: WorkBuddy
+emoji: 🛠️
+description: WorkBuddy 侧的执行能力 —— 预留槽位（请先按注释填好命令）
+persona: 你是 WorkBuddy 助手，在自己的环境里完成任务并给出结论。
+builtin: false
+#: ⚠️ 预留位：填好 command / output 之后再改成 true。
+enabled: false
+
+# 形态一（默认）：本机 CLI。
+transport: stdio
+
+stdio:
+  #: TODO 换成 WorkBuddy 真实的命令行入口。
+  command: ["workbuddy", "run", "--json"]
+  input:
+    #: argv-template / stdin-text / stdin-json / none
+    mode: argv-template
+    args: ["{{task}}"]
+  #: 需要带上会话信息时用 stdin-json：它会收到
+  #: {"task":..., "sessionId":..., "workspace":..., "config":...}
+  env: {}
+  cwd: workspace
+  timeoutSeconds: 900
+
+output:
+  #: TODO 按真实回传形状改。
+  format: json
+  textPath: $.result
+  errorPath: $.error
+
+# 形态二（备选）：如果走 HTTP 接口，把 transport 换成 http。
+#
+# transport: http
+# http:
+#   endpoint: "https://<your-endpoint>/run"
+#   method: POST
+#   headers:
+#     authorization: "Bearer <你的 token>"
+#     x-session: "{{session_id}}"
+#     x-workspace: "{{workspace}}"
+# output:
+#   format: json
+#   textPath: $.data.answer
+
+# 形态三（备选）：如果它是本仓库内的 Python 实现，用进程内入口最省事。
+#
+# transport: internal
+# entry: "my_package.workbuddy_agent:handle"
+
+tools:
+  - id: workbuddy_run
+    name: WorkBuddy · Run
+    description: 把一段任务交给 WorkBuddy 执行
+    input_schema:
+      type: object
+      properties:
+        task:
+          type: string
+          description: 要交给 WorkBuddy 完成的任务描述
+      required: [task]
+
+skills:
+  roots: ["~/.workbuddy/skills"]
+
+borrow:
+  tools: false
+  skills: false

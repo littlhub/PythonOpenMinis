@@ -4385,6 +4385,42 @@ input:checked + .toggle-slider:before {
   color: #fff;
 }
 
+/* 工具/技能来源标注（ZCode · 相交 file_read、外部…）—— 小一号、降对比，
+   避免抢掉工具名本身的注意力。 */
+.sa-chip-badge {
+  font-size: 10px;
+  opacity: 0.72;
+}
+
+.sa-chip.on .sa-chip-badge {
+  opacity: 0.9;
+}
+
+/* 锁定项：外部 agent 自带、删不掉的能力（只增不减）。与可勾选项视觉上分开 ——
+   它不是按钮，鼠标也不该给出「可以点」的暗示。 */
+.sa-chip.locked {
+  cursor: default;
+  border-style: dashed;
+  opacity: 0.9;
+  color: var(--fg, inherit);
+}
+
+.sa-chip.locked:hover {
+  border-color: var(--border);
+  color: var(--fg, inherit);
+}
+
+/* 借用被描述符关掉时，勾选按钮不可用（而不是点了没反应）。 */
+.sa-chip:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+.sa-chip:disabled:hover {
+  border-color: var(--border);
+  color: var(--muted);
+}
+
 
 
 /* ---- 技能激活开关（skill toggle）---- */

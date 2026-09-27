@@ -62,8 +62,12 @@ async def subagents_update(sid: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 @router.delete("/{sid}")
 async def subagents_delete(sid: str) -> dict[str, Any]:
-    if not delete_subagent(_store(), sid):
-        raise HTTPException(status_code=404, detail="not_found")
+    try:
+        if not delete_subagent(_store(), sid):
+            raise HTTPException(status_code=404, detail="not_found")
+    except SubagentError as e:
+        # 系统内置子代理（zcode）不可删除 —— 返回 400 并把原因带给前端。
+        raise HTTPException(status_code=400, detail=str(e)) from None
     return {"ok": True}
 
 

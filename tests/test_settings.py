@@ -39,7 +39,9 @@ def test_default_settings_have_catalog(store):
     assert len(body["providerTypes"]) == 6
     assert any(t["type"] == "anthropic" and t["engine"] == "anthropic"
                for t in body["providerTypes"])
-    assert [t["id"] for t in body["toolCatalog"]] == [
+    tool_ids = [t["id"] for t in body["toolCatalog"]]
+    # 宿主工具目录（顺序即定义顺序）：先这几个，之后追加并入的外部 agent 工具。
+    assert tool_ids[:16] == [
         "shell_execute",
         "file_read",
         "file_write",
@@ -57,6 +59,9 @@ def test_default_settings_have_catalog(store):
         "skill_use",
         "send",
     ]
+    # ZCode 工具链并入目录（「主 agent 借外部 agent 的工具」那一半）。
+    assert "zcode_read" in tool_ids
+    assert all(i.startswith("zcode_") for i in tool_ids[16:])
 
 
 def test_put_provider_activate_identity(store):

@@ -16,33 +16,9 @@ API = "https://api.github.com"
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _git() -> str:
-    """找到 git 可执行文件。
-
-    本机 PATH 时不时没有 git（沙箱/终端各不一样），直接 ``["git", …]`` 会
-    ``FileNotFoundError: [WinError 2]``。所以先 ``which``，再退回已知安装位置。
-    """
-    import shutil
-    from pathlib import Path
-
-    found = shutil.which("git")
-    if found:
-        return found
-    candidates = [
-        *sorted(Path.home().glob(
-            ".workbuddy/binaries/PortableGit/versions/*/cmd/git.exe"), reverse=True),
-        Path("C:/Program Files/Git/cmd/git.exe"),
-        Path("C:/Program Files (x86)/Git/cmd/git.exe"),
-    ]
-    for cand in candidates:
-        if cand.is_file():
-            return str(cand)
-    return "git"  # 交给 subprocess 去报错，信息更真实
-
-
 def _token() -> str:
     out = subprocess.run(
-        [_git(), "credential", "fill"],
+        ["git", "credential", "fill"],
         input="protocol=https\nhost=github.com\n\n",
         capture_output=True, text=True, cwd=REPO_DIR,
     ).stdout
@@ -68,33 +44,9 @@ def api(method, path, payload=None, binary=False):
     )
     try:
         with opener.open(req, timeout=120) as r:
-            raw = r.read()
-            if binary:
-                return raw
-            # DELETE 之类返回 204 空体 —— 别拿空字符串去 json.loads
-            return json.loads(raw.decode()) if raw else {}
+            return r.read() if binary else json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         raise SystemExit(f"API {method} {path} -> {e.code}\n{e.read().decode()[:800]}") from None
-
-
-def _find_release(tag: str):
-    """已存在的同名 release（重发同一个版本号时要更新，而不是被 422 顶回来）。"""
-    try:
-        return api("GET", f"/repos/{REPO}/releases/tags/{tag}")
-    except SystemExit as exc:
-        if "-> 404" in str(exc):
-            return None
-        raise
-
-
-def _move_tag(tag: str, commitish: str) -> None:
-    """把 tag 强制挪到 commitish —— 重发时让 tag 落在最新提交上。"""
-    try:
-        api("PATCH", f"/repos/{REPO}/git/refs/tags/{tag}",
-            {"sha": commitish, "force": True})
-        print(f"tag {tag} → {commitish[:8]}")
-    except SystemExit as exc:  # pragma: no cover - 权限或分支保护
-        print(f"（tag 没挪动，请手动确认：{exc}）")
 
 
 def _body(version: str, zip_name: str) -> str:
@@ -120,15 +72,10 @@ def _body(version: str, zip_name: str) -> str:
         "## 改进\n"
         "- **沙箱守卫不再误伤**：图片文件名里的长哈希（QQ/微信媒体大量是哈希命名）不再被当成"
         "「疑似密钥」遮成「已拦截」；真密钥（`sk-` / `AKIA` / `ghp_` / PEM / 孤立哈希）照旧拦。\n"
-        "- **路径形态双向**：发给模型与聊天对象的内容里不出现 `C:\\Users\\<用户名>\\…`，"
-        "统一成 `/var/minis/workspace|data|home/…`；模型照着这个形态拼的命令、"
-        "回填的图片路径也都能还原回真实位置（技能目录 `cd` 不进去这类问题就是它）。\n"
-        "- **技能能跑起来了**：技能声明的环境变量在界面填一次即可（脚本里 `os.getenv` "
-        "直接读到）；`/var/minis/data/skills/xxx` 这种路径在 shell 里会被还原成真实目录。\n"
+        "- **路径形态统一**：发给模型与聊天对象的内容里不再出现 `C:\\Users\\<用户名>\\…`，"
+        "统一成 `/var/minis/workspace/…`；模型把沙箱路径回填给工具也能正确解析回工作区。\n"
         "- **识图更稳**：识图槽接上兜底链（原来只有单点，一撞限流整条识图能力就瞎）；"
         "同一张图换着说法反复问不再重复调用模型（实测这一步能耗掉近 5 分钟）。\n"
-        "- **少等一会儿**：轮次开始预热沙箱 shell（首条命令的 bash 启动开销挪到后台），"
-        "环境变量没变就不再重发一次 `export`。\n"
         "- **通道更可靠**：被动回复窗口过期（群聊 5 分钟 / 单聊 60 分钟）自动改走主动消息，"
         "不再出现「干活了但什么都没发回来」；跑一轮期间持续显示「正在输入」；"
         "机器人驱动的那条会话在网页端也能实时看到工具卡与流式文字。\n"
@@ -160,30 +107,15 @@ def main() -> None:
     version = tag.lstrip("v")
     body = _body(version, os.path.basename(zip_path))
 
-    print(f"创建/更新 release {tag} @ {commitish} ...")
-    rel = _find_release(tag)
-    existed = rel is not None
-    if rel is None:
-        rel = api("POST", f"/repos/{REPO}/releases", {
-            "tag_name": tag,
-            "target_commitish": commitish,
-            "name": tag,
-            "body": body,
-            "draft": False,
-            "prerelease": False,
-        })
-    else:
-        # 已存在（比如上一次发到一半/需要补新修复）→ 更新说明、把 tag 挪到新提交、
-        # 清掉旧资产再传。否则 POST 会被 422 already_exists 顶回来，只能手工收拾。
-        print(f"release {tag} 已存在（id={rel['id']}）→ 更新说明并替换资产")
-        # ``target_commitish`` 一并更新：GitHub 只在**创建**时认真对待它，之后
-        # 不动就会留下「tag 指着新提交、release 却写着老提交」的不一致。
-        api("PATCH", f"/repos/{REPO}/releases/{rel['id']}",
-            {"body": body, "name": tag, "target_commitish": commitish})
-        _move_tag(tag, commitish)
-        for asset in rel.get("assets") or []:
-            print("  删除旧资产:", asset["name"])
-            api("DELETE", f"/repos/{REPO}/releases/assets/{asset['id']}")
+    print(f"创建 release {tag} @ {commitish} ...")
+    rel = api("POST", f"/repos/{REPO}/releases", {
+        "tag_name": tag,
+        "target_commitish": commitish,
+        "name": tag,
+        "body": body,
+        "draft": False,
+        "prerelease": False,
+    })
     rid = rel["id"]
     print(f"release id={rid}")
 
@@ -203,14 +135,6 @@ def main() -> None:
     except urllib.error.HTTPError as e:
         raise SystemExit(f"上传失败 {e.code}\n{e.read().decode()[:800]}") from None
     print("资产已上传:", resp.get("browser_download_url"))
-
-    if existed:
-        # 附件换完了，但 **GitHub 的 release 列表显示的是 ``published_at``**，
-        # 而 PATCH 改不动它 —— 不重新发布的话页面上的日期还是上一版那天，用户会
-        # 以为「没更新」。转草稿再发布一次即可刷新（标签与资产都保持不动）。
-        api("PATCH", f"/repos/{REPO}/releases/{rid}", {"draft": True})
-        fresh = api("PATCH", f"/repos/{REPO}/releases/{rid}", {"draft": False})
-        print("已重新发布，发布时间:", fresh.get("published_at"))
 
 
 if __name__ == "__main__":

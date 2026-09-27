@@ -424,9 +424,10 @@ export function ChatView({
     mq.addEventListener('change', onChange)
     return () => mq.removeEventListener('change', onChange)
   }, [])
-  // Agent 循环模式：react=增强版（同参重复立刻拦 + 空转自动收尾）/ kt=KT 原版。
-  // 存在 settings.agent.loopMode，聊天页顶部可直接切换（下一轮对话生效）。
-  const [loopMode, setLoopMode] = useState<'react' | 'kt'>('react')
+  // Agent 循环模式：react=增强版（同参重复立刻拦 + 空转自动收尾）/ kt=KT 原版
+  // / zcode=整个循环换成 ZCode 编程内核。存在 settings.agent.loopMode，聊天页顶部
+  // 可直接切换（下一轮对话生效）。
+  const [loopMode, setLoopMode] = useState<'react' | 'kt' | 'zcode'>('react')
 
   // ── 群聊 ────────────────────────────────────────────────────────────────
   // 主代理与被拉进群的子代理在同一个聊天框里说话：子代理的发言、它自己调的
@@ -473,7 +474,8 @@ export function ChatView({
     api
       .settingsGet()
       .then((s) => {
-        if (alive && s.agent?.loopMode === 'kt') setLoopMode('kt')
+        const m = s.agent?.loopMode
+        if (alive && (m === 'kt' || m === 'zcode')) setLoopMode(m)
       })
       .catch(() => {
         /* 读不到就用默认 react */
@@ -483,7 +485,7 @@ export function ChatView({
     }
   }, [])
 
-  const switchLoopMode = useCallback(async (mode: 'react' | 'kt') => {
+  const switchLoopMode = useCallback(async (mode: 'react' | 'kt' | 'zcode') => {
     setLoopMode(mode)
     try {
       await api.settingsPut({ agent: { loopMode: mode } })
@@ -1276,7 +1278,7 @@ export function ChatView({
 
           <div
             className="cap-picker loop-mode-picker"
-            title="Agent 循环模式：ReAct 增强版会在第一次重复调用时立刻停下；KT 原版只跑移植的四条策略（10/20/30）"
+            title="Agent 循环模式：ReAct 增强版会在第一次重复调用时立刻停下；KT 原版只跑移植的四条策略（10/20/30）；ZCode 把整个循环换成编程内核 —— 专职编程，用它自带的工具链与技能"
           >
             <button
               type="button"
@@ -1291,6 +1293,13 @@ export function ChatView({
               onClick={() => void switchLoopMode('kt')}
             >
               原版
+            </button>
+            <button
+              type="button"
+              className={`chip cap-chip cap-3d ${loopMode === 'zcode' ? 'on' : ''}`}
+              onClick={() => void switchLoopMode('zcode')}
+            >
+              ZCode
             </button>
           </div>
 

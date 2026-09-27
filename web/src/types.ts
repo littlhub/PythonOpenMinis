@@ -384,6 +384,30 @@ export interface ToolInfo {
   /** 插件工具才有：它来自哪个插件（category === 'Plugin'）。 */
   pluginId?: string
   pluginName?: string
+  /** 外部 agent 工具才有（category === 'ZCode'）：它来自哪个外部 agent。 */
+  source?: string
+  /** 外部 agent 工具才有：与主智能体某个工具「功能相交」（**不是**别名）。 */
+  intersects?: string
+  /** 主智能体工具才有：外部 agent 可以借用它。 */
+  borrowable?: boolean
+}
+
+/** 一个已接入的外部 agent（描述符驱动）。 */
+export interface ExternalAgentInfo {
+  id: string
+  name: string
+  emoji: string
+  description: string
+  transport: 'internal' | 'stdio' | 'http' | string
+  builtin: boolean
+  enabled: boolean
+  /** 它自己声明的工具 id（不一定在本应用的工具目录里）。 */
+  tools: string[]
+  skillRoots: string[]
+  borrowTools: boolean
+  borrowSkills: boolean
+  /** 描述符文件路径（排障用；预留槽位指着它去填命令）。 */
+  source: string
 }
 
 export interface SettingsInfo {
@@ -428,7 +452,7 @@ export interface AgentConfig {
   /** 看图走哪条路:false(默认)=read_image 走「识图」槽;true=委派识图子代理. */
   imageVisionSubagent?: boolean
   /** Agent 循环模式:react=增强版(同参重复立刻拦 + 空转自动收尾) / kt=KT 原版四策略. */
-  loopMode?: 'react' | 'kt'
+  loopMode?: 'react' | 'kt' | 'zcode'
   /** 每多少条用户提问后把每日记忆蒸馏进长期记忆(0=关闭). */
   memoryOrganizeEvery?: number
   /** LLM 兜底模型链:主模型限流/超时/5xx 时按顺序自动切下一个. */
@@ -710,9 +734,56 @@ export interface SkillToolInfo {
   required: string[]
 }
 
+/**
+ * 外部 agent 自己的技能（只读）。
+ *
+ * 它与 `SkillInfo` 是两回事：这些技能的正文不在主智能体技能库里，主智能体既不能
+ * 激活也不能卸载它们 —— 它们属于某个外部 agent 的技能根。列出来是为了让用户知道
+ * 「系统里还有这些技能，但归别的 agent 管」。
+ */
+export interface ExternalSkillInfo {
+  name: string
+  description: string
+  /** 它属于哪个外部 agent。 */
+  agentId: string
+  agentName: string
+  scope: string
+  source: string
+  path: string
+  /** 所属技能根 —— 也就是这个 agent 的「安装落点」目录。 */
+  rootPath?: string
+  /** 该技能所在落点的 id（`<agentId>#<序号>`），删除/继续安装时回传它。 */
+  targetId?: string
+  whenToUse?: string | null
+  /** 恒为 true：主智能体这边不能激活它（要动就去动它的技能根）。 */
+  readOnly: boolean
+  /** 与主智能体某个技能同名（两边正文可能不同，不做合并）。 */
+  shadowed: boolean
+}
+
+/**
+ * 一份技能可以装到哪儿 —— 「每个 agent 都有加技能入口」的接口面。
+ *
+ * 主智能体技能库是 `host`；外部 agent 的落点由它自己的协议描述符
+ * （`skills.roots`）声明，id 为 `<agentId>#<序号>`。路径一律由服务端解析。
+ */
+export interface SkillInstallTarget {
+  id: string
+  kind: 'host' | 'external'
+  label: string
+  path: string
+  scope: string
+  agentId: string
+  agentName: string
+}
+
 export interface SkillsList {
   skills: SkillInfo[]
   tools: SkillToolInfo[]
+  /** 外部 agent 自己的技能（主智能体不加载，但可以往同一个根里继续装）。 */
+  external?: ExternalSkillInfo[]
+  /** 可安装技能的落点清单。 */
+  targets?: SkillInstallTarget[]
   dir: string
   /** Skill names currently in the main agent's scope. */
   active: string[]
@@ -947,6 +1018,34 @@ export interface SubagentInfo {
   skills: string[]
   mcpServers: string[]
   maxRounds: number
+  /** 内置项（随应用分发）：可配置，但不可删除。 */
+  builtin?: boolean
+  /** 外部 agent（描述符驱动）：tool/skill/loop/prompt 都是它自己那一套。 */
+  external?: boolean
+  /** 外部 agent 的传输方式。 */
+  transport?: 'internal' | 'stdio' | 'http' | string
+  /** 外部 agent 可配置（改的是覆盖层），但不可删除。 */
+  configurable?: boolean
+  /** 外部 agent 自己声明的工具（只展示；`tools` 才是可勾选的并集）。 */
+  selfManagedTools?: string[]
+  /** 它自带的工具（描述符声明 + tools.roots 目录导入）—— 界面上是**锁定项**。 */
+  ownTools?: string[]
+  /** 它自带技能根里发现的技能名 —— 同样是锁定项，只增不减。 */
+  ownSkills?: string[]
+  /** 用户额外**借来**的宿主工具 / 技能（覆盖层的净增量）。 */
+  borrowedTools?: string[]
+  borrowedSkills?: string[]
+  /** 外部 agent 自己的技能根。 */
+  skillRoots?: string[]
+  /** 它自己声明/导入的工具目录（只读展示）。 */
+  toolRoots?: string[]
+  /** 外部 agent 的系统提示（来自描述符；只读展示）。 */
+  systemPrompt?: string
+  /** 描述符文件路径。 */
+  source?: string
+  /** 与主智能体互借工具 / 技能。 */
+  borrowTools?: boolean
+  borrowSkills?: boolean
 }
 
 /** A provider as seen by the subagent registry: may lack a key or engine. */
@@ -969,14 +1068,32 @@ export interface SubagentModelOption {
   display: string
 }
 
+/** 注册表里的一条技能（主智能体的 + 外部 agent 的，取并集展示）。 */
+export interface RegistrySkill {
+  name: string
+  description: string
+  /** 'external' = 来自某个外部 agent 自己的技能根。 */
+  source?: string
+  /** source === 'external' 时：它属于哪个外部 agent。 */
+  agentId?: string
+  scope?: string
+  path?: string
+  /** 同名技能已被前面那条遮蔽（两边可能是不同的正文，所以不做合并）。 */
+  shadowed?: boolean
+}
+
 /** What a subagent is allowed to be built from (live snapshot). */
 export interface SubagentRegistry {
   providers: SubagentProviderOption[]
   models: SubagentModelOption[]
   tools: ToolInfo[]
-  skills: { name: string; description: string }[]
+  skills: RegistrySkill[]
   mcpServers: string[]
   mcpNote: string
+  /** 已接入的外部 agent（含未启用的预留槽位）。 */
+  externalAgents?: ExternalAgentInfo[]
+  /** 主智能体工具里可被外部 agent 借用的那些。 */
+  borrowedTools?: ToolInfo[]
 }
 
 export interface SubagentsList {

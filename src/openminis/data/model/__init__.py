@@ -405,7 +405,16 @@ class _Cancelled(LLMError):
 
 class _Unknown(LLMError):
     def __init__(self, cause: Optional[Exception]) -> None:
-        super().__init__(f"Unknown error: {cause.message if cause else None}", cause)
+        # Kotlin 的 ``Throwable.message`` 是**可空属性**，所以原文写 ``cause.message``
+        # 没问题；Python 异常没有统一的 ``message`` —— ``httpx.RemoteProtocolError``
+        # 之类完全没有这个属性。照抄过来就是在**错误映射器内部**再抛一个
+        # AttributeError，把真正的上游故障（peer closed connection）整个埋掉：
+        # 用户看到的是 "对话出错: 'RemoteProtocolError' object has no attribute
+        # 'message'"，日志里也是这条，排查成本极高。统一走 ``str(cause)`` 兜底。
+        detail = getattr(cause, "message", None) or (
+            str(cause) if cause is not None else None
+        )
+        super().__init__(f"Unknown error: {detail}", cause)
 
 
 # Convenience aliases so ported call sites read naturally.

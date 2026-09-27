@@ -292,6 +292,12 @@ async def describe_image_with_fallback(
         # 子代理那条路走通了 —— 把封禁撤掉，否则换个问题问同一张图会被误拦。
         _DEAD_PATHS.pop(image_path or "", None)
         _cache_put(key, sub)
+        # 按路径也记一笔。否则直接识图失败→fallback 成功后，同一张图换个措辞
+        # 再问时 ``(path, 新prompt)`` 缓存 miss、``_DEAD_PATHS`` 又刚被弹掉、
+        # ``_same_image_recent`` 又从未记录 → 再次走「失败→fallback 子代理」，
+        # 每次产出一段不同的新文本，形成同图空转（子代理反复 read_image）。
+        # 记下后同图（换措辞也算）TTL 内直接复用，并提示模型停止重读。
+        _remember_ok(str(image_path or ""), sub)
         return sub
     return text
 

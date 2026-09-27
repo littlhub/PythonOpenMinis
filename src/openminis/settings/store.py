@@ -92,10 +92,6 @@ def _defaults() -> dict[str, Any]:
             # 看图走哪条路：False(默认)=read_image 走「识图」槽（与其它工具
             # 同一条路）；True=主 Agent 委派识图子代理（用子代理自己的模型看图）。
             "imageVisionSubagent": False,
-            # 生图走哪条路：False(默认)=image_gen 用「生图」槽里的模型直出；
-            # True=主 Agent 的 image_gen 调用委派给匹配到的「生图子代理」
-            # （用子代理自己绑定的模型生成；没配生图子代理则退回槽直出）。
-            "imageSubagent": False,
             "imageMaxEdge": 2000,
             # Agent 循环模式：
             #   "react"（默认）—— 增强版：KT 四策略检测器 + 本项目补充护栏
@@ -540,8 +536,7 @@ class SettingsStore:
                         except (TypeError, ValueError):
                             errors.append(f"agent.{key} 必须是整数")
                 # 布尔开关(深度思考 / 子代理助理)—— 宽松解析,非布尔按真假字符串判。
-                for bkey in ("deepThinking", "subagentEnabled",
-                             "imageVisionSubagent", "imageSubagent"):
+                for bkey in ("deepThinking", "subagentEnabled", "imageVisionSubagent"):
                     if bkey in raw:
                         bv = raw[bkey]
                         agent[bkey] = (
@@ -557,10 +552,10 @@ class SettingsStore:
                         errors.append("agent.imageContextMode 只能是 path 或 inline")
                 if "loopMode" in raw:
                     loop_mode = str(raw["loopMode"] or "").strip().lower()
-                    if loop_mode in ("react", "kt"):
+                    if loop_mode in ("react", "kt", "zcode"):
                         agent["loopMode"] = loop_mode
                     else:
-                        errors.append("agent.loopMode 只能是 react 或 kt")
+                        errors.append("agent.loopMode 只能是 react、kt 或 zcode")
                 if "memoryOrganizeEvery" in raw:
                     try:
                         n = int(raw["memoryOrganizeEvery"])

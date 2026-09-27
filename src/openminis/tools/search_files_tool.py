@@ -175,9 +175,14 @@ def os_walk(base: Path):
             filenames: list[str] = []
             for entry in current.iterdir():
                 try:
-                    if entry.is_dir(follow_symlinks=False):
+                    # ``Path.is_dir(follow_symlinks=...)`` only exists on 3.13+,
+                    # so probe the link directly — same "don't follow symlinks"
+                    # semantics as ``os.DirEntry.is_dir(follow_symlinks=False)``.
+                    if entry.is_symlink():
+                        continue
+                    if entry.is_dir():
                         dirnames.append(entry.name)
-                    elif entry.is_file(follow_symlinks=False):
+                    elif entry.is_file():
                         filenames.append(entry.name)
                 except OSError:
                     continue

@@ -1047,6 +1047,10 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
             started = pending_tool_started.pop(chunk.id, None)
             if not chunk.is_error and looks_like_image_generation(chunk.name, args):
                 images = collect_recent_images(since=started)
+                logger.info(
+                    "[toolEnd-images] name=%r looks_like=True started=%r found=%d %s",
+                    chunk.name, started, len(images), images[:2],
+                )
                 if images:
                     frame["images"] = images
                     for path in images:
@@ -1104,16 +1108,8 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
         except Exception:  # pragma: no cover
             logger.debug("sandbox dir override failed for %s", sid)
 
-    # 后台预热这个会话的 shell：首条命令要连 bash 启动一起等（实测 ~1.1s），而带
-    # 工具的回合动辄十几条命令 —— 轮次刚开始就叫起来，第一刀不白等。没入组的会话
-    # 同样受益（它的 shell 落在工作区默认目录里）。
-    try:
-        from ..tools.shell_execute_tool import get_coordinator
-
-        _spawn_bg(get_coordinator().warm(f"db-{sid}"))
-    except Exception:  # pragma: no cover - 预热失败不该影响对话
-        logger.debug("shell warm-up dispatch failed for %s", sid)
-
+    #: 本轮是否已经把助手消息落库 —— 出错收尾时据此决定要不要补一条失败记录。
+    persisted = False
     try:
         # 群聊可视化：把「子代理活动」接到同一条推流上。装在这里（而不是 sink
         # 里）是因为 agent 派生的工具任务会继承**当前任务**的 contextvars ——
@@ -1131,11 +1127,6 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
             await _safe_send(client_id, ev)
 
         emitter_token = set_emitter(_on_agent_event)
-        # 交付台账按轮归零：`send` 靠它做「同一轮同一文件只交付一次」，以及
-        # 「你交付的是较旧那张」的提醒（模型会抓错历史里的 `![生成图](…)`）。
-        from ..tools import send_tool
-
-        send_tool.begin_turn(f"db-{sid}")
         try:
             await runtime.run(
                 provider,
@@ -1144,7 +1135,6 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
                 options=options,
             )
         finally:
-            send_tool.end_turn(f"db-{sid}")
             reset_emitter(emitter_token)
             await _persist_sub_turns(sid, sub_turns)
         # persist the final assistant text (intermediate tool rounds live only
@@ -1172,6 +1162,7 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
                     ),
                     **snapshot,
                 )
+                persisted = True
         # 到达轮次(默认 30)或接近上下文预算(默认 511998 tokens)时压缩:
         # 顺带把值得长期保留的事实写进记忆日志。压缩失败不影响本轮回答,
         # 所以 maybe_compact 内部吞掉异常。
@@ -1204,9 +1195,21 @@ async def _run_chat(client_id: str, msg: dict[str, Any]) -> None:
             logger.debug("memory organise trigger failed", exc_info=True)
     except Exception as e:  # pragma: no cover - defensive
         logger.exception("chat run crashed")
+        detail = str(e).strip() or type(e).__name__
+        # 出错也要在会话里留痕。原先这里只发一帧 error 就完事 —— 那一轮**不落库**，
+        # 于是用户看到的是「转半天，然后什么都没有」，刷新后连痕迹都没了（实测
+        # 2026-09-27：上游掐流 → 映射器崩 → 整轮消失）。补一条失败记录，至少
+        # 让「这轮出错了、错在哪」可回看；已经落过库就不重复写。
+        if not persisted:
+            try:
+                await chat_store.append_turn(
+                    sid, "assistant", f"⚠️ 本轮未能完成：{detail}"
+                )
+            except Exception:  # pragma: no cover - 落库失败不该盖住原错误
+                logger.debug("persist failure turn failed", exc_info=True)
         await _safe_send(
             client_id,
-            {"type": "error", "error": f"对话出错: {e}", "sessionId": sid},
+            {"type": "error", "error": f"对话出错: {detail}", "sessionId": sid},
         )
     finally:
         # 「分配项目」是**本轮**的，收工必须清掉 —— 否则同一个上下文里跑下一轮

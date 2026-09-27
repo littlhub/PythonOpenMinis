@@ -244,6 +244,7 @@ def test_agent_tools_drops_read_image_when_no_vision():
 def test_catalog_full_set_round_trip():
     from openminis.settings.catalog import (
         TOOL_CATALOG,
+        ZCODE_TOOL_CATALOG,
         build_tool_registry,
         make_agent_tools,
     )
@@ -251,7 +252,12 @@ def test_catalog_full_set_round_trip():
     ids = {t["id"] for t in TOOL_CATALOG}
     assert "file_read" in ids
     assert "memory_write" in ids
+    # 主智能体借外部 agent 工具的那一半：ZCode 工具链并入了应用工具目录。
+    zcode_ids = {t["id"] for t in ZCODE_TOOL_CATALOG}
+    assert zcode_ids and zcode_ids <= ids
     reg = build_tool_registry(list(ids))
     assert set(reg.keys()) == ids
+    # ``AgentTools`` 只是**宿主**工具的定义源；ZCode 工具的定义来自内核工具链
+    # （``build_agent_tool_definition``），单独成源，所以这里只对宿主那一半断言。
     def_names = {d.name for d in make_agent_tools()}
-    assert def_names >= ids
+    assert def_names >= (ids - zcode_ids)

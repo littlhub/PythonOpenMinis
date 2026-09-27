@@ -302,3 +302,99 @@ def test_chat_setup_wraps_provider_only_when_chain_configured(store):
     provider, _runtime, _options, _identity, _conf = chat_service.build_chat_setup(store)
     assert isinstance(provider, FallbackChainProvider)
     assert provider.active_label  # 主模型名先顶上
+
+
+# ---------------------------------------------------------------------------
+# 上游把 SSE 流中途掐断（RemoteProtocolError）—— 两层都曾出错（2026-09-27 线上实测）
+#
+# 现场：agnes 网关在流中途关掉连接 → httpx 抛 RemoteProtocolError →
+#   (1) ``_map_error`` 只认 5 个具体异常类，它落到 ``Unknown`` —— 既不可重试也
+#       不可切换，明明配了兜底模型也永远不生效；
+#   (2) ``Unknown.__init__`` 照抄 Kotlin 的 ``cause.message``，Python 异常没这个
+#       属性 → **错误映射器自己崩**，用户只看到
+#       "对话出错: 'RemoteProtocolError' object has no attribute 'message'"。
+# ---------------------------------------------------------------------------
+def _truncation() -> Exception:
+    import httpx
+
+    return httpx.RemoteProtocolError(
+        "peer closed connection without sending complete message body "
+        "(incomplete chunked read)"
+    )
+
+
+def test_unknown_error_does_not_crash_on_bare_exception():
+    """错误映射器**绝不能自己崩** —— 否则真正的上游故障被整套埋掉。"""
+    cause = _truncation()
+    err = LLMError.Unknown(cause)  # 修前：AttributeError: no attribute 'message'
+    assert "peer closed connection" in str(err)
+    # ``LLMError`` 不自定义 ``__init__``，cause 走 ``Exception.args[1]``
+    # （不是 ``__cause__`` —— 那要 ``raise ... from ...`` 才会设）。
+    assert err.args[1] is cause
+    # 没有 cause 也不能崩
+    assert "None" in str(LLMError.Unknown(None))
+    # 有 ``message`` 属性的异常仍沿用原语义
+    class WithMessage(Exception):
+        message = "自定义消息"
+
+    assert "自定义消息" in str(LLMError.Unknown(WithMessage()))
+
+
+@pytest.mark.parametrize(
+    "module_name",
+    ["openai.openai_provider", "anthropic.anthropic_provider"],
+)
+def test_truncated_stream_maps_to_retryable_network_error(module_name):
+    """掐流必须是**可重试的网络错误**，兜底链才会接手。"""
+    import importlib
+
+    import httpx
+
+    module = importlib.import_module(f"openminis.provider.{module_name}")
+    provider_cls = next(
+        obj
+        for obj in vars(module).values()
+        if isinstance(obj, type) and hasattr(obj, "_map_error")
+        and obj.__module__ == module.__name__
+    )
+    mapped = provider_cls._map_error(_truncation())
+    assert isinstance(mapped, LLMError)
+    assert isinstance(mapped, LLMError) and mapped.is_retryable, (
+        "掐流不可重试 → 兜底链永远不会换人（修前的症状）"
+    )
+    assert "peer closed connection" in str(mapped)
+    # 原有覆盖不能丢：连接/读超时仍归网络错误
+    for exc in (httpx.ConnectError("x"), httpx.ReadTimeout("x"), httpx.ReadError("x")):
+        assert provider_cls._map_error(exc).is_retryable
+    # LLMError 原样透传、不二次包装
+    already = LLMError.RateLimited()
+    assert provider_cls._map_error(already) is already
+
+
+def test_truncated_stream_actually_switches_to_fallback():
+    """端到端：主模型掐流 → 真的切到兜底模型并拿到答案（不只是"分类对了"）。"""
+    import httpx
+
+    mapped = LLMError.NetworkError(_truncation())
+    p0 = FakeProvider("p0", error=mapped)
+    p1 = FakeProvider("p1", text="recovered")
+    seen: list[tuple[str, str, str]] = []
+    chain = _chain(p0, [("p1", p1)], on_switch=lambda a, b, r: seen.append((a, b, r)))
+
+    assert _collect(chain) == ["recovered"]
+    assert chain.active is p1
+    # NetworkError 先原地重试（_SAME_PROVIDER_RETRIES=2 次），失败后才换人
+    assert p0.calls == 3 and p1.calls == 1
+    assert seen and seen[0][2].startswith("Network error")
+
+
+def test_truncation_after_partial_content_does_not_merge_two_answers():
+    """已经吐出正文之后再掐流 —— 不能重来（会把两段回复接在一起）。"""
+    p0 = FakeProvider("p0", text="半截…", error=_truncation(), error_after_text=True)
+    p1 = FakeProvider("p1", text="不该出现")
+    chain = _chain(p0, [("p1", p1)])
+
+    with pytest.raises(Exception) as ei:
+        _collect(chain)
+    assert "peer closed connection" in str(ei.value)
+    assert p1.calls == 0

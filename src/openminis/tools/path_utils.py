@@ -20,10 +20,8 @@ mirroring the escape guard in :mod:`openminis.tools.file_read_tool`.
 
 from __future__ import annotations
 
-import os
 import re
 from pathlib import Path
-from typing import Any
 
 from ..core.context import app_context
 from ..core.logging import get_logger
@@ -39,11 +37,9 @@ __all__ = [
     "SANDBOX_DATA",
     "SANDBOX_HOME",
     "split_sandbox_prefix",
-    "split_sandbox_root",
     "to_sandbox_path",
-    "to_host_path",
     "scrub_machine_paths",
-    "unscrub_sandbox_paths",
+    "rewrite_sandbox_paths",
 ]
 
 
@@ -149,73 +145,6 @@ def to_sandbox_path(path: str | Path) -> str:
     return raw
 
 
-#: 沙箱写法 → 真实目录。**顺序从具体到宽泛**，否则 ``/var/minis/workspace``
-#: 会被更宽的前缀先吃掉。
-_SANDBOX_ROOTS: tuple[tuple[str, Any], ...] = (
-    (SANDBOX_WORKSPACE, lambda: app_context().external_files_dir),
-    (SANDBOX_DATA, lambda: app_context().data_dir),
-    (SANDBOX_HOME, lambda: Path.home()),
-)
-
-
-def split_sandbox_root(raw: str | Path) -> tuple[Path, str] | None:
-    """``/var/minis/data/a/b`` → ``(data_dir, "a/b")``；不是沙箱写法返回 ``None``。
-
-    同时给出「根部」与「余额」：调用方既要知道最终路径，也要知道**该用哪个根
-    做围栏**（工作区里的东西和工作区外的数据目录规则不一样）。
-    """
-    text = str(raw or "").strip().strip('"').strip("'")
-    if not text:
-        return None
-    norm = text.replace("\\", "/")
-    for prefix, resolve in _SANDBOX_ROOTS:
-        if norm == prefix:
-            return Path(resolve()), ""
-        if norm.startswith(prefix + "/"):
-            rest = norm[len(prefix) + 1 :]
-            return Path(resolve()), rest
-    return None
-
-
-def to_host_path(raw: str | Path) -> Path | None:
-    """沙箱写法还原成本机路径；不是沙箱写法返回 ``None``。
-
-    与 :func:`to_sandbox_path` 是一对：出站会把机器路径换成沙箱写法，模型回填
-    时必须还原得回来，否则「看得见、用不了」。
-    """
-    split = split_sandbox_root(raw)
-    if split is None:
-        return None
-    root, rest = split
-    return Path(root, *[p for p in rest.split("/") if p]) if rest else root
-
-
-def unscrub_sandbox_paths(text: str) -> str:
-    """把文本里的沙箱写法还原成本机路径（给 shell 命令用）。
-
-    Windows 上不存在 ``/var/minis``，所以模型照着出站看到的路径拼出来的命令
-    （``cd /var/minis/data/skills/xxx``）必然 "No such file or directory"。
-    替换成真实路径后，bash 与 cmd 都认。
-    """
-    if not text or "/var/minis" not in text:
-        return text
-    out = text
-    for prefix, resolve in _SANDBOX_ROOTS:
-        try:
-            target = str(resolve()).replace("\\", "/").rstrip("/")
-        except Exception:  # pragma: no cover - 上下文没起来就原样留着
-            continue
-        if not target:
-            continue
-        # 前缀后面不能紧跟路径字符，避免从半个目录名中间咬一口
-        out = re.sub(
-            re.escape(prefix) + r"(?![A-Za-z0-9_])",
-            lambda _m, t=target: t,
-            out,
-        )
-    return out
-
-
 def scrub_machine_paths(text: str) -> str:
     """把文本里的本机绝对路径前缀换成沙箱写法。
 
@@ -228,6 +157,45 @@ def scrub_machine_paths(text: str) -> str:
     for pattern, replacement in _sandbox_rules():
         out = pattern.sub(
             lambda m, r=replacement: _sandbox_join(r, m.group(1) or ""),  # type: ignore[misc]
+            out,
+        )
+    return out
+
+
+def rewrite_sandbox_paths(text: str) -> str:
+    """把文本/命令里的沙箱路径还原回真实宿主路径（出站的逆）。
+
+    出站给模型看的是 ``/var/minis/data/...`` 这种沙箱写法；模型会照着回填进
+    shell 命令。执行前必须替回真实目录（``C:/Users/loo/openminis/...``），
+    否则 bash 把 ``/var/minis`` 当成根目录，接到 bash 安装目录后面拼出
+    ``.../PortableGit/versions/1.2.0/var/minis/...`` → 「No such file」。
+
+    只替换沙箱前缀段本身，后面照原样保留；三种沙箱前缀的首段互斥
+    （``data``/``workspace``/``home``），逐个替换不会互相吃掉。
+    """
+    if not text or "/var/minis" not in text:
+        return text
+    ctx = app_context()
+    #: 顺序即优先级，**不能重排**：``/var/minis/workspace`` 与 ``/var/minis/data``
+    #: 必须先匹配，否则裸 ``/var/minis`` 会把它们的前缀先吃掉，拼出
+    #: ``<workspace>/workspace/…`` 这种四不像。
+    rules: tuple[tuple[str, Path], ...] = (
+        (SANDBOX_WORKSPACE, ctx.external_files_dir),
+        (SANDBOX_DATA, ctx.data_dir),
+        (SANDBOX_HOME, Path.home()),
+        # 裸 ``/var/minis``：主智能体的路径解析把它当**工作区根**
+        # （``PREFIXES`` 的最后一项，见 ``split_sandbox_prefix``），还原时也得
+        # 对齐 —— 否则它会原样透进 bash，被当成 MSYS 安装根下的目录。
+        ("/var/minis", ctx.external_files_dir),
+    )
+    out = text
+    for prefix, real in rules:
+        real_dir = str(real).replace("\\", "/").rstrip("/")
+        # 只把 ``/var/minis/<kind>`` 这一整段前缀换成真实目录，遇跟前的 / 或
+        # 结尾即止——绝不小口咬后面的路径正文。
+        out = re.sub(
+            re.escape(prefix) + r"(?=/|$)",
+            lambda _m, r=real_dir: r,
             out,
         )
     return out

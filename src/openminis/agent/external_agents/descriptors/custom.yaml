@@ -1,0 +1,107 @@
+# ============================================================================
+# 自定义槽位 —— 空白模板
+#
+# 想接入一个不在预留列表里的外部 agent（自研 CLI、公司内部平台、别家 harness…），
+# 照本文件填一遍就是全部工作：不用改应用代码，也不用改其它任何文件。
+#
+# 用法（二选一）：
+#   A. 复制到 ~/openminis/agents/my-agent.yaml，改 id/name/命令，再把 enabled
+#      改成 true —— 推荐，随包文件保持干净；
+#   B. 直接改本文件（只要 id 不与其它描述符重复即可）。
+#
+# 最短可用版本（把 TODO 补上就完事）：
+#
+#   version: 1
+#   id: my-agent
+#   name: 我的 agent
+#   enabled: true
+#   transport: stdio
+#   stdio:
+#     command: ["my-agent", "run"]
+#     input: {mode: argv-template, args: ["{{task}}"]}
+#
+# 字段全集、三种传输（internal / stdio / http）、模板变量、回传解析与互借开关，
+# 全在 ../PROTOCOL.md 里。照着抄比读文档快。
+# ============================================================================
+version: 1
+
+id: custom-agent
+name: 自定义槽位
+emoji: 🔌
+description: 空白模板 —— 复制到 ~/openminis/agents/ 填好命令并启用
+persona: 你是「自定义槽位」，按给定的任务专注、可靠地完成工作。
+builtin: false
+#: ⚠️ 模板默认关闭：填好 command / output 之后再改成 true。
+enabled: false
+
+# ── 三选一：internal（进程内）| stdio（CLI 子进程）| http（远端接口）──────────
+transport: stdio
+
+stdio:
+  #: TODO 改成真实命令。命令、参数、环境变量、URL 都支持 {{task}} / {{session_id}}
+  #: / {{workspace}} 这几个模板变量。
+  command: ["my-agent", "run"]
+  input:
+    #: 常用 argv-template（任务拼进命令行）。需要结构化输入时用 stdin-json ——
+    #: 它会收到 {"task":..., "sessionId":..., "workspace":..., "config":...}
+    mode: argv-template
+    args: ["{{task}}"]
+  env: {}
+  #: workspace = 会话工作区（默认）；也可写具体路径或行首 ~。
+  cwd: workspace
+  #: 超时后 kill 子进程并记为失败。
+  timeoutSeconds: 600
+
+# ── 回传解析：不做这一步，模型读到的是一坨原始日志 ──────────────────────────
+output:
+  #: text（原样）| json（整体解析）| json-lines（逐行解析，坏行跳过，取最后一条）
+  format: text
+  # textPath: $.result.message      # 取结论
+  # errorPath: $.error              # 取到非空即判失败
+
+# ── 形态二：只有 HTTP 接口时 ────────────────────────────────────────────────
+# transport: http
+# http:
+#   endpoint: "https://example.com/agent/run"
+#   method: POST
+#   headers:
+#     authorization: "Bearer <你的 token>"
+# output:
+#   format: json
+#   textPath: $.data.answer
+
+# ── 形态三：本仓库内的 Python 实现（最省事，不需要起进程）────────────────────
+# transport: internal
+# entry: "my_package.my_agent:handle"
+#   入口签名：async def handle(task, *, session_id, workspace, config, provider=None) -> str
+
+# ── 能力面 ──────────────────────────────────────────────────────────────────
+# 两种写法可以并存：
+#   roots    —— **工具目录**。把清单文件丢进去即自动导入，不用改这个 YAML
+#               （像绘世扫模型目录）。支持 <root>/<name>.json|yaml、
+#               <root>/<tool>/tool.json；内容是单条工具 / 数组 / {tools: [...]}。
+#   declared —— 显式钉死的工具。同名 id 以这里为准。
+# 注意：这里声明的是「能力面」（界面展示 + 子代理配置用）；不在本应用工具目录里
+# 的 id 不会变成可勾选项，只是说明「它自带这些工具」。
+tools:
+  roots: ["~/.my-agent/tools"]
+  declared:
+    - id: custom_exec
+      name: Exec
+      description: 执行一段任务
+      input_schema:
+        type: object
+        properties:
+          task:
+            type: string
+            description: 要完成的任务描述
+        required: [task]
+
+# ── 它自己的技能根（技能管理处「安装到」即可往这些根里装技能）───────────────
+skills:
+  roots: ["~/.my-agent/skills"]
+
+# ── 与主智能体互借：让它在自己的循环里也能用宿主的工具 / 技能 ────────────────
+borrow:
+  tools: false
+  skills: false

@@ -198,10 +198,16 @@ class SkillStore:
         return installed
 
     def install(self, source: Path | str, *, force: bool = False) -> SkillEntry:
-        """Install a skill from a directory or a ``.zip`` archive."""
+        """Install a skill from a directory or a ``.zip`` archive.
+
+        ``self.root`` 可以是任意技能根 —— 主智能体技能库、外部 agent 自己的
+        ``.zcode/skills``、用户级技能目录都走这一条。根目录不存在时按需创建：
+        外部 agent 的技能根通常是**第一次装技能时**才出现的。
+        """
         src = Path(str(source)).expanduser()
         if not src.exists():
             raise SkillError(f"路径不存在: {src}")
+        self.root.mkdir(parents=True, exist_ok=True)
         if src.is_dir():
             return self._install_dir(src, force=force)
         if src.suffix.lower() != ".zip":

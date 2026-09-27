@@ -24,25 +24,12 @@ from typing import Awaitable, Callable, Optional
 from ..core.logging import get_logger
 from ..data.model.agent_tool_definition import AgentToolDefinition, AgentToolParam
 from ..sandbox.execution_coordinator import ExecutionCoordinator
+from .path_utils import rewrite_sandbox_paths
 from .tool_execution_result import ToolExecutionResult
 
 logger = get_logger(__name__)
 
 __all__ = ["ShellExecuteTool"]
-
-#: 命令里出现这些片段就认定是「生图」（技能脚本形式）。
-_IMAGE_CMD_MARKERS = (
-    "image_generation", "image_gen", "agnes-image", "agnes_image", "imagegen",
-)
-
-#: 生图命令的最小 timeout（秒）。实测 90–150 秒，留足余量。
-_IMAGE_CMD_MIN_TIMEOUT = 300
-
-
-def _looks_like_image_gen(command: str) -> bool:
-    """这条命令是生图脚本吗（按命令文本判断，跟 repeat_guard 用同一组标记）。"""
-    low = (command or "").lower()
-    return any(marker in low for marker in _IMAGE_CMD_MARKERS)
 
 
 class ShellExecuteTool:
@@ -175,16 +162,9 @@ class ShellExecuteTool:
             return ToolExecutionResult("Error: 'command' is required", True,
                                        tool_title=tool_title)
 
-        # 把沙箱写法还原成本机路径再执行。
-        #
-        # 为什么必须做：出站给模型的内容里，机器路径被统一换成
-        # ``/var/minis/workspace|data|home/…``（见 path_utils.scrub_machine_paths），
-        # 模型照着这个形态拼命令是**必然**的 —— 而 Windows 上根本没有
-        # ``/var/minis``，于是 ``cd /var/minis/data/skills/xxx`` 一律
-        # "No such file or directory"。实测这就是技能脚本跑不起来的原因。
-        from .path_utils import unscrub_sandbox_paths
-
-        command = unscrub_sandbox_paths(command)
+        # 入站还原：模型回填的 /var/minis/{data,workspace,home}/… 是沙箱写法，
+        # 执行前替回真实宿主路径，否则 bash 会把它当 / 根目录接到安装目录后面。
+        command = rewrite_sandbox_paths(command)
 
         # 沙箱守卫：异常删除 / 敏感信息（读密钥、外传凭据）先在这里拦下。
         # 拦下后记一条事件，用户在「沙箱」页可以手动放行。
@@ -205,20 +185,6 @@ class ShellExecuteTool:
             timeout = int(args.get("timeout", 900))
         except (TypeError, ValueError):
             timeout = 900
-        # 生图命令（技能脚本）实测要 90–150 秒，有时候接近 3 分钟。模型经常随手
-        # 给 timeout=120 —— 那是**必然**被杀：工具在 120 秒整中止，模型只能重跑
-        # 一遍，白扔两分钟（现场就是这样把 QQ 群聊的 5 分钟被动窗口耗光的）。
-        # 这是确定性的失败配置，直接抬到安全值并说明，而不是让模型自己去悟。
-        timeout_note = ""
-        if timeout < _IMAGE_CMD_MIN_TIMEOUT and _looks_like_image_gen(command):
-            timeout_note = (
-                f"[已自动把 timeout 从 {timeout}s 抬到 "
-                f"{_IMAGE_CMD_MIN_TIMEOUT}s：生图实测 90–150 秒，"
-                f"{timeout}s 必然被杀、只能重跑。]\n"
-            )
-            logger.info("raised shell timeout for image gen: %ss -> %ss",
-                        timeout, _IMAGE_CMD_MIN_TIMEOUT)
-            timeout = _IMAGE_CMD_MIN_TIMEOUT
         try:
             delay = int(args.get("delay", 0))
         except (TypeError, ValueError):
@@ -235,9 +201,7 @@ class ShellExecuteTool:
             env_vars=env,
         )
 
-        output = (timeout_note + (result.output or "(no output)")) if timeout_note else (
-            result.output or "(no output)"
-        )
+        output = result.output or "(no output)"
         if result.exit_code == -1 and "[Write error" not in output:
             # 持久 shell 没跑成（app 的事件循环拓扑下偶发秒死，exit=-1）。
             # 兜底：用一次性 ``bash -c`` 在工作线程里同步执行 —— 不依赖

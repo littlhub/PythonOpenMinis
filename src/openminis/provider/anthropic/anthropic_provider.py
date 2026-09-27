@@ -787,7 +787,10 @@ class AnthropicProvider(LLMProvider):
     def _map_error(error: Exception) -> LLMError:
         if isinstance(error, LLMError):
             return error
-        if isinstance(error, (httpx.ConnectError, httpx.ReadError, httpx.WriteError,
-                              httpx.ConnectTimeout, httpx.ReadTimeout)):
+        # 与 openai 侧同语义：连接级故障一律算网络错误（可重试 → 兜底链能接手）。
+        # ``httpx.TransportError`` 覆盖 ConnectError/ReadError/WriteError、各类
+        # Timeout、PoolTimeout，以及 ``ProtocolError`` —— 含流被中途掐断时的
+        # ``RemoteProtocolError``（旧写法漏了它，会落到不可重试的 ``Unknown``）。
+        if isinstance(error, httpx.TransportError):
             return LLMError.NetworkError(error)
         return LLMError.Unknown(error)

@@ -32,6 +32,20 @@ from .repeat_guard import RepeatGuard
 from .tool_loop_detector import LoopCheckResult, LoopLevel, ToolLoopDetector
 
 
+def _session_workspace_dir(session_id: str) -> str:
+    """会话工作区（``zcode`` 循环模式的根目录，与 ``file_*`` 工具同一套映射）。"""
+    import os
+
+    try:
+        from ..core.context import app_context
+
+        root = app_context().external_files_dir / str(session_id)
+        root.mkdir(parents=True, exist_ok=True)
+        return str(root)
+    except Exception:  # pragma: no cover - 无 AppContext（CLI / 测试）时退回 cwd
+        return os.getcwd()
+
+
 def _guard_outbound(messages: list[LLMMessage], session_id: str) -> None:
     """出站敏感信息拦截：发给 LLM 前把明文凭据换成占位符/部分显示。
 
@@ -88,15 +102,6 @@ def _round_dedup_key(params: dict[str, Any]) -> str:
         return json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)
     except (TypeError, ValueError):  # pragma: no cover - unusual arg shapes
         return repr(sorted(payload.items(), key=lambda kv: kv[0]))
-
-
-#: 同一**回合**内只放行一次的只读工具（同参、且上次成功）。
-#:
-#: 现场：一轮 6 分 23 秒的会话里，「加载同一个技能」被调了 5 次、「读同一张图」
-#: 2 次 —— 每次都要多一轮 LLM 往返（十几秒），纯浪费。同轮去重（``seen_in_round``）
-#: 看不见跨轮的重复，失败的调用则必须允许重试，所以这里只认**无副作用**且
-#: **上次成功**的那两个：写文件、发消息、跑命令、生图一律不碰。
-_TURN_DEDUP_TOOLS = frozenset({"skill_use", "read_image"})
 
 
 def _skill_mistake_hint(name: str) -> str | None:
@@ -166,7 +171,10 @@ class AgentRuntimeOptions:
     #: ``"react"``（默认）—— 增强版：额外启用补充护栏（同参重复立刻拦、检索
     #:   家族空转、effect 一张就停）+ 空转自动收尾 + 连续全拦截硬停；
     #: ``"kt"``  —— 原版：只跑 KT ToolLoopDetector 的四条策略（10/20/30），
-    #:   不做额外拦截与自动收尾，循环由模型自己停或 max_turns 用尽结束。
+    #:   不做额外拦截与自动收尾，循环由模型自己停或 max_turns 用尽结束；
+    #: ``"zcode"`` —— **整个循环换成 ZCode 编程内核**（专职编程）：它自带
+    #:   loop / 工具链 / 系统提示 / 技能根，主智能体这轮的 registry、护栏与
+    #:   技能库都不参与。见 :meth:`AgentRuntime._run_zcode_mode`。
     loop_mode: str = "react"
     #: [T-tool-cards-persist-and-fold] 工具输出进上下文的上限。
     #: ``tool_keep_recent`` —— 最近 N 条工具输出保持完整，更早的折成一行
@@ -231,6 +239,93 @@ class AgentRuntime:
         if self.chunk_sink is not None:
             await self.chunk_sink(chunk)
 
+    # ── zcode 循环模式 ─────────────────────────────────────────────────────
+    async def _run_zcode_mode(
+        self,
+        provider: Any,
+        messages: list[LLMMessage],
+        session_id: str,
+        opts: AgentRuntimeOptions,
+    ) -> tuple[list[LLMMessage], Optional[str]]:
+        """把整轮交给 ZCode 编程内核（``loopMode = "zcode"``）。
+
+        这与 ``react`` / ``kt`` 的区别不是「换一套工具」，而是**整个循环换掉**：
+        ZCode 自带 loop、工具链、系统提示与技能根，主智能体的 registry、循环
+        护栏、技能库都不参与本轮。所以它是一个**专职编程**的会话模式 —— 选了
+        它就按编程 agent 的方式干活，而不是主智能体换个工具清单。
+
+        文本与工具结果仍走同一个 ``chunk_sink`` 出去，界面上的流式气泡和工具卡
+        与 ReAct 模式没有区别；本轮结果的正文会作为一条 assistant 消息追加进
+        ``messages``，这样后续轮次（以及切回 ReAct 时）看得到它说过什么。
+
+        已知边界（不是 bug，是「换了个 agent」的必然结果）：
+
+        * 只取最后一条 user 消息的**文本**作为任务 —— 历史轮次与图片附件不进
+          ZCode 的上下文（它自带会话与提示词装配，不吃主智能体的消息数组）。
+        * ``session_user_env``（会话级环境变量）不参与：ZCode 的 Bash 走自己的
+          ``ExecutionPort``，环境来自工具请求里的 overlay。
+        * 主智能体的循环护栏（``loop_detector`` / ``repeat_guard``）与工具输出
+          折叠都不生效 —— 那两条都是 ReAct 循环的机制。
+        """
+        from .zcode.integration.agent import ZcodeRunOptions, run_zcode_agent
+
+        # ReAct 那边是「每次请求前」过一遍出站脱敏；这里换成整轮交给 ZCode，
+        # 那个时机不存在了，所以显式补一次 —— 凭据不能因为换了循环就漏出去。
+        _guard_outbound(messages, session_id)
+
+        task = ""
+        for message in reversed(messages):
+            if getattr(message, "role", None) == LLMMessage.Role.USER:
+                task = str(getattr(message, "content", "") or "")
+                break
+        if not task.strip():
+            return messages, "no_input"
+
+        workdir = _session_workspace_dir(session_id)
+        options = ZcodeRunOptions(
+            working_directory=workdir,
+            workspace_root=workdir,
+            # 轮次预算沿用主智能体的「工具步骤上限」，量级一致（都在十几轮）。
+            max_turns=max(1, int(opts.max_turns or 12)),
+            chunk_sink=self.chunk_sink,
+            # 借来的宿主工具按**宿主会话**解析工作区，不是 ZCode 的内部会话 id。
+            host_session_id=session_id,
+            # 专职编程：只用它自己的工具链与技能根，不向主智能体借 ——
+            # 借了就不再是「ZCode 模式」，而是普通的 ReAct 换了个循环。
+            borrow_host_tools=False,
+            borrow_host_skills=False,
+        )
+        result = await run_zcode_agent(
+            provider, task, session_id=f"{session_id}:zcode", options=options
+        )
+        local_only = False
+        if result.error:
+            text = f"(ZCode 运行失败：{result.error})"
+            local_only = True
+        elif (result.text or "").strip():
+            text = result.text
+        else:
+            text = f"(ZCode 未产出文字，stop_reason={result.stop_reason})"
+            local_only = True
+        if local_only:
+            # 这条文案是**本地拼的**，从没经过 chunk_sink —— 模型产的文字走的是流式
+            # delta 帧，而它没有。不推这一下，用户在界面上看到的就是「助手」标签
+            # 下面一片空白。落库那条路见下方 content_parts。
+            await self._emit(LLMStreamChunk.Text(text=text))
+        # 正文必须放进 ``content_parts``（``content`` 留空）—— 这不是风格问题。
+        # 服务端落库读的是 ``messages[-1].content_parts`` 里的 ``Text``
+        # （见 ``server/main.py`` 的 ``final_text``）：正文塞进 ``content`` 会让它
+        # 恒为空串，加上 zcode 模式下 ``runs`` 也拿不到 ReAct 的工具记录，于是
+        # ``if final_text.strip() or runs`` 为假 —— **整轮不写库**，前端刷新/切会话/
+        # 重启后端之后 ZCode 的总结就没了（用户报的现象）。重建上下文
+        # （``load_runtime_history``）同样只读 text part，所以多轮对话里它也会
+        # 「忘记」自己上一轮说了什么。
+        # 与 ReAct 分支（``content_parts=[Text(text_joined)]``）保持同一形态。
+        messages.append(
+            LLMMessage(LLMMessage.Role.ASSISTANT, "", content_parts=[Text(text)])
+        )
+        return messages, result.stop_reason or "end_turn"
+
     async def _execute_tool(
         self,
         tu: ToolUse,
@@ -289,9 +384,13 @@ class AgentRuntime:
         tool round, so the caller can persist it and continue later.
         """
         opts = options or AgentRuntimeOptions()
+        mode = (opts.loop_mode or "react").strip().lower()
+        if mode == "zcode":
+            # 整个循环换掉 —— 交给 ZCode 编程内核，本轮不跑 ReAct。
+            return await self._run_zcode_mode(provider, messages, session_id, opts)
         # 循环模式：'kt' = 只用 KT 原版四策略检测器；'react'（默认）额外启用
         # 本项目补充护栏与空转自动收尾。
-        react_mode = (opts.loop_mode or "react").strip().lower() != "kt"
+        react_mode = mode != "kt"
         detector = opts.loop_detector or ToolLoopDetector()
         # kt 模式只跳过**启发式拦截**（同参重复 / 家族兜底），产物级规则照样生效：
         # 生图「一张就停」与空转收尾都是产品行为，不是循环启发式。用户反馈开着
@@ -300,8 +399,6 @@ class AgentRuntime:
         if repeat_guard is not None:
             # 按轮计数的护栏在这里归零（「一张就停」），检测器的跨轮历史不动。
             repeat_guard.begin_turn()
-        #: 本回合内「已经成功跑过、且无副作用」的工具指纹（见 _TURN_DEDUP_TOOLS）。
-        turn_dedup: set[tuple] = set()
         tool_defs = self.tool_definitions()
 
         final_text: list[str] = []
@@ -479,14 +576,6 @@ class AgentRuntime:
                         "拿到重复结果，请直接引用已有结果继续或总结收尾。",
                     )
                 seen_in_round.add(dedup_key)
-                # 跨轮的同参重复：同轮集合每轮清空，看不见「上一轮刚成功调过」。
-                if not gate.is_blocking and dedup_key in turn_dedup:
-                    gate = LoopCheckResult(
-                        LoopLevel.CRITICAL,
-                        f"[LOOP BLOCKED] 本回合已经成功执行过 {tu.name}"
-                        "（参数完全相同），结果就在上面的上下文里 —— "
-                        "直接引用它继续，不要重复调用。",
-                    )
                 if gate.is_blocking:
                     blocked_any = True
                     if (gate.warning_key or "") == "imagebudget":
@@ -554,8 +643,6 @@ class AgentRuntime:
                                       error_message=None if result.success
                                       else result.output,
                                       tool_call_id=tu.id)
-                if result.success and tu.name in _TURN_DEDUP_TOOLS:
-                    turn_dedup.add((tu.name, _round_dedup_key(tu.input)))
                 extra_rec = (
                     repeat_guard.record(tu.name, tu.input, result.output,
                                         error_message=None if result.success
@@ -696,12 +783,7 @@ class AgentRuntime:
                                 else:
                                     finish_results.append(ToolResult(
                                         id=tu.id, name=tu.name,
-                                        content=(
-                                            "[loop protection] 本轮已经结束，"
-                                            "不要再调用任何工具。本轮产出的图片/文件"
-                                            "会由系统自动交付给用户，你只需要直接输出"
-                                            "最终答复（把已经拿到的结论说清楚）。"
-                                        ),
+                                        content="[loop protection] 收尾阶段只允许 send。",
                                         is_error=True,
                                     ))
                                 await self._emit(LLMStreamChunk.ToolResult(

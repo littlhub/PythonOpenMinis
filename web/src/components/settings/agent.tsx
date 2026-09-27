@@ -1726,11 +1726,20 @@ export function AgentConfigPage(props: { onBack: () => void }) {
                 >
                   KT 原版
                 </button>
+                <button
+                  type="button"
+                  className={`chip cap-chip cap-3d ${cfg.loopMode === 'zcode' ? 'on' : ''}`}
+                  onClick={() => setCfg({ ...cfg, loopMode: 'zcode' })}
+                >
+                  ZCode 编程
+                </button>
               </div>
               <div className="muted" style={{ fontSize: 12 }}>
-                {(cfg.loopMode ?? 'react') === 'react'
-                  ? 'ReAct 增强版：同一个工具用完全相同的参数再调一次立刻拦下（第一次重复就停）；检索/生图类空转另有家族护栏，连续空转会自动收尾总结。'
-                  : 'KT 原版：只跑移植过来的 ToolLoopDetector 四条策略（阈值 10/20/30），不做额外拦截与自动收尾。'}
+                {(cfg.loopMode ?? 'react') === 'zcode'
+                  ? 'ZCode 编程：整个循环换成移植过来的 ZCode 内核 —— 它自带 loop、工具链、系统提示与技能根，主智能体这一轮的工具、技能与循环护栏都不参与。适合把这一轮当纯编程任务处理（读写代码、跑命令、查仓库）。'
+                  : (cfg.loopMode ?? 'react') === 'kt'
+                    ? 'KT 原版：只跑移植过来的 ToolLoopDetector 四条策略（阈值 10/20/30），不做额外拦截与自动收尾。'
+                    : 'ReAct 增强版：同一个工具用完全相同的参数再调一次立刻拦下（第一次重复就停）；检索/生图类空转另有家族护栏，连续空转会自动收尾总结。'}
               </div>
             </div>
           </SectionCard>

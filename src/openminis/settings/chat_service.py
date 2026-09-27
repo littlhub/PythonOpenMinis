@@ -203,13 +203,6 @@ IMAGE_GEN_DISCIPLINE = (
     "生成成功后必须把产物交给用户：优先用 send 工具，或在回复里单独成行写 "
     "`![简短说明](图片的绝对路径)`。只写「已生成」而不给可渲染的路径，"
     "用户在界面上是看不到图的。"
-    "\n【生图选哪个】默认用内置 image_gen 工具（走「生图」模型槽）。"
-    "若设置了「生图走子代理」（agent.imageSubagent=开），image_gen 会自动"
-    "委派给匹配到的生图子代理生成 —— 你照常调 image_gen 即可，**不要**再手动"
-    "用 subagent_delegate 去派生图。"
-    "只有用户明确提到魔搭 / modelscope（例如说「魔搭生图」）时，"
-    "才改用 modelscope-image 技能：先用 skill_use 加载它的 SKILL.md，"
-    "再按其说明用 shell_execute 执行。"
 )
 
 #: 并发工具纪律：一轮对话里的多个工具调用会**并发执行**，所以互不依赖的
@@ -579,9 +572,13 @@ def build_chat_setup(  # noqa: ANN201
     tools = build_tool_registry(enabled_ids)
     runtime = AgentRuntime(tools=tools, chunk_sink=chunk_sink)
     image_mode = str(agent_cfg.get("imageContextMode") or "path")
-    # 循环模式：'react'（默认，增强护栏）| 'kt'（KT 原版四策略）。
+    # 循环模式：
+    #   'react'（默认）—— 本项目的增强 ReAct：额外护栏 + 空转自动收尾；
+    #   'kt'          —— KT 原版四策略检测器；
+    #   'zcode'       —— 整个循环换成 ZCode 编程内核（专职编程：自带工具链、
+    #                    系统提示与技能根，主智能体这轮的工具/技能不参与）。
     loop_mode = str(agent_cfg.get("loopMode") or "react").strip().lower()
-    if loop_mode not in ("react", "kt"):
+    if loop_mode not in ("react", "kt", "zcode"):
         loop_mode = "react"
     # 会话级循环防护：检测器的滑动窗口要跨轮累积（KT 是每会话一个实例）。
     loop_detector, repeat_guard = (

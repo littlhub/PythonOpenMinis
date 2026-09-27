@@ -1,0 +1,79 @@
+# ============================================================================
+# 内置描述符：ZCode 编程内核
+#
+# ZCode 随应用分发（进程内实现），所以 builtin: true（不可删除、可改配置）。
+# 它自带 tool / skill / loop / prompt，因此这里只声明「怎么调」和「能力面」。
+# ============================================================================
+version: 1
+
+id: zcode
+name: ZCode 编程助手
+emoji: 💻
+description: ZCode 编程 agent 内核 —— 代码编写、调试、解释与重构支持
+persona: 你是 ZCode 编程助手，专注于代码编写、调试、解释和重构。
+builtin: true
+enabled: true
+
+# 进程内实现：entry 指向移植内核的独立运行入口。
+transport: internal
+entry: "openminis.agent.zcode.integration:run_zcode_external_agent"
+
+# 工具面 = 目录导入 + 显式声明，两种可以并存。
+#
+#   roots    —— 工具**目录**。把清单文件丢进去即自动导入（像绘世扫模型目录）：
+#               支持 <root>/<name>.json|yaml、<root>/<tool>/tool.json，
+#               文件内容可以是单个工具 / 工具数组 / {tools: [...]} 索引。
+#   declared —— 显式钉死的工具。同名 id 以这里为准；内核无法加载时界面也还有
+#               一份可展示的清单。
+tools:
+  roots:
+    - "<workspace>/.zcode/tools"
+    - "~/.zcode/tools"
+  declared:
+    - id: zcode_read
+      name: ZCode · Read
+      description: Reads a file from the local filesystem.
+    - id: zcode_write
+      name: ZCode · Write
+      description: Writes a file to the local filesystem, overwriting if one exists.
+    - id: zcode_edit
+      name: ZCode · Edit
+      description: Performs exact string replacement in a file.
+    - id: zcode_bash
+      name: ZCode · Bash
+      description: Runs a shell command in the session workspace.
+    - id: zcode_glob
+      name: ZCode · Glob
+      description: Finds files by glob pattern.
+    - id: zcode_grep
+      name: ZCode · Grep
+      description: Searches file contents with a regular expression.
+    - id: zcode_web_fetch
+      name: ZCode · WebFetch
+      description: Fetches a URL and returns readable content.
+    - id: zcode_todo_read
+      name: ZCode · TodoRead
+      description: Reads the current session todo list.
+    - id: zcode_todo_write
+      name: ZCode · TodoWrite
+      description: Creates and updates the session todo list.
+    - id: zcode_skill
+      name: ZCode · Skill
+      description: Loads one of ZCode's own skills into context.
+
+# ZCode 的技能来自它自己的技能根（与主智能体技能库分开）。
+# 技能管理处「安装到」即可把技能装进这些根 —— 配好目录就等于接好了入口。
+skills:
+  roots:
+    - "<workspace>/.zcode/skills"
+    - "<workspace>/.agents/skills"
+    - "~/.zcode/skills"
+    - "~/.agents/skills"
+
+# 与主智能体**互借**（默认开启）：
+#   tools:  true —— 主智能体的工具可以在 ZCode 里勾选使用（借来的工具沿用宿主原名，
+#                  执行落回宿主注册表；ZCode 自己的工具也能被主智能体勾选，反向同理）
+#   skills: true —— 主智能体的技能库也进入 ZCode 的技能发现（同名时 ZCode 自己的胜出）
+borrow:
+  tools: true
+  skills: true

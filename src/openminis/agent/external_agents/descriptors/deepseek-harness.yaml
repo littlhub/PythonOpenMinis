@@ -1,0 +1,85 @@
+# ============================================================================
+# 预留槽位：DeepSeek Harness
+#
+# 本文件是**预留位**，默认 enabled: false —— 它不会出现在子代理列表里，也不会被
+# 委派。等 DeepSeek 的 harness 可调用时，按下面 3 步填好即可上线：
+#
+#   1. 确认它的可执行文件在 PATH 上（把 stdio.command 改成真实命令）；
+#   2. 按它的回传形状改 output.textPath / output.errorPath；
+#   3. 把 enabled 改成 true。
+#
+# 不想改随包文件的话：复制到 ~/openminis/agents/deepseek-harness.yaml 再改
+# （同名 id 以用户目录为准，覆盖本文件）。
+#
+# 字段全集见 ../PROTOCOL.md 。
+# ============================================================================
+version: 1
+
+id: deepseek-harness
+name: DeepSeek Harness
+emoji: 🐋
+description: DeepSeek 官方 agent harness —— 预留槽位（请先按注释填好命令）
+persona: 你是 DeepSeek 编程代理，在自己的环境里读写代码、执行命令并给出结论。
+builtin: false
+#: ⚠️ 预留位：填好 command / output 之后再改成 true。
+enabled: false
+
+# 形态一（默认）：本机 CLI。
+#   harness 自带模型与工具循环，所以不需要应用侧模型服务 —— 它自己去读自己的配置。
+transport: stdio
+
+stdio:
+  #: TODO 改成真实的可执行文件与参数。
+  command: ["deepseek", "run", "--output-format", "json"]
+  input:
+    #: argv-template: 任务作为命令行参数追加（多数 harness 用这个）
+    #: stdin-text:    任务原文写进 stdin
+    #: stdin-json:    {"task","sessionId","workspace","config"} 写进 stdin
+    mode: argv-template
+    args: ["{{task}}"]
+  env:
+    #: harness 自己的凭据通常写在它自己的配置文件里；确实需要环境变量时在这里加
+    #: （键值都支持 {{task}} / {{session_id}} / {{workspace}} 等模板变量）。
+    DEEPSEEK_NON_INTERACTIVE: "1"
+  cwd: workspace
+  timeoutSeconds: 900
+
+output:
+  #: TODO 按它真实的回传形状改。json-lines 时取不到 textPath 会用**最后一条记录**
+  #: 当结论（CLI 一般把最终结果放最后），多数情况下这样就够了。
+  format: json-lines
+  textPath: $.msg.content
+  errorPath: $.error
+
+# 形态二（备选）：如果它只有 HTTP 接口，改成下面这样，并把 transport 换成 http。
+#
+# transport: http
+# http:
+#   endpoint: "https://api.deepseek.com/agent/run"
+#   method: POST
+#   headers:
+#     authorization: "Bearer <你的 key>"
+# output:
+#   format: json
+#   textPath: $.data.answer
+
+tools:
+  - id: deepseek_run
+    name: DeepSeek · Run
+    description: 把一段编程任务交给 DeepSeek harness 执行
+    input_schema:
+      type: object
+      properties:
+        task:
+          type: string
+          description: 要交给 DeepSeek harness 完成的任务描述
+      required: [task]
+
+# 它自己的技能根（若有）。
+skills:
+  roots: ["~/.deepseek/skills"]
+
+# 预留位默认不互借：先把「它能跑通」这件事做实，再决定要不要把宿主工具接进去。
+borrow:
+  tools: false
+  skills: false

@@ -239,18 +239,29 @@ export const api = {
       body: JSON.stringify({ values }),
     }),
 
-  skillGet: (name: string) =>
-    request<SkillDetail>(`/skills/${encodeURIComponent(name)}`),
+  skillGet: (name: string, target = 'host') =>
+    request<SkillDetail>(
+      `/skills/${encodeURIComponent(name)}?target=${encodeURIComponent(target)}`,
+    ),
 
-  skillInstall: (source: string, force = false) =>
-    request<{ ok: boolean; skill: SkillInfo }>('/skills/install', {
-      method: 'POST',
-      body: JSON.stringify({ source, force }),
-    }),
+  /**
+   * 装一份技能到指定落点。
+   *
+   * `target` 缺省是主智能体技能库；传 `<agentId>#<序号>` 则装进那个外部 agent
+   * 自己的技能根（路径由服务端从描述符解析，前端只报 id）。
+   */
+  skillInstall: (source: string, force = false, target = 'host') =>
+    request<{ ok: boolean; skill: SkillInfo; target?: string; path?: string }>(
+      '/skills/install',
+      {
+        method: 'POST',
+        body: JSON.stringify({ source, force, target }),
+      },
+    ),
 
-  skillDelete: (name: string) =>
-    request<{ ok: boolean; name: string }>(
-      `/skills/${encodeURIComponent(name)}`,
+  skillDelete: (name: string, target = 'host') =>
+    request<{ ok: boolean; name: string; target?: string }>(
+      `/skills/${encodeURIComponent(name)}?target=${encodeURIComponent(target)}`,
       { method: 'DELETE' },
     ),
 

@@ -1,0 +1,77 @@
+# ============================================================================
+# 预留槽位：豆包（Doubao）
+#
+# 本文件是**预留位**，默认 enabled: false。按下面 3 步填好即可上线：
+#
+#   1. 确认调用方式：豆包侧的 agent/harness CLI → 改下面 stdio.command；
+#      只有 HTTP 接口（火山方舟 Ark 的 OpenAI 兼容形态）→ 换成注释里的 http 段；
+#   2. 按真实回传形状改 output.textPath / output.errorPath；
+#   3. 把 enabled 改成 true。
+#
+# 也可以复制到 ~/openminis/agents/doubao.yaml 再改（同名 id 以用户目录为准）。
+# 字段全集见 ../PROTOCOL.md 。
+# ============================================================================
+version: 1
+
+id: doubao
+name: 豆包
+emoji: 🫘
+description: 豆包（Doubao）侧的执行能力 —— 预留槽位（请先按注释填好命令）
+persona: 你是豆包助手，在自己的环境里完成任务并给出结论。
+builtin: false
+#: ⚠️ 预留位：填好 command / output 之后再改成 true。
+enabled: false
+
+# 形态一（默认）：本机 CLI。
+transport: stdio
+
+stdio:
+  #: TODO 换成豆包侧真实的命令行入口。
+  command: ["doubao", "run", "--json"]
+  input:
+    #: argv-template / stdin-text / stdin-json / none
+    mode: argv-template
+    args: ["{{task}}"]
+  env: {}
+  cwd: workspace
+  timeoutSeconds: 900
+
+output:
+  #: TODO 按真实回传形状改。
+  format: json
+  textPath: $.result
+  errorPath: $.error
+
+# 形态二（备选）：只有 HTTP 接口时用这个（把上面的 transport 改成 http）。
+# 豆包在火山方舟上提供 OpenAI 兼容的 /chat/completions；若走它，回传取
+# $.choices[0].message.content。
+#
+# transport: http
+# http:
+#   endpoint: "https://ark.cn-beijing.volces.com/api/v3/chat/completions"
+#   method: POST
+#   headers:
+#     authorization: "Bearer <你的 ARK_API_KEY>"
+# output:
+#   format: json
+#   textPath: $.choices[0].message.content
+#   errorPath: $.error.message
+
+tools:
+  - id: doubao_run
+    name: 豆包 · Run
+    description: 把一段任务交给豆包侧的 agent 执行
+    input_schema:
+      type: object
+      properties:
+        task:
+          type: string
+          description: 要交给豆包完成的任务描述
+      required: [task]
+
+skills:
+  roots: ["~/.doubao/skills"]
+
+borrow:
+  tools: false
+  skills: false

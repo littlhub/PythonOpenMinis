@@ -61,7 +61,9 @@ def test_upsert_fills_defaults(store):
     assert cfg["maxRounds"] == 6
     assert cfg["mcpServers"] == []
     assert get_subagent(store, "writer")["model"] == "claude-sonnet-5"
-    assert [s["id"] for s in list_subagents(store)] == ["writer"]
+    ids = [s["id"] for s in list_subagents(store)]
+    assert "zcode" in ids       # 随应用分发的内置外部 agent 恒在
+    assert "writer" in ids      # 刚刚 upsert 的那条也在
 
 
 def test_legacy_provider_type_is_resolved_to_instance(store):
@@ -174,7 +176,8 @@ def test_rest_crud(store):
     _configure(store)
     with TestClient(app) as c:
         body = c.get("/api/subagents").json()
-        assert body["subagents"] == []
+        # 用户还没建任何 subagent，列表里只剩随应用分发的内置外部 agent
+        assert [s["id"] for s in body["subagents"]] == ["zcode"]
         assert body["registry"]["providers"]
 
         r = c.post("/api/subagents", json={
@@ -384,64 +387,3 @@ async def test_delegate_available_even_if_identity_list_is_stale(store):
     _p2, runtime2, _o2, _i2, _c2 = chat_service.build_chat_setup(store)
     assert "subagent_delegate" not in runtime2.tools
 
-
-# ---------------------------------------------------------------------------
-# 识图委派 —— 主 agent 把「看图」交给识图子代理，技能/模型都是子代理自己的。
-# ---------------------------------------------------------------------------
-def test_find_vision_subagent_requires_read_image(store):
-    """没有 read_image 的子代理看不了图，不能被当成识图子代理。"""
-    _configure(store)
-    upsert_subagent(store, {"id": "writer", "name": "写作助手",
-                            "providerType": "anthropic", "model": "m",
-                            "tools": ["file_read"], "skills": ["visioncustom"]})
-    assert find_vision_subagent(store) is None
-
-
-def test_find_vision_subagent_prefers_vision_skill(store):
-    _configure(store)
-    upsert_subagent(store, {"id": "painter", "name": "绘画助手",
-                            "providerType": "anthropic", "model": "m",
-                            "tools": ["read_image"], "skills": ["agnes-image"]})
-    upsert_subagent(store, {"id": "seer", "name": "识图助手",
-                            "providerType": "anthropic", "model": "m",
-                            "tools": ["read_image"], "skills": ["visioncustom"]})
-    # 技能名带 vision 的优先
-    assert find_vision_subagent(store) == "seer"
-
-
-def test_find_vision_subagent_falls_back_to_vision_model(store):
-    """技能名不显眼时，看它绑的模型是否自带视觉能力。"""
-    _configure(store)
-    upsert_subagent(store, {"id": "gpt", "name": "看图",
-                            "providerType": "anthropic", "model": "claude-sonnet-5",
-                            "tools": ["read_image"], "skills": []})
-    assert find_vision_subagent(store) == "gpt"
-
-
-def test_vision_subagent_scope_forces_inline_images(store):
-    """子代理内部跑 inline —— 否则识图子代理也只能拿到路径，看不到像素。"""
-    from openminis.settings.catalog import _caller_image_mode, image_caller_scope
-
-    store.apply_full({"agent": {"imageContextMode": "path"}})
-    assert _caller_image_mode(store) == "path"
-    with image_caller_scope("inline"):
-        assert _caller_image_mode(store) == "inline"
-    assert _caller_image_mode(store) == "path"
-
-
-@pytest.mark.asyncio
-async def test_delegate_available_even_if_identity_list_is_stale(store):
-    """主 agent 必须真的握有 subagent_delegate，否则「识图交给子代理」断链。
-
-    用户的 settings.json 里 enabled_tools 可能是 subagent_delegate 出现之前
-    存的，那份旧列表不能把委派能力一直关着。
-    """
-    _configure(store)
-    store.apply_full({"identities": [], "activeIdentityId": "coder",
-                      "agent": {"subagentEnabled": True}})
-    _provider, _runtime, _options, _identity, _conf = chat_service.build_chat_setup(store)
-    assert "subagent_delegate" in _runtime.tools
-
-    store.apply_full({"agent": {"subagentEnabled": False}})
-    _p2, runtime2, _o2, _i2, _c2 = chat_service.build_chat_setup(store)
-    assert "subagent_delegate" not in runtime2.tools

@@ -174,6 +174,9 @@ def test_loop_mode_defaults_to_react(tmp_path, monkeypatch):
     assert store.agent_config()["loopMode"] == "react"
     store.apply_full({"agent": {"loopMode": "kt"}})
     assert store.agent_config()["loopMode"] == "kt"
+    # zcode = 整个循环换成 ZCode 编程内核（专职编程模式）。
+    store.apply_full({"agent": {"loopMode": "zcode"}})
+    assert store.agent_config()["loopMode"] == "zcode"
 
 
 def test_loop_mode_rejects_unknown_value(tmp_path):

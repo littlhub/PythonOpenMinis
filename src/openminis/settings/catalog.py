@@ -467,6 +467,46 @@ TOOL_CATALOG: list[dict] = [
 VALID_TOOLS = {t["id"] for t in TOOL_CATALOG}
 
 
+# ---------------------------------------------------------------------------
+# ZCode 工具链 —— 外部 agent 自带的工具面，与上方应用工具**并存**
+#
+# ZCode 的 tool / skill / loop / prompt 都与主智能体不同，它带的是一整套自己的
+# 编程工具链（Read/Write/Edit/Bash/Glob/Grep/…）。这些工具在这里登记为
+# ``zcode_*`` 独立 id，而不是被应用工具收编：
+#
+# - 原 subagent 的 tools 校验是「包含型」（每个 id 必须在本目录内），ZCode 的工具
+#   名进去之前不在这里 —— 这正是「ZCode 配不了工具」的直接原因；
+# - 修法**不是**把 ZCode 工具别名成应用工具（那会让 ZCode 失去自己的语义），
+#   而是把两套工具**取并集**同时登记：相交的能力（``zcode_read`` ↔ ``file_read``）
+#   靠 ``intersects`` 标注关联，执行时各走各的实现。
+#
+# 目录构建失败（例如内核被裁剪）时该组为空，不影响应用自身工具。
+# ---------------------------------------------------------------------------
+def _zcode_catalog_entries() -> list[dict]:
+    try:
+        from ..agent.zcode.integration import zcode_tool_catalog
+
+        return zcode_tool_catalog()
+    except Exception:  # pragma: no cover - 内核不可用不该拖垮工具目录
+        logger.warning("ZCode toolchain catalog unavailable", exc_info=True)
+        return []
+
+
+ZCODE_TOOL_CATALOG: list[dict] = _zcode_catalog_entries()
+
+#: ZCode 工具 id 集合（供 ``build_tool_registry`` 与界面共用）。
+ZCODE_TOOL_IDS: set[str] = {t["id"] for t in ZCODE_TOOL_CATALOG}
+
+if ZCODE_TOOL_CATALOG:
+    TOOL_CATALOG = [*TOOL_CATALOG, *ZCODE_TOOL_CATALOG]
+    VALID_TOOLS = VALID_TOOLS | ZCODE_TOOL_IDS
+
+
+def zcode_tool_ids() -> set[str]:
+    """已登记的 ZCode 工具 id（供界面标注「外部 agent 工具」用）。"""
+    return set(ZCODE_TOOL_IDS)
+
+
 def known_tool_ids() -> set[str]:
     """内置工具 + **已启用的插件工具**。
 
@@ -526,6 +566,54 @@ def _wrap_async_static_executor(definition: AgentToolDefinition, async_callable)
         executor=executor,
     )
     return tool
+
+
+def _wrap_zcode_tool_executor(tool_id: str):  # noqa: ANN202
+    """把 ZCode 内核工具包装成应用的 ``ToolExecutor``。
+
+    ZCode 是外部 agent：这条包装的意义是让**主智能体/其它子代理也能选用** ZCode
+    的工具（并集里 ZCode 那半边），而不是把 ZCode 变成应用工具的一部分。
+    执行一定落到内核 handler，端口由 ``integration`` 按会话提供。
+
+    工具定义（名字/描述/schema）直接取内核对 ``ToolEntry`` 的投影，所以模型看到的
+    是 ZCode 自己的入参形状，不是应用侧的近似品。
+    """
+    from ..agent.zcode.integration import (
+        build_agent_tool_definition,
+        execute_zcode_tool_id,
+        zcode_tool_spec,
+    )
+
+    spec = zcode_tool_spec(tool_id)
+    if spec is None:
+        return None
+    definition = build_agent_tool_definition(spec)
+
+    async def executor(args_json: str, session_id: str, **_kw) -> ToolExecutionResult:
+        try:
+            args = json.loads(args_json) if args_json else {}
+        except json.JSONDecodeError:
+            args = {}
+        if not isinstance(args, dict):
+            args = {}
+        try:
+            text = await execute_zcode_tool_id(
+                tool_id, args, session_id=session_id or ""
+            )
+        except Exception as exc:  # noqa: BLE001 - 内核业务失败也要变成可读结果
+            return ToolExecutionResult(
+                f"[tool error] {type(exc).__name__}: {exc}", False,
+                tool_title=definition.name,
+            )
+        return ToolExecutionResult(
+            text or "(no output)", True, tool_title=definition.name
+        )
+
+    return types.SimpleNamespace(
+        name=definition.name,
+        definition=definition,
+        executor=executor,
+    )
 
 
 def _chat_model_has_native_vision(store) -> bool:  # noqa: ANN001
@@ -743,6 +831,12 @@ def build_tool_registry(enabled_ids: list[str]) -> dict[str, ToolExecutor]:
             out[tool_id] = _wrap_async_static_executor(
                 SendTool.definition(), SendTool.execute
             )
+        elif tool_id in ZCODE_TOOL_IDS:
+            # ZCode 外部 agent 的工具：执行走内核 handler，**不**路由到上方的同名
+            # 应用工具 —— 相交登记只用于界面标注，不改执行路径。
+            wrapped = _wrap_zcode_tool_executor(tool_id)
+            if wrapped is not None:
+                out[tool_id] = wrapped
     # 插件工具（声明式：调用时才起插件目录里的进程）。用户没勾选就不挂 ——
     # 装了插件、又没启用，不该往模型的 schema 里塞工具。
     try:

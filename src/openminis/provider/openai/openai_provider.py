@@ -711,8 +711,18 @@ class OpenAIProvider(LLMProvider):
     def _map_error(error: Exception) -> LLMError:
         if isinstance(error, LLMError):
             return error
-        if isinstance(error, (httpx.ConnectError, httpx.ReadError, httpx.WriteError,
-                              httpx.ConnectTimeout, httpx.ReadTimeout)):
+        # 连接级故障一律算网络错误 —— ``LLMError.is_retryable`` 只认
+        # ``NetworkError`` / ``TransientError``，兜底链才有机会「先在原地重试、
+        # 再切下一个模型」。
+        #
+        # 旧写法只列了 5 个具体类，**漏掉 ``ProtocolError``** —— 上游把 SSE 流
+        # 中途掐断时 httpx 抛的正是 ``RemoteProtocolError``（继承链
+        # ProtocolError → TransportError）。它落到 ``Unknown``，既不可重试也不可
+        # 切换 → 明明配了兜底模型也永远不会生效，用户只看到一句糊掉的报错。
+        # ``httpx.TransportError`` 是这套连接级异常的公共父类：
+        # ConnectError/ReadError/WriteError、各类 Timeout、PoolTimeout、
+        # ProtocolError(含 Local/Remote)、ProxyError、UnsupportedProtocol、CloseError。
+        if isinstance(error, httpx.TransportError):
             return LLMError.NetworkError(error)
         return LLMError.Unknown(error)
 
