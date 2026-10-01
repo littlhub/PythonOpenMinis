@@ -28,11 +28,14 @@ import asyncio
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Callable, Optional
 
 from ....core.logging import get_logger
+from ..runtime.helpers.runtime_reminders import PlanReminderState
+from .permission_gate import build_permission_capability, check_tool_gate
 from .toolchain import (
     DEFAULT_ZCODE_TOOL_IDS,
     ZcodeHostRuntime,
@@ -45,7 +48,9 @@ from .toolchain import (
 )
 
 __all__ = [
+    "ZCODE_DEFAULT_MAX_TOKENS",
     "ZCODE_DEFAULT_MAX_TURNS",
+    "ZCODE_REPEAT_FAILURE_LIMIT",
     "ZcodeRunOptions",
     "ZcodeRunResult",
     "build_zcode_system_prompt",
@@ -56,6 +61,18 @@ __all__ = [
 
 #: 与主智能体的 ``maxToolSteps`` 语义不同：ZCode 自己的循环预算（内核默认 12 轮）。
 ZCODE_DEFAULT_MAX_TURNS = 12
+#: 单轮输出预算。**必须与宿主 ``AgentRuntimeOptions.max_tokens`` 同量级** ——
+#: 写代码就是「一次吐一个大文件」，预算是这个内核最吃紧的资源。原先这里写死
+#: 8192（宿主是 16384），于是 20KB+ 的 ``zcode_write`` 会在半路被 ``finish_reason
+#: = "length"`` 截断：工具调用到不了终点，参数退化成空串，落库成 ``input: {}``，
+#: 工具再抛 ``len(None)``，模型看不懂只能原地重试直到轮次耗尽（用户报的「ZCode
+#: 卡了」就是这个循环）。16KB 文本 + JSON 转义 ≈ 12k tokens，16384 才够用。
+ZCODE_DEFAULT_MAX_TOKENS = 16_384
+#: 同一个工具以**完全相同的参数**连续失败多少轮就收手。ReAct 循环有
+#: ``ToolLoopDetector`` / ``RepeatGuard`` 两道路闸，ZCode 是整条循环换掉、没有
+#: 那套机制 —— 一个注定失败的动作（实测：参数被上游截断的 write）会把整份轮次
+#: 预算烧在同一个调用上，每轮 20~140 秒，界面就是「卡死」，会话还被这轮锁着。
+ZCODE_REPEAT_FAILURE_LIMIT = 3
 _MAX_TOOL_OUTPUT_CHARS = 60_000
 
 logger = get_logger(__name__)
@@ -70,7 +87,7 @@ class ZcodeRunOptions:
     system_prompt: Optional[str] = None
     tool_ids: Optional[list[str]] = None
     max_turns: int = ZCODE_DEFAULT_MAX_TURNS
-    max_tokens: int = 8192
+    max_tokens: int = ZCODE_DEFAULT_MAX_TOKENS
     #: 会话级 todo 存储（跨工具调用复用；同一会话多次运行应传同一个实例）。
     session_store: Any = None
     #: 过程事件回调（前端把子代理气泡画出来用）；None 表示静默运行。
@@ -409,6 +426,9 @@ async def run_zcode_agent(
         session_store=options.session_store,
         borrow_host_skills=options.borrow_host_skills,
         borrowed_skill_names=options.borrowed_skill_names,
+        # 模式与 goal 状态按**宿主**会话 id 索引（内核侧是 ``<宿主 id>:zcode``）。
+        # 不传这一句，宿主读到的永远是「没进过 plan 模式、没有 goal」。
+        host_session_id=options.host_session_id or session_id,
     )
     runtime.abort_signal = options.abort_signal
 
@@ -479,12 +499,24 @@ async def _run_turns(
     final_text = ""
     stop_reason = ""
     turns = 0
+    # 「同样的失败原地打转」断路器（ReAct 有 RepeatGuard，这里自己兜一道）。
+    last_failure_sig = ""
+    repeat_failures = 0
+
+    # plan 模式提醒：进 plan 模式后模型很容易「知道自己在规划」但忘了**只读**这条
+    # 硬约束（尤其上下文被压缩过之后）。上游每几轮补一次；本循环在一次运行内补一次
+    # 开场提醒，退出时再补一条「已退出」——见 ``runtime/helpers/runtime_reminders.py``。
+    plan_reminder = PlanReminderState()
+    _inject_plan_reminder(messages, runtime, plan_reminder)
 
     for turn in range(1, max(1, int(options.max_turns)) + 1):
         turns = turn
         text_chunks: list[str] = []
         pending: list[tuple[str, str, dict[str, Any]]] = []
         round_stop = ""
+        turn_started = time.monotonic()
+        # 参数没送到的调用（call_id → (原因, 原始长度)）。这些**不能**拿空参去执行。
+        arg_issue: dict[str, tuple[str, int]] = {}
         stream = provider.stream_message(
             messages, system_prompt, options.max_tokens, None, None, definitions
         )
@@ -503,12 +535,31 @@ async def _run_turns(
                 text_chunks.append(chunk.text)
             elif isinstance(chunk, LLMStreamChunk.ToolCallComplete):
                 pending.append((chunk.id, chunk.name, chunk.args or {}))
+                issue = getattr(chunk, "args_parse_error", None)
+                if issue:
+                    arg_issue[chunk.id] = (
+                        str(issue),
+                        int(getattr(chunk, "raw_args_len", 0) or 0),
+                    )
             elif isinstance(chunk, LLMStreamChunk.Finished):
                 round_stop = str(chunk.stop_reason or "")
 
         turn_text = "".join(text_chunks)
         if turn_text.strip():
             final_text = turn_text
+        # 打点：ZCode 循环原先**一行日志都没有**，界面上是「发完消息后一片死寂」，
+        # 无法区分「模型正在写长文件」和「真的卡死了」。实测一次 23KB HTML 的
+        # 生成要 ~160 秒，全程静默 —— 用户据此判定「ZCode 卡了」。ReAct 那边有
+        # ``agent turn=`` / ``tool_ms``，这里补齐同一组口径，便于对齐排查。
+        logger.info(
+            "zcode turn=%d llm_ms=%d tools=%d bad_args=%d text_chars=%d stop=%s",
+            turn,
+            int((time.monotonic() - turn_started) * 1000),
+            len(pending),
+            len(arg_issue),
+            len(turn_text),
+            round_stop or "-",
+        )
 
         assistant_parts: list[Any] = []
         if turn_text:
@@ -536,6 +587,7 @@ async def _run_turns(
                     runtime=runtime,
                     turn_id=turn_id,
                     chunk_sink=options.chunk_sink,
+                    arg_issue=arg_issue.get(call_id),
                 )
                 for call_id, name, args in pending
             )
@@ -557,6 +609,46 @@ async def _run_turns(
             )
         messages.append(LLMMessage(LLMMessage.Role.USER, "", content_parts=result_parts))
         stop_reason = round_stop or "tool_use"
+
+        # ── 退出 plan 模式 → 补一条「已退出」提醒 ──────────────────────────────
+        # 上游 ``needsPlanModeExitReminder`` 在 planEnabled 由真变假时置位。不补这一句，
+        # 模型可能还沉浸在「只读、只调研」的旧指令里，计划都批了却不动手改文件。
+        if any(
+            name == "ExitPlanMode" and not is_err
+            for (_cid, name, _args), (_out, is_err) in zip(pending, results)
+        ):
+            plan_reminder.note_plan_exited()
+            exit_body = plan_reminder.take_exit_reminder()
+            if exit_body:
+                messages.append(LLMMessage(LLMMessage.Role.USER, exit_body))
+
+        # ── 同样的失败原地打转就收手 ────────────────────────────────────────
+        # ZCode 的循环**没有** ReAct 那套 ``ToolLoopDetector`` / ``RepeatGuard``
+        # （见 ``_run_zcode_mode`` 的边界说明）。实测一个注定失败的 write（如参数
+        # 被上游截断）会让模型把全部轮次预算砸在这一个动作上，每轮 20~140 秒 ——
+        # 界面上就是「卡死」，而会话还被这一轮锁着（用户报的「又卡了而且没法插入
+        # 会话」）。判据取「工具名 + 参数 + 错误原文」**完全一致**：参数变了就是
+        # 另一回事，不能误伤「换个文件重试」这种正常行为。
+        failure_sig = " || ".join(
+            "{}#{}#{}".format(
+                name, json.dumps(args, sort_keys=True, ensure_ascii=False), out
+            )
+            for (_cid, name, args), (out, is_err) in zip(pending, results)
+            if is_err
+        )
+        if failure_sig and failure_sig == last_failure_sig:
+            repeat_failures += 1
+        else:
+            repeat_failures = 1 if failure_sig else 0
+        last_failure_sig = failure_sig
+        if repeat_failures >= ZCODE_REPEAT_FAILURE_LIMIT:
+            stop_reason = "repeated_tool_failure"
+            logger.warning(
+                "zcode: 同样的工具失败连续 %d 轮，提前收手：%s",
+                repeat_failures,
+                failure_sig[:300],
+            )
+            break
     else:
         stop_reason = stop_reason or "max_turns"
 
@@ -572,11 +664,18 @@ async def _run_turns(
     # 补**一次**收尾轮：把工具列表清空，逼它写字（无处可调就只能产出正文）。
     # 只补一次、不递归 —— 它要是仍然不说话，由调用方落兜底文案。
     if not final_text.strip() and collected:
+        repeated = stop_reason == "repeated_tool_failure"
         messages.append(
             LLMMessage(
                 LLMMessage.Role.USER,
-                "工具已经执行完毕。请直接用简洁的中文向用户总结：你做了什么、"
-                "结果如何、产出文件在哪里。不要再调用任何工具。",
+                (
+                    "工具反复失败，已经停止重试。请直接用简洁的中文告诉用户："
+                    "你想做什么、卡在哪一步、失败原因是什么、需要用户做什么。"
+                    "不要再调用任何工具。"
+                    if repeated
+                    else "工具已经执行完毕。请直接用简洁的中文向用户总结：你做了什么、"
+                    "结果如何、产出文件在哪里。不要再调用任何工具。"
+                ),
             )
         )
         summary_chunks: list[str] = []
@@ -602,6 +701,53 @@ async def _run_turns(
     return turns, final_text, stop_reason
 
 
+def _runtime_mode(runtime: ZcodeHostRuntime) -> str:
+    """读会话模式（``build`` / ``edit`` / ``yolo`` / ``auto``）。"""
+    port = getattr(runtime, "session_mode_port", None)
+    if port is None:
+        return "build"
+    try:
+        return str(port.get_mode() or "build")
+    except Exception:  # pragma: no cover - 端口故障按默认模式处理
+        return "build"
+
+
+def _runtime_plan_enabled(runtime: ZcodeHostRuntime) -> bool:
+    """读「plan 模式是否开着」。
+
+    端口缺席时返回 ``False``（= 不拦任何工具）。这与「拿不到模式端口」的上游行为
+    一致：没有端口就没有模式，而**没有模式时不该比有模式时更严** —— 否则一个
+    纯探测性的运行会突然连 Write 都用不了。
+    """
+    port = getattr(runtime, "session_mode_port", None)
+    if port is None:
+        return False
+    try:
+        return bool(port.is_plan_enabled())
+    except Exception:  # pragma: no cover
+        return False
+
+
+def _inject_plan_reminder(
+    messages: list[Any], runtime: ZcodeHostRuntime, state: PlanReminderState
+) -> None:
+    """按需把 plan 模式提醒追加进消息流（Mirrors ``buildRuntimeModeReminderBody``）。
+
+    上游是**附件**（带 ``metadata.source = "runtime_mode"`` 的条目）；本移植集的循环
+    没有那种带元数据的消息条目，于是按 user-role 消息追加 —— 文本逐字相同，模型
+    看到的内容一致。
+    """
+    from ....data.model import LLMMessage
+
+    try:
+        body = state.build(_runtime_plan_enabled(runtime))
+    except Exception:  # pragma: no cover - 提醒绝不能打断循环
+        logger.debug("zcode: plan reminder build failed", exc_info=True)
+        return
+    if body:
+        messages.append(LLMMessage(LLMMessage.Role.USER, body))
+
+
 async def _execute_tool_call(
     *,
     spec: Optional[ZcodeToolSpec],
@@ -611,6 +757,7 @@ async def _execute_tool_call(
     runtime: ZcodeHostRuntime,
     turn_id: Optional[str],
     chunk_sink: Optional[Callable[[Any], Any]],
+    arg_issue: Optional[tuple[str, int]] = None,
 ) -> tuple[str, bool]:
     """执行一个工具调用；异常转成 ``is_error`` 结果而不是终止整轮。
 
@@ -619,41 +766,98 @@ async def _execute_tool_call(
     """
     from ....data.model import LLMStreamChunk
 
-    if spec is None:
-        return f"[tool error] Unknown ZCode tool: {name}", True
-
-    missing = [key for key in spec.needs if runtime.port(key) is None]
-    if missing:
-        return (
-            f"[tool error] {name} 缺少宿主端口：{', '.join(missing)}",
-            True,
-        )
-
-    context = runtime.make_context(tool_call_id=call_id, turn_id=turn_id)
+    started = time.monotonic()
+    ok = False
     try:
-        handler = getattr(spec.entry, "handler", None)
-        if handler is None:
-            return f"[tool error] {name} 没有 handler（内核未注册实现）", True
-        output = await handler(dict(args or {}), context)
-        text = _clip(format_zcode_tool_output(output))
-        if chunk_sink is not None:
-            await _maybe_await(
-                chunk_sink,
-                LLMStreamChunk.ToolResult(id=call_id, name=name, content=text, is_error=False),
+        if spec is None:
+            return f"[tool error] Unknown ZCode tool: {name}", True
+
+        # 参数根本没送到（上游截断 / arguments 为空串）→ **不要**拿空参去执行。
+        # 否则工具会抛 ``len(None)`` 这种模型完全无法据以改正的错，它只会原地
+        # 重试到轮次耗尽 —— 这正是「ZCode 卡了」的完整成因。
+        if arg_issue is not None:
+            reason, raw_len = arg_issue
+            message = (
+                f"[tool error] {name} 的参数没能完整传过来（收到 {raw_len} 字符，"
+                f"原因：{reason}）。**这不是你漏写参数**，而是单次输出被上限截断了。\n"
+                "请改成多次小步写入：先用 write 写一个较短的骨架（或前 1/3），"
+                "再用 edit 追加剩余部分；每次调用控制在 4KB 以内，不要一次吐整个大文件。"
             )
-        return text, False
-    except asyncio.CancelledError:  # pragma: no cover - 上层取消
-        raise
-    except Exception as error:  # noqa: BLE001
-        message = _describe_tool_error(error)
-        if chunk_sink is not None:
-            await _maybe_await(
-                chunk_sink,
-                LLMStreamChunk.ToolResult(
-                    id=call_id, name=name, content=message, is_error=True
-                ),
+            if chunk_sink is not None:
+                await _maybe_await(
+                    chunk_sink,
+                    LLMStreamChunk.ToolResult(
+                        id=call_id, name=name, content=message, is_error=True
+                    ),
+                )
+            return message, True
+
+        missing = [key for key in spec.needs if runtime.port(key) is None]
+        if missing:
+            return (
+                f"[tool error] {name} 缺少宿主端口：{', '.join(missing)}",
+                True,
             )
-        return message, True
+
+        # ── plan 模式闸门 ────────────────────────────────────────────────────
+        # 「plan 模式是只读的」这条承诺，光靠提示词里的那句话是拦不住的：模型完全
+        # 可以一边说「我在规划」一边调 Write 把文件改了。上游由 ``ToolExecutor``
+        # 在调用 handler 之前跑 ``PermissionService``；本移植集的循环没有执行器那
+        # 一层，闸门就缺了 —— 这里用**已移植的同一个** ``PermissionService`` 补上。
+        denied = check_tool_gate(
+            tool_name=name,
+            tool_input=args,
+            capability=build_permission_capability(spec),
+            mode=_runtime_mode(runtime),
+            plan_enabled=_runtime_plan_enabled(runtime),
+        )
+        if denied is not None:
+            if chunk_sink is not None:
+                await _maybe_await(
+                    chunk_sink,
+                    LLMStreamChunk.ToolResult(
+                        id=call_id, name=name, content=denied, is_error=True
+                    ),
+                )
+            return denied, True
+
+        context = runtime.make_context(tool_call_id=call_id, turn_id=turn_id)
+        try:
+            handler = getattr(spec.entry, "handler", None)
+            if handler is None:
+                return f"[tool error] {name} 没有 handler（内核未注册实现）", True
+            output = await handler(dict(args or {}), context)
+            text = _clip(format_zcode_tool_output(output))
+            if chunk_sink is not None:
+                await _maybe_await(
+                    chunk_sink,
+                    LLMStreamChunk.ToolResult(
+                        id=call_id, name=name, content=text, is_error=False
+                    ),
+                )
+            ok = True
+            return text, False
+        except asyncio.CancelledError:  # pragma: no cover - 上层取消
+            raise
+        except Exception as error:  # noqa: BLE001
+            message = _describe_tool_error(error)
+            if chunk_sink is not None:
+                await _maybe_await(
+                    chunk_sink,
+                    LLMStreamChunk.ToolResult(
+                        id=call_id, name=name, content=message, is_error=True
+                    ),
+                )
+            return message, True
+    finally:
+        # 与 ReAct 循环的 ``tool_ms name=… ok=…`` 对齐：整轮慢时能一眼分清是
+        # 「模型慢」还是「某个工具慢」。ZCode 原先是黑箱，只有一轮结束才有结果。
+        logger.info(
+            "zcode tool=%s ok=%s ms=%d",
+            name,
+            ok,
+            int((time.monotonic() - started) * 1000),
+        )
 
 
 def _describe_tool_error(error: BaseException) -> str:

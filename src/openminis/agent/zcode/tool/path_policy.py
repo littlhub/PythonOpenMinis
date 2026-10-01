@@ -50,7 +50,11 @@ def resolve_workspace_path(options: ToolWorkspacePathOptions) -> str:
     _normalize_absolute_directory(options.workspace_root, "workspaceRoot")
     requested_path = options.input_path
 
-    if len(requested_path) == 0:
+    # ``len(None)`` 会抛 ``TypeError: object of type 'NoneType' has no len()`` ——
+    # 模型看不懂这种错，只会原地重试。路径非字符串（缺参数时调用方传 None）统一
+    # 走「路径不能为空」这条可读失败：上游 JS 是 ``undefined.length`` 直接
+    # TypeError，这里把它收成同一条语义化错误，行为等价但可诊断。
+    if not isinstance(requested_path, str) or len(requested_path) == 0:
         raise create_core_error(
             CoreErrorType.TOOL_EXECUTION_FAILED,
             "Tool path must not be empty",

@@ -267,7 +267,11 @@ class AgentRuntime:
         * 主智能体的循环护栏（``loop_detector`` / ``repeat_guard``）与工具输出
           折叠都不生效 —— 那两条都是 ReAct 循环的机制。
         """
-        from .zcode.integration.agent import ZcodeRunOptions, run_zcode_agent
+        from .zcode.integration.agent import (
+            ZCODE_DEFAULT_MAX_TURNS,
+            ZcodeRunOptions,
+            run_zcode_agent,
+        )
 
         # ReAct 那边是「每次请求前」过一遍出站脱敏；这里换成整轮交给 ZCode，
         # 那个时机不存在了，所以显式补一次 —— 凭据不能因为换了循环就漏出去。
@@ -285,8 +289,18 @@ class AgentRuntime:
         options = ZcodeRunOptions(
             working_directory=workdir,
             workspace_root=workdir,
-            # 轮次预算沿用主智能体的「工具步骤上限」，量级一致（都在十几轮）。
-            max_turns=max(1, int(opts.max_turns or 12)),
+            # 轮次预算沿用宿主的 ``maxToolSteps``（与原实现一致，见 git 历史）。
+            # 上游 ZCode 的 ``maxTurns`` 本来就是**宿主注入**的（
+            # ``runtimeConfig.maxTurns``，见 script-workflow-child-runtime.ts），
+            # 所以「由宿主决定轮次」才是与源码对齐的做法 —— 实测一个改飞机的
+            # 任务真会用到 20 轮，写死 12 会把合法工作截断。
+            max_turns=max(1, int(opts.max_turns or ZCODE_DEFAULT_MAX_TURNS)),
+            # 输出预算**必须**沿用宿主的：原先这行漏了，ZCode 就退回自己的默认值
+            # （8192，宿主是 16384）。写 20KB+ 文件时那一半预算会在中途被
+            # ``finish_reason="length"`` 截断 —— 工具调用到不了终点、参数退化成
+            # 空串，落库成 ``input: {}``，工具再抛 ``len(None)``，模型只能原地
+            # 重试到轮次耗尽（用户报的「ZCode 又卡了」）。
+            max_tokens=int(opts.max_tokens or 16_384),
             chunk_sink=self.chunk_sink,
             # 借来的宿主工具按**宿主会话**解析工作区，不是 ZCode 的内部会话 id。
             host_session_id=session_id,
@@ -298,6 +312,18 @@ class AgentRuntime:
         result = await run_zcode_agent(
             provider, task, session_id=f"{session_id}:zcode", options=options
         )
+        # 「本轮结束」不等于「活干完了」：模型若顺手写了 ``... &``（内核的 Bash 明确
+        # 拒绝 ``run_in_background``，所以这些后台作业一定是没被正式授权的），命令
+        # 立刻返回、进程却继续跑。它们不在任何 pending 里，``stop()`` 也碰不到，
+        # 于是留在机器上烧 CPU（用户报的「ZCode 工作完没清理没用的 pid」）。
+        # 一轮收口时按**宿主会话 id 前缀**匹配收掉（ZCode 侧真实 shell 键是
+        # ``<宿主 id>:zcode``，子代理还会再挂后缀）。
+        try:
+            from ..tools.shell_execute_tool import get_coordinator
+
+            await get_coordinator().reap_background_jobs(session_id)
+        except Exception:  # pragma: no cover - 收尾绝不拖垮本轮结果
+            logger.debug("zcode: reap background jobs failed", exc_info=True)
         local_only = False
         if result.error:
             text = f"(ZCode 运行失败：{result.error})"

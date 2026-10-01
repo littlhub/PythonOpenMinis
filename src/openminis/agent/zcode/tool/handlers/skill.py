@@ -26,7 +26,7 @@ When users ask you to perform tasks, check if any of the available skills match.
 When users reference a "slash command" or "/<something>", they are referring to a skill. Use this tool to invoke it.
 
 How to invoke:
-- Set `skill` to the exact name of an available skill (no leading slash). For plugin-namespaced skills use the fully qualified `plugin:skill` form.
+- Set `skill` to the exact name of an available skill (no leading slash). Pass the name exactly as it appears in the available-skills list: use the `plugin:skill` form only when the list itself shows a prefixed name, and pass a bare name bare — never add a namespace prefix of your own.
 - Set `args` to pass optional arguments.
 
 Important:

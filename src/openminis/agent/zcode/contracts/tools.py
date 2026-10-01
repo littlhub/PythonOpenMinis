@@ -329,7 +329,13 @@ nodeReplCuaAppDisplaySchema: dict[str, Any] = {
 # Workflow tool-name constants (office workflow — kept for turn_control import).
 AMEND_WORKFLOW_TOOL_NAME = "amend_workflow"
 CREATE_WORKFLOW_TOOL_NAME = "create_workflow"
-EXIT_PLAN_MODE_TOOL_NAME = "exit_plan_mode"
+# 上游 ``AMEND_WORKFLOW_TOOL_NAME`` / ``CREATE_WORKFLOW_TOOL_NAME`` 确实是 snake_case
+# （见 ``contracts/src/tools/amend-workflow.ts``），但 ``EXIT_PLAN_MODE_TOOL_NAME`` 是
+# **PascalCase 的 ``ExitPlanMode``**（``contracts/src/tools/plan-mode.ts``）——本行原先
+# 照抄了邻居的命名风格写成 ``exit_plan_mode``。后果是
+# ``with_plan_exit_denied_turn_stop`` 里 ``input.toolName != EXIT_PLAN_MODE_TOOL_NAME``
+# 恒为真：用户拒绝计划后那道「本轮就此收手」的闸门**从来没关上过**。
+EXIT_PLAN_MODE_TOOL_NAME = "ExitPlanMode"
 
 
 @dataclass(slots=True)

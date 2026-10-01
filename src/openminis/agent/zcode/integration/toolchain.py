@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Iterator, Optional
 
 from ...zcode.contracts.ids import SessionId, TraceId, create_turn_id
+from .goal import HostGoalPort
 from .host_ports import (
     AppExecutionPort,
     InMemorySessionStorePort,
@@ -34,6 +35,7 @@ from .host_ports import (
     SimpleHttpClientPort,
     read_field,
 )
+from .session_mode import HostSessionModePort
 from .skills import ZcodeSkillPort
 
 __all__ = [
@@ -68,11 +70,19 @@ _ID_SUFFIX: dict[str, str] = {
     "WebFetch": "web_fetch",
     "TodoRead": "todo_read",
     "TodoWrite": "todo_write",
+    "GoalRead": "goal_read",
+    "EnterPlanMode": "enter_plan_mode",
+    "ExitPlanMode": "exit_plan_mode",
     "Skill": "skill",
 }
 
 #: 「功能相交」登记：ZCode 工具 ↔ 主智能体已有工具。**仅用于界面标注**，
 #: 不参与执行路由（见模块 docstring 第 2 条）。
+#:
+#: 注意：``TodoWrite`` / ``TodoRead`` / ``GoalRead`` / ``*PlanMode`` **没有**宿主对应物
+#: —— 主智能体的工具面里没有代办列表、没有会话目标、也没有模式切换，它们只属于
+#: ZCode 这条外部 agent 的循环，所以这里刻意不登记（登记成 ``tool_plan`` 之类会让
+#: 界面标注出现一个并不存在的宿主工具）。
 _INTERSECTS: dict[str, str] = {
     "Read": "file_read",
     "Write": "file_write",
@@ -88,8 +98,6 @@ _INTERSECTS: dict[str, str] = {
 #: （模型会把失败当环境问题反复重试）。
 _PENDING: dict[str, str] = {
     "WebSearch": "依赖未移植的 Model 层（provider-native web search）",
-    "EnterPlanMode": "依赖未移植的 SessionModePort",
-    "ExitPlanMode": "依赖未移植的 SessionModePort",
     "AskUserQuestion": "依赖宿主的交互式提问通道",
     "TaskOutput": "依赖未移植的后台任务端口",
     "TaskStop": "依赖未移植的后台任务端口",
@@ -108,6 +116,9 @@ _TOOL_PORTS: dict[str, tuple[str, ...]] = {
     "WebFetch": ("http",),
     "TodoRead": ("store",),
     "TodoWrite": ("store",),
+    "GoalRead": ("goal",),
+    "EnterPlanMode": ("mode",),
+    "ExitPlanMode": ("mode",),
     "Skill": ("skill",),
 }
 
@@ -473,6 +484,10 @@ class ZcodeHostRuntime:
     session_store: Any = None
     skill_port: Any = None
     http_client_port: Any = None
+    #: 会话模式状态（plan/build/edit/yolo/auto）。``EnterPlanMode`` / ``ExitPlanMode`` 靠它。
+    session_mode_port: Any = None
+    #: 会话 goal 的读入口（``GoalRead`` 靠它）。不注入时 handler 退回进程级默认存储。
+    goal_port: Any = None
     read_file_state: dict[str, Any] = field(default_factory=dict)
     abort_signal: Any = None
 
@@ -483,6 +498,8 @@ class ZcodeHostRuntime:
             "store": self.session_store,
             "skill": self.skill_port,
             "http": self.http_client_port,
+            "mode": self.session_mode_port,
+            "goal": self.goal_port,
         }.get(key)
 
     def supports(self, spec: ZcodeToolSpec) -> bool:
@@ -523,6 +540,8 @@ class ZcodeHostRuntime:
             session_store=self.session_store,
             skill_port=self.skill_port,
             http_client_port=self.http_client_port,
+            session_mode_port=self.session_mode_port,
+            goal_port=self.goal_port,
             read_file_state=self.read_file_state,
             emit_event=emit_event,
             runtime_scope="main",
@@ -551,6 +570,11 @@ HOST_PORT_FACTORIES: dict[str, Callable[..., Any]] = {
         host_skill_filter=kw.get("borrowed_skill_names"),
     ),
     "http": lambda **kw: SimpleHttpClientPort(),
+    # 模式端口必须绑在**宿主会话 id** 上：内核里的会话 id 是 ``<宿主 id>:zcode``，
+    # 而宿主读同一份状态时用的是纯宿主 id —— 绑错了就会变成「模型进了 plan 模式，
+    # 宿主不知道」，读改写两条路各看各的。
+    "mode": lambda host_session_id, **kw: HostSessionModePort(str(host_session_id or "")),
+    "goal": lambda host_session_id, **kw: HostGoalPort(str(host_session_id or "")),
 }
 
 
@@ -559,11 +583,12 @@ def build_zcode_runtime(
     session_id: str,
     working_directory: str,
     workspace_root: Optional[str] = None,
-    need: tuple[str, ...] = ("fs", "exec", "store", "skill", "http"),
+    need: tuple[str, ...] = ("fs", "exec", "store", "skill", "http", "mode", "goal"),
     session_store: Any = None,
     overrides: Optional[dict[str, Any]] = None,
     borrow_host_skills: bool = True,
     borrowed_skill_names: Optional[list[str]] = None,
+    host_session_id: Optional[str] = None,
 ) -> ZcodeHostRuntime:
     """按需拼装宿主运行时。
 
@@ -571,6 +596,9 @@ def build_zcode_runtime(
     其余端口按 ``HOST_PORT_FACTORIES`` 现建。``borrow_host_skills`` 决定技能端口是否
     把宿主技能库一并纳入（「外部 agent 借主 agent 的技能」）；``borrowed_skill_names``
     进一步指定**只借哪几个**（``None`` = 整个技能库）。
+
+    ``host_session_id`` 是**宿主**会话 id（模式与 goal 状态都按它索引）。缺省时退回
+    ``session_id`` —— 直接以宿主身份跑内核（不挂 ``:zcode`` 后缀）也仍然正确。
     """
     overrides = overrides or {}
     working_directory = os.path.abspath(working_directory)
@@ -586,6 +614,7 @@ def build_zcode_runtime(
         "workspace_root": runtime.workspace_root,
         "borrow_host_skills": borrow_host_skills,
         "borrowed_skill_names": borrowed_skill_names,
+        "host_session_id": str(host_session_id or session_id),
     }
     for key in need:
         if key == "store" and session_store is not None:
@@ -606,6 +635,8 @@ _ATTR_BY_PORT: dict[str, str] = {
     "store": "session_store",
     "skill": "skill_port",
     "http": "http_client_port",
+    "mode": "session_mode_port",
+    "goal": "goal_port",
 }
 
 

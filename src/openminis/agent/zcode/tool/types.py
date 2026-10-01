@@ -262,8 +262,13 @@ class ToolExecutionContext:
     off_peak_port: Any = None
     # PORT: ``SessionStorePort`` — @zcode/contracts, not ported yet.
     session_store: Any = None
-    # PORT: ``SessionModePort`` — @zcode/contracts, not ported yet.
+    # PORT: ``SessionModePort`` — 本包定义见 ``contracts/session_mode.py``。
+    # ``EnterPlanMode`` / ``ExitPlanMode`` 通过它读写会话模式（宿主注入）。
     session_mode_port: Any = None
+    # 会话 goal 的读入口（``GoalRead`` 用）。上游没有这个字段 —— ``GoalRead`` 在
+    # 上游只有契约、没有 handler（详见 ``tool/handlers/goal_read.py`` 的文件注释）。
+    # 宿主不注入时 handler 退回进程级默认存储，见 ``goal_read._resolve_goal``。
+    goal_port: Any = None
     # PORT: ``WorkflowPort`` — @zcode/contracts, not ported yet.
     workflow_port: Any = None
     # workflow run 提交端口；缺席则 CreateWorkflow 回占位诊断而不启动。

@@ -495,22 +495,43 @@ _EXT_TAIL_RE = re.compile(r"\.[A-Za-z0-9]{1,8}(?![\w-])")
 #: 路径分隔符（含 markdown 引用里的 ``](``）。
 _PATH_LEFT_CHARS = "/\\"
 
+#: 工作区目录名前缀 —— ``workspace/db-<32 位十六进制>``，那一串就是**会话 id**。
+#:
+#: 会话 id 是本地生成的 ``uuid4().hex``，和凭据毫无关系；但它既不带扩展名、
+#: 前面也不是分隔符（是 ``db-``），旧判定一律当密钥遮掉。实测后果：
+#: ``ls workspace/`` 的工具输出、前端会话列表里每个会话都被打成
+#: ``ac48…efe0「已拦截」``，而 ``zcode_bash`` 只要命令里出现工作区路径
+#: （``ls -la .../workspace/db-ac48…/``）就被**整条拦下** —— 用户报的
+#: 「敏感信息一直拦 / ZCode 干不了活 / 看着卡住」。
+_ID_DIR_PREFIX = "db-"
+
 
 def _in_path_context(text: str, start: int, end: int) -> bool:
-    """命中片段是不是只是文件名 / 路径的一部分。
+    """命中片段是不是只是文件名 / 路径 / 本地标识符的一部分。
 
-    只看两处最可靠的特征，避免把真正的密钥放过去：
+    只看四处最可靠的特征，避免把真正的密钥放过去：
 
     1. **紧跟着扩展名**（``…A39C8122FF85B3B700719B9836EA6C4D.jpg``）；
-    2. **紧挨着路径分隔符**（``C:/cache/9f8e…/a.png``、``/tmp/deadbeef…``）。
+    2. **紧挨着路径分隔符**（``C:/cache/9f8e…/a.png``、``/tmp/deadbeef…``）；
+    3. **紧跟着路径分隔符**（``…/9f8e…/``）—— 路径中间那一段；
+    4. **``db-<十六进制>``**（``workspace/db-ac48…``）—— 会话工作区目录名。
 
-    这两条之外的十六进制串照旧判为疑似密钥 —— 收紧的口子越小越安全。
+    这些之外的十六进制串照旧判为疑似密钥 —— 收紧的口子越小越安全。
     """
     tail = text[end : end + 12]
     if _EXT_TAIL_RE.match(tail):
         return True
+    # 注意 ``startswith`` 而不是 ``tail[:1] in _PATH_LEFT_CHARS`` —— 后者在
+    # ``tail`` 为空串（命中落在文本末尾）时恒为真（``'' in "/\\"`` 是 True），
+    # 会把文末的孤立十六进制串无条件放行。
+    if tail.startswith(("/", "\\")):
+        return True
     left = text[max(0, start - 1) : start]
-    return left in _PATH_LEFT_CHARS
+    if left and left in _PATH_LEFT_CHARS:  # 同上：``left`` 为空（命中在行首）时不能算
+        return True
+    if left == "-" and text[max(0, start - 3) : start] == _ID_DIR_PREFIX:
+        return True
+    return False
 
 
 def _find_secret_hits(text: str) -> list[tuple["re.Match[str]", str, int]]:

@@ -483,7 +483,15 @@ class ZcodeSkillPort:
             (s for s in outcome.skills if s.name == name or s.qualified_name == name), None
         )
         if match is None:
-            raise FileNotFoundError(f"Skill not found: {name}")
+            # 只回一句「没找到」对模型没有校正作用：它会当成瞬时故障反复试，
+            # 或者照着名字家族继续编 —— 实测模型看到清单里的 ``web-fetch`` /
+            # ``web-summarizer`` 后，编出了并不存在的 ``web-dev``，还自造了个
+            # ``zcode:`` 前缀（因为工具说明里写了 ``plugin:skill`` 这种限定名
+            # 格式，而清单里一个带前缀的都没有）。
+            # 把**当前真实可用的技能名**一并回给模型，它下一轮就能自我纠正。
+            # 前缀 ``Skill not found: {name}`` 与上游保持一致（语义不变）。
+            available = ", ".join(sorted({s.name for s in outcome.skills})) or "(none)"
+            raise FileNotFoundError(f"Skill not found: {name} (available: {available})")
         manifest = Path(match.path)
         raw = manifest.read_text(encoding="utf-8", errors="replace")
         _meta_mapping, body = _frontmatter(raw)

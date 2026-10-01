@@ -41,6 +41,37 @@ MAX_PLAN_MODE_MODEL_BYTES = 100_000
 EXIT_PLAN_MODE_DESCRIPTION = EXIT_PLAN_MODE_MODEL_INSTRUCTIONS[0]
 
 
+def _transition_field(transition: Any, name: str) -> Any:
+    """从端口返回的转换结果里读一个字段。
+
+    端口是**宿主注入**的，契约上是 ``EnterPlanModeTransitionResult`` 这类**对象**
+    （见 ``contracts/session_mode.py``，对应上游 TS 的 ``{ mode, previousMode, … }``
+    对象字面量）。但 TS 的「对象字面量」在 Python 里既可以落成 dataclass，也可以
+    落成 ``dict`` —— 本 handler 原先只按 ``dict`` 读（``transition.get("mode")``），
+    于是任何一个按契约返回对象的端口实现都会在这里炸
+    ``AttributeError: '…Result' object has no attribute 'get'``。
+
+    两种形状都接受，字段名同时认 snake_case 与 camelCase。端口缺失（``None``）时
+    返回 ``None``，与 TS 里读一个不存在的属性同义。
+    """
+    if transition is None:
+        return None
+    if isinstance(transition, dict):
+        if name in transition:
+            return transition[name]
+        camel = _to_camel(name)
+        return transition.get(camel)
+    if hasattr(transition, name):
+        return getattr(transition, name)
+    camel = _to_camel(name)
+    return getattr(transition, camel, None)
+
+
+def _to_camel(name: str) -> str:
+    head, *rest = name.split("_")
+    return head + "".join(part[:1].upper() + part[1:] for part in rest)
+
+
 # ---------------------------------------------------------------------------
 # 已移植的 plan-file-continuity 落点（runtime/helpers/plan-file-continuity.ts）
 # ---------------------------------------------------------------------------
@@ -122,10 +153,10 @@ async def enter_plan_mode_handler(input: Any, context: Any) -> Any:
 
     return {
         "message": "Entered plan mode. You should now focus on exploring the codebase and designing an implementation approach.",
-        "mode": transition.get("mode"),
-        "previous_mode": transition.get("previous_mode"),
-        "plan_enabled": transition.get("plan_enabled"),
-        "previous_plan_enabled": transition.get("previous_plan_enabled"),
+        "mode": _transition_field(transition, "mode"),
+        "previous_mode": _transition_field(transition, "previous_mode"),
+        "plan_enabled": _transition_field(transition, "plan_enabled"),
+        "previous_plan_enabled": _transition_field(transition, "previous_plan_enabled"),
     }
 
 
@@ -175,11 +206,11 @@ async def exit_plan_mode_handler(input: Any, context: Any) -> Any:
     return {
         "allowed_prompts": parsed.get("allowed_prompts"),
         "approved": True,
-        "plan_enabled": transition.get("plan_enabled"),
-        "previous_plan_enabled": transition.get("previous_plan_enabled"),
-        "mode": transition.get("mode"),
+        "plan_enabled": _transition_field(transition, "plan_enabled"),
+        "previous_plan_enabled": _transition_field(transition, "previous_plan_enabled"),
+        "mode": _transition_field(transition, "mode"),
         "plan": parsed.get("plan", ""),
-        "previous_mode": transition.get("previous_mode"),
+        "previous_mode": _transition_field(transition, "previous_mode"),
     }
 
 

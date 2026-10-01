@@ -222,6 +222,13 @@ class _ToolCallComplete(LLMStreamChunk):
     # historical functionCall. Null for every other provider.
     args: dict
     thought_signature: Optional[str] = None
+    # 参数没能取到（JSON 不完整 / 上游把 ``arguments`` 给成空串）时记下原因。
+    # 这两种情况下 ``args`` 只能是 ``{}``，但**绝不能**让上层把它当成「模型真的
+    # 没给参数」去执行工具 —— 工具会拿到空参抛 ``len(None)`` 这类看不懂的错，
+    # 模型只能盲目重试，直到轮次耗尽（实测把 20KB+ 文件交给弱模型时必现）。
+    # 带上原始长度，上层就能回一句模型看得懂、能自我纠正的失败说明。
+    args_parse_error: Optional[str] = None
+    raw_args_len: int = 0
 
 
 LLMStreamChunk.ToolCallComplete = _ToolCallComplete  # type: ignore[attr-defined]

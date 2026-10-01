@@ -191,7 +191,9 @@ class OpenAIProvider(LLMProvider):
         custom_user_agent: Optional[str] = None,
     ) -> None:
         self.api_key = api_key
-        self.model = model or LLMModel.gpt_4o_mini  # type: ignore[attr-defined]
+        # 属性名是 ``gpt4o_mini``（不是 ``gpt_4o_mini``）：写错会让「模型字符串为
+        # 空」的配置直接在构造器里 AttributeError —— 那不是配置问题，是拼写问题。
+        self.model = model or LLMModel.gpt4o_mini  # type: ignore[attr-defined]
         # # PORT: Kotlin keeps an "apiBase" WITHOUT /v1 and appends per endpoint.
         self.base_url = base_url.rstrip("/")
         self.is_oauth = is_oauth
@@ -440,13 +442,47 @@ class OpenAIProvider(LLMProvider):
         for acc in tool_accs.values():
             if not acc.started:
                 continue
-            try:
-                args = json.loads(acc.args_str) if acc.args_str.strip() else {}
-            except ValueError:
+            raw = acc.args_str
+            parse_error: Optional[str] = None
+            if not raw.strip():
+                # 上游只给了 ``tool_calls`` 的 id/name、``arguments`` 是空串
+                # （apihub 等中转在超长参数被截断时就是这个形态）。这不是
+                # 「模型没传参数」，而是参数根本没送到 —— 必须让上层知道。
+                parse_error = "arguments 为空串（上游未返回工具参数）"
+                logger.warning(
+                    "OpenAIProvider: tool-call args 缺失 name=%s id=%s（arguments 为空串）",
+                    acc.name,
+                    acc.id,
+                )
                 args = {}
+            else:
+                try:
+                    args = json.loads(raw)
+                except ValueError as error:
+                    # **不能静默换成 {}**：旧行为在这里吞掉异常，工具拿到空参后
+                    # 抛 ``len(None)`` 之类看不懂的错，模型只会原地重试到轮次耗尽。
+                    parse_error = f"{type(error).__name__}: {error}"
+                    logger.warning(
+                        "OpenAIProvider: tool-call args 不是合法 JSON name=%s id=%s len=%d: %s | head=%r tail=%r",
+                        acc.name,
+                        acc.id,
+                        len(raw),
+                        parse_error,
+                        raw[:120],
+                        raw[-120:],
+                    )
+                    args = {}
             if not isinstance(args, dict):
                 args = {"value": args}
-            chunks.append(LLMStreamChunk.ToolCallComplete(acc.id, acc.name, args))
+            chunks.append(
+                LLMStreamChunk.ToolCallComplete(
+                    acc.id,
+                    acc.name,
+                    args,
+                    args_parse_error=parse_error,
+                    raw_args_len=len(raw),
+                )
+            )
         tool_accs.clear()
 
         if reasoning_accum:

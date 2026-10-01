@@ -30,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -571,6 +572,164 @@ def test_workspace_guard(tmp: Path) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# 进程树回收：停掉 shell 必须连它跑着的孙进程一起收
+# ---------------------------------------------------------------------------
+
+#: 死循环 + 不 sleep —— 真烧一个核，正是用户那边看到的现象
+_CPU_HOG_BODY = (
+    "import os,pathlib\n"
+    "pathlib.Path(r'{pf}').write_text(str(os.getpid()))\n"
+    "while True: pass\n"
+)
+
+
+def _pid_alive(pid: int) -> bool:
+    """用 ``tasklist`` 探活（``wmic`` 在本机被安全策略硬拦）。"""
+    if not pid:
+        return False
+    try:
+        cp = subprocess.run(  # noqa: S603 - 固定参数
+            ["tasklist", "/FI", f"PID eq {pid}", "/NH"],
+            capture_output=True, timeout=15,
+        )
+    except Exception:
+        return False
+    # 中文 Windows 的 tasklist 输出是 GBK，``text=True`` 会直接把 stdout 变成 None
+    out = (cp.stdout or b"").decode("gbk", "replace")
+    return str(pid) in out
+
+
+def _kill_tree(pid: int) -> None:
+    subprocess.run(  # noqa: S603 - 探针清理，固定参数
+        ["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True
+    )
+
+
+def test_shell_tree_reap(tmp: Path) -> None:
+    """shell 停/退役时，**子孙进程**必须一并回收。
+
+    为什么这条必须是真机断言：``Process.terminate()`` 在 Windows 上只结束 bash
+    **自己**，它跑着的 ``node``/``python``（``&`` 后台、忘了退出的 ``tail -f``、
+    死循环脚本）会被系统重新挂到一个不存在的父上继续跑 —— 用户报的「ZCode 干完活
+    还留着一堆 pid 在烧 CPU」就是这个。而且修复的**顺序**也是被测对象：
+    ``taskkill /T`` 按当前父子快照找人，先 ``terminate`` 掉 bash 就再也找不到孙子
+    （实测：fire-and-forget 版本三个场景全红）。
+    """
+    from openminis.sandbox.execution_coordinator import ExecutionCoordinator
+    from openminis.sandbox.persistent_shell import PersistentShell, detect_shell_spec
+
+    spec = detect_shell_spec()
+    print(f"\n[进程树回收] shell = {spec.name} ({spec.executable})")
+    if spec.name != "bash":
+        print("  - 跳过：本机没找到 bash")
+        return
+
+    ws = tmp / "reap-ws"
+    ws.mkdir(parents=True, exist_ok=True)
+
+    def child_cmd(pid_file: Path, *, background: bool) -> str:
+        body = _CPU_HOG_BODY.format(pf=str(pid_file).replace("\\", "/"))
+        return 'python -c "' + body + '"' + (" &" if background else "")
+
+    async def spawn(session: str, pid_file: Path, *, background: bool):
+        sh = PersistentShell(session, spec=spec, cwd=ws)
+        await sh.ensure_started()
+        if pid_file.exists():
+            pid_file.unlink()
+        # 前台那条会挂住直到超时；后台那条立刻返回（`&`）
+        await sh.execute_command(
+            child_cmd(pid_file, background=background), timeout=20 if background else 2
+        )
+        for _ in range(50):
+            if pid_file.exists():
+                break
+            await asyncio.sleep(0.1)
+        child = int(pid_file.read_text().strip()) if pid_file.exists() else 0
+        return sh, child
+
+    async def scenario() -> None:
+        # 1) 显式 stop()
+        pf = tmp / "reap-a.pid"
+        sh, child = await spawn("smoke-reap-a", pf, background=True)
+        check("stop 前孙进程在烧 CPU", _pid_alive(child), f"pid={child}")
+        await sh.stop()
+        await asyncio.sleep(1.0)
+        check("stop() 连带回收孙进程", not _pid_alive(child), f"pid={child} 仍存活")
+        if _pid_alive(child):
+            _kill_tree(child)
+
+        # 2) stop_sync()（取消传播 / atexit 路径）
+        pf = tmp / "reap-b.pid"
+        sh, child = await spawn("smoke-reap-b", pf, background=True)
+        sh.stop_sync()
+        await asyncio.sleep(1.2)
+        check("stop_sync() 连带回收孙进程", not _pid_alive(child), f"pid={child} 仍存活")
+        if _pid_alive(child):
+            _kill_tree(child)
+
+        # 3) 命令超时 → 自动退役（用户在 ZCode 里最常撞上的那条）
+        pf = tmp / "reap-c.pid"
+        sh, child = await spawn("smoke-reap-c", pf, background=False)
+        await asyncio.sleep(0.8)
+        check("超时退役后孙进程被回收", not _pid_alive(child), f"pid={child} 仍存活")
+        if _pid_alive(child):
+            _kill_tree(child)
+        await sh.stop()
+
+        # 4) coordinator.shutdown_sync()（atexit 走的就是它）
+        pf = tmp / "reap-d.pid"
+        coord = ExecutionCoordinator()
+        sh = await coord._get_or_create_shell("smoke-reap-d")  # noqa: SLF001
+        if pf.exists():
+            pf.unlink()
+        await sh.execute_command(child_cmd(pf, background=True), timeout=20)
+        for _ in range(50):
+            if pf.exists():
+                break
+            await asyncio.sleep(0.1)
+        child = int(pf.read_text().strip()) if pf.exists() else 0
+        coord.shutdown_sync()
+        await asyncio.sleep(1.2)
+        check("shutdown_sync() 连带回收孙进程", not _pid_alive(child), f"pid={child} 仍存活")
+        if _pid_alive(child):
+            _kill_tree(child)
+
+        # 5) 「一轮干完」收残留后台作业：shell 还活着，但 ``&`` 起的进程不该留着
+        pf = tmp / "reap-e.pid"
+        coord = ExecutionCoordinator()
+        sh = await coord._get_or_create_shell("smoke-sess:zcode")  # noqa: SLF001
+        # ZCode 的 shell 键带 ``:``（``<宿主 id>:zcode``），而 Windows 目录名不允许
+        # 冒号 —— 修前这里直接 ``NotADirectoryError: [WinError 267]``。
+        check("会话 id 带冒号也能建 shell（目录名已折换）",
+              ":" not in sh.cwd.name and sh.cwd.name == "smoke-sess_zcode",
+              f"cwd={sh.cwd}")
+        check("会话身份不被折换（MINIS_SESSION_ID 仍是原值）",
+              sh._env.get("MINIS_SESSION_ID") == "smoke-sess:zcode",  # noqa: SLF001
+              f"{sh._env.get('MINIS_SESSION_ID')!r}")  # noqa: SLF001
+        if pf.exists():
+            pf.unlink()
+        await sh.execute_command(child_cmd(pf, background=True), timeout=20)
+        for _ in range(50):
+            if pf.exists():
+                break
+            await asyncio.sleep(0.1)
+        child = int(pf.read_text().strip()) if pf.exists() else 0
+        check("一轮结束前后台作业还在跑", _pid_alive(child), f"pid={child}")
+        reaped = await coord.reap_background_jobs("smoke-sess")
+        await asyncio.sleep(1.0)
+        check("reap 报告了被收掉的作业", bool(reaped), f"reaped={reaped}")
+        check("后台作业已被收掉（shell 仍可用）", not _pid_alive(child), f"pid={child} 仍存活")
+        if _pid_alive(child):
+            _kill_tree(child)
+        out_r, code_r = await sh.execute_command("echo still-alive", timeout=15)
+        check("收完残留后 shell 照常工作", code_r == 0 and out_r.strip() == "still-alive",
+              f"{code_r} {out_r!r}")
+        await coord.shutdown()
+
+    _run(scenario())
+
+
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="smoke-host-ports-"))
     try:
@@ -580,6 +739,7 @@ def main() -> int:
         test_zcode_system_prompt_sections(tmp)
         test_workspace_guard(tmp)
         test_persistent_shell(tmp)
+        test_shell_tree_reap(tmp)
     finally:
         reset_app_context()
         shutil.rmtree(tmp, ignore_errors=True)

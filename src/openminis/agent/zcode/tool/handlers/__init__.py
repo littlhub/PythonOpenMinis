@@ -44,6 +44,7 @@ from .ask_user_question import ask_user_question_tool_entry
 from .bash import BashToolEntryOptions, bash_tool_entry, create_bash_tool_entry
 from .edit import edit_tool_entry
 from .glob import glob_tool_entry
+from .goal_read import goal_read_tool_entry
 from .grep import grep_tool_entry
 from .plan_mode import (
     create_enter_plan_mode_tool_entry,
@@ -89,6 +90,9 @@ built_in_tools: list[ToolEntry] = [
     web_search_tool_entry,
     todo_read_tool_entry,
     todo_write_tool_entry,
+    # ``GoalRead`` 在上游只有契约与 tool-identity 登记（无 handler），本包按契约补全。
+    # 家庭归属见 ``packages/shared/src/tool-identity.ts`` 的 ``goal`` family。
+    goal_read_tool_entry,
     enter_plan_mode_tool_entry,
     exit_plan_mode_tool_entry,
     ask_user_question_tool_entry,

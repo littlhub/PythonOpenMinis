@@ -18,6 +18,7 @@ Android pipeline: a shared per-session ``PersistentShell`` via
 from __future__ import annotations
 
 import asyncio
+import atexit
 import json
 from typing import Awaitable, Callable, Optional
 
@@ -285,3 +286,22 @@ def install_coordinator(coordinator: ExecutionCoordinator) -> None:
     """Point the default tool at an externally-owned coordinator (server/CLI)."""
     global _shared
     _shared = coordinator
+
+
+def _shutdown_shells_at_exit() -> None:
+    """进程退出时收掉所有会话 shell —— 否则 Windows 上它们会变成孤儿常驻。
+
+    正常关服由 ``server/main.py`` 的 ``lifespan`` 负责（能 await，收得更干净）；
+    这里兜的是**到不了 lifespan 的退出**：Ctrl-C、任务管理器结束、崩溃退出、
+    CLI 直接退。Windows 结束父进程不会带走子进程，漏掉这一步，ZCode/ReAct 跑过
+    的那些 bash 和它们派生的 ``node``/``python`` 会留在机器上继续跑（实测能到
+    满核占用）。
+    """
+    try:
+        if _shared is not None:
+            _shared.shutdown_sync()
+    except Exception:  # pragma: no cover - 退出路径绝不抛
+        logger.debug("shell shutdown at exit failed", exc_info=True)
+
+
+atexit.register(_shutdown_shells_at_exit)

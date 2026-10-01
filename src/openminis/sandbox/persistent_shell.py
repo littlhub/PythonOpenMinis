@@ -29,6 +29,8 @@ import asyncio
 import os
 import re
 import shutil
+import signal
+import subprocess
 import sys
 import uuid
 from dataclasses import dataclass, field
@@ -38,7 +40,13 @@ from typing import Callable, Optional
 from openminis.core.context import app_context
 from openminis.core.logging import get_logger
 
-__all__ = ["PersistentShell", "ShellSpec", "detect_shell_spec"]
+__all__ = [
+    "PersistentShell",
+    "ShellSpec",
+    "detect_shell_spec",
+    "kill_process_tree_async",
+    "kill_process_tree_sync",
+]
 
 logger = get_logger(__name__)
 
@@ -65,6 +73,86 @@ _MARKER_TEMPLATE = "__MINIS_DONE_{marker}_EXIT_{code}__"
 # their late arrival cannot pollute the NEXT command's output — the marker is
 # protocol chatter, never user-visible output.
 _STRAY_MARKER_RE = re.compile(r"__MINIS_DONE_[0-9a-f]{8}_EXIT_(\d+)__")
+
+
+# ---------------------------------------------------------------------------
+# 进程树回收 —— 「停掉 shell」不等于「停掉 shell 干的活」
+# ---------------------------------------------------------------------------
+# 现场的教训：模型在 Bash 里跑的常常**不是**一条会自己结束的命令，而是一个
+# 长期驻留的东西 —— ``node server.js``、``python -m http.server``、忘了退出的
+# ``tail -f``、命令尾部一个 ``&``。``Process.terminate()`` / ``kill()`` 在
+# Windows 上**只结束那一个进程**：孙进程会被系统重新挂到一个不存在的父上，继续
+# 跑下去。用户看到的现象就是「ZCode 干完活了，任务管理器里还挂着几个 pid 在烧
+# CPU」，而且关掉应用也带不走它们。
+#
+# 所以收口必须按**树**来，而且顺序有讲究：``taskkill /T`` 是顺着父子的当前快照
+# 找人的，**父进程先死就找不到孙子了** —— 必须先杀树，再兜底 ``terminate()``。
+
+def kill_process_tree_sync(pid: int, *, wait: bool = False) -> None:
+    """把 ``pid`` 及其所有子孙一起杀掉。尽力而为，**绝不抛异常**。
+
+    Windows：``taskkill /F /T /PID``（``/T`` = 连子孙）。
+    POSIX：只有当这个 pid **自己就是进程组组长**时才 ``killpg``。否则
+    ``os.getpgid(pid)`` 返回的是宿主 python 的组，一杀连自己一起带走。
+
+    ⚠️ ``wait`` 不是性能选项，是**正确性**选项。``taskkill /T`` 是按**调用那一刻**
+    的父子快照找人的，所以：
+
+    * 调用方如果接着还要 ``terminate()`` bash 或关它的 stdin（bash 读到 EOF 就退），
+      **必须** ``wait=True`` —— 否则 bash 先死，孙子成孤儿，``/T`` 再也找不到它们。
+      实测这个竞态必现：fire-and-forget 版本 100% 漏杀（``stop_sync`` 三个场景全红）。
+    * 纯粹"顺手清理"的场合可以 ``wait=False``（``Popen`` 出去不占调用方时间）。
+    """
+    if not pid:
+        return
+    if os.name == "nt":
+        cmd = ["taskkill", "/F", "/T", "/PID", str(pid)]
+        try:
+            if wait:
+                subprocess.run(  # noqa: S603 - 固定参数，无 shell
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            else:
+                subprocess.Popen(  # noqa: S603 - 固定参数，无 shell
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+        except Exception:  # pragma: no cover - 清理失败不该影响调用方
+            logger.debug("kill_process_tree_sync: taskkill failed pid=%s", pid, exc_info=True)
+        return
+    try:  # pragma: no cover - POSIX 分支（本机是 Windows）
+        if os.getpgid(pid) == pid:
+            os.killpg(pid, signal.SIGKILL)
+        else:
+            os.kill(pid, signal.SIGKILL)
+    except Exception:
+        logger.debug("kill_process_tree_sync: posix kill failed pid=%s", pid, exc_info=True)
+
+
+async def kill_process_tree_async(pid: int, timeout: float = 5.0) -> None:
+    """``kill_process_tree_sync`` 的 await 版：等 ``taskkill`` 真正跑完。
+
+    ``stop()`` 是**正常路径**（不是取消路径），可以在那里等一下 —— 杀干净再往下
+    收管道，比"发了信号就走人"更确定。超时/失败都只记日志。
+    """
+    if not pid:
+        return
+    if os.name != "nt":
+        kill_process_tree_sync(pid)
+        return
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "taskkill", "/F", "/T", "/PID", str(pid),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await asyncio.wait_for(proc.wait(), timeout)
+    except Exception:  # pragma: no cover - 失败退回同步版
+        logger.debug("kill_process_tree_async failed pid=%s", pid, exc_info=True)
+        kill_process_tree_sync(pid)
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +183,17 @@ class ShellSpec:
     def marker_pattern(self, marker: str) -> re.Pattern[str]:
         escaped = re.escape(marker)
         return re.compile(rf"__MINIS_DONE_{escaped}_EXIT_(\d+)__")
+
+
+def _safe_dir_name(session_id: str) -> str:
+    """会话 id → 可直接当目录名的串。
+
+    Windows 禁止 ``: * ? " < > |``，POSIX 只禁 ``/`` 与 NUL（``/`` 还会被当成
+    层级分隔符，把目录建到别处去）—— 统一折成 ``_``。空串兜一个固定名，免得
+    整个 ``external_files_dir`` 被当成会话目录。
+    """
+    folded = re.sub(r'[:*?"<>|/\\]', "_", str(session_id or "")).strip()
+    return folded or "session"
 
 
 def detect_shell_spec() -> ShellSpec:
@@ -197,7 +296,11 @@ class PersistentShell:
         self.session_bind_mounts: dict[str, str] = dict(session_bind_mounts or {})
         self.spec = spec or detect_shell_spec()
 
-        workspace = Path(cwd) if cwd else app_context().external_files_dir / session_id
+        # 会话 id 不一定能当目录名用：ZCode 的 shell 键是 ``<宿主 id>:zcode``（子
+        # 代理还会再挂后缀），而 Windows 的目录名**不允许冒号** —— 直接把 id 拼进
+        # 路径会 ``NotADirectoryError: [WinError 267]``。目录名折换一次即可，
+        # ``session_id`` 本身与 ``MINIS_SESSION_ID`` 都保持原样，会话身份不受影响。
+        workspace = Path(cwd) if cwd else app_context().external_files_dir / _safe_dir_name(session_id)
         workspace.mkdir(parents=True, exist_ok=True)
         self.cwd = workspace
 
@@ -571,12 +674,26 @@ class PersistentShell:
         parts.append(note)
         return "\n".join(parts)
 
-    def _retire_sync(self) -> None:
-        """``_retire`` 的同步版：关 stdin、发终止信号、撤掉 reader，不 await。"""
+    def stop_sync(self) -> None:
+        """``stop()`` 的同步版：**杀整棵树** + 撤 reader，全程不 await。
+
+        取消传播期间不能 ``await``（第一个 await 立刻会被同一个取消打断，shell
+        就退役不掉了），``atexit`` 里更没有事件循环 —— 两条路都走这里。
+
+        顺序不能换：``taskkill /T`` 顺着**当前**的父子快照找人，先 ``terminate``
+        掉 bash 的话孙子就成孤儿、再也追不回来了（实测就是这样漏的）。
+        """
         self._dead = True
         self._pending = None
         proc, self._process = self._process, None
         if proc is not None and proc.returncode is None:
+            # ``returncode is None`` 不只是"活着"的判断，也是 PID 没被回收复用的
+            # 证据 —— 只有这时才敢按 pid 杀树，否则可能误伤别人。
+            #
+            # ``wait=True`` 是**必须**的：下面紧接着就要关 stdin（bash 读到 EOF 会
+            # 自己退出）并发终止信号，只要这两步抢在 taskkill 前面，父子链一断，
+            # 孙子就再也追不回来了 —— 实测必现。
+            kill_process_tree_sync(proc.pid, wait=True)
             try:
                 if proc.stdin is not None and not proc.stdin.is_closing():
                     proc.stdin.close()
@@ -589,6 +706,10 @@ class PersistentShell:
         task, self._reader_task = self._reader_task, None
         if task is not None and not task.done():
             task.cancel()
+
+    def _retire_sync(self) -> None:
+        """``_retire`` 的同步版：退役这条 shell（语义同前，改为委托 ``stop_sync``）。"""
+        self.stop_sync()
 
     async def _retire(self, reason: str) -> None:
         """退役这条 shell —— 下次 ``execute_command`` 会重建一个干净的。
@@ -609,6 +730,46 @@ class PersistentShell:
             await self.stop()
         except Exception:  # pragma: no cover - 退役失败不该盖掉真正的失败原因
             logger.debug("PersistentShell[%s]: retire failed", self.session_id, exc_info=True)
+
+    # --- 残留后台作业 -----------------------------------------------------
+    async def reap_background_jobs(self, *, timeout: float = 5.0) -> list[int]:
+        """收掉这条 shell 里残留的**后台作业**（``&`` 起的那些），返回被杀的 pid。
+
+        为什么需要：「工作完」不等于「活干完了」。命令尾部的 ``&`` 让命令立刻返回、
+        进程却继续在跑，它不在任何 pending 里，``stop()`` 之前的每一步也碰不到它 ——
+        于是留在机器上烧 CPU（用户报的「ZCode 干完活还挂着一堆 pid」）。内核的
+        ``Bash`` 明确拒绝 ``run_in_background``，所以这些后台作业一定是模型顺手写的
+        ``&``，收掉不会打断任何合法流程。
+
+        为什么用 ``jobs -p`` 而不是按父进程枚举：它由 bash **自己**认领，拿到的就是
+        这条 shell 的后台作业，不需要 ``psutil``（本机没装），也不用去猜进程树
+        （Windows 上枚举子进程要么靠被安全策略拦掉的 ``wmic``，要么靠很慢的
+        ``Get-CimInstance``）。实测可用：起完 ``... &`` 后 ``jobs -p`` 就报出那个 pid。
+        """
+        if not self.is_alive:
+            return []
+        try:
+            out, _code = await self.execute_command("jobs -p", timeout=timeout)
+        except Exception:  # pragma: no cover - 收尾失败不该影响本轮结果
+            logger.debug("reap_background_jobs: jobs -p failed", exc_info=True)
+            return []
+        pids = [int(tok) for tok in out.split() if tok.strip().isdigit()]
+        if not pids:
+            return []
+        try:
+            # ``sleep 0.3`` 不是摆设：bash 杀掉一个作业后会往 **stderr** 打一行
+            # ``<行号>: <pid> Killed <命令原文>``，而 stderr 是并进 stdout 的 —— 它
+            # 会混进**下一条**命令的输出里，让模型看到一行莫名其妙的“Killed”。
+            # 在这里多等半拍，那行通知就落进这次调用的输出（我们只看 pid，整段丢弃）。
+            await self.execute_command(
+                "kill -9 " + " ".join(str(p) for p in pids) + " 2>/dev/null; sleep 0.3; :",
+                timeout=timeout,
+            )
+        except Exception:  # pragma: no cover - 同上
+            logger.debug("reap_background_jobs: kill failed pids=%s", pids, exc_info=True)
+        logger.info("PersistentShell[%s]: reaped %d background job(s): %s",
+                    self.session_id, len(pids), pids)
+        return pids
 
     # --- environment ------------------------------------------------------
     async def apply_environment(
@@ -648,15 +809,21 @@ class PersistentShell:
         self._dead = True
         proc, self._process = self._process, None
         if proc is not None and proc.returncode is None:
-            try:
-                if proc.stdin is not None and not proc.stdin.is_closing():
-                    proc.stdin.close()
-            except Exception:
-                pass
-            try:
-                proc.terminate()
-            except ProcessLookupError:
-                pass
+            # 1) 先把**整棵树**端掉（此时 bash 还活着，``taskkill /T`` 才认得出孙子）。
+            #    只 terminate bash 的话，它跑着的 node/python 会变成孤儿继续烧 CPU
+            #    —— 这正是"ZCode 干完活还留着一堆 pid"的根因。
+            await kill_process_tree_async(proc.pid)
+            # 2) 兜底：万一 taskkill 不可用（POSIX / 被策略拦），仍然发终止信号。
+            if proc.returncode is None:
+                try:
+                    if proc.stdin is not None and not proc.stdin.is_closing():
+                        proc.stdin.close()
+                except Exception:
+                    pass
+                try:
+                    proc.terminate()
+                except ProcessLookupError:
+                    pass
 
         task, self._reader_task = self._reader_task, None
         if task is not None and not task.done():

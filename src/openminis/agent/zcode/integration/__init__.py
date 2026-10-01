@@ -22,6 +22,7 @@ import os
 from typing import Any, Optional
 
 from .agent import (
+    ZCODE_DEFAULT_MAX_TOKENS,
     ZCODE_DEFAULT_MAX_TURNS,
     ZcodeRunOptions,
     ZcodeRunResult,
@@ -69,6 +70,7 @@ from .toolchain import (
 
 __all__ = [
     "ZCODE_DEFAULT_MAX_TURNS",
+    "ZCODE_DEFAULT_MAX_TOKENS",
     "ZCODE_TOOL_ID_PREFIX",
     "ZCODE_TOOLCHAIN",
     "DEFAULT_ZCODE_TOOL_IDS",

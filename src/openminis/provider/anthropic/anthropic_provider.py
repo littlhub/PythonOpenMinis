@@ -239,9 +239,25 @@ class AnthropicProvider(LLMProvider):
 
                     elif event_type == "content_block_stop":
                         if current_tool_id is not None and current_tool_name is not None:
-                            args = self._safe_json("".join(tool_input_buffer))
+                            raw_args = "".join(tool_input_buffer)
+                            args, args_error = self._safe_json_checked(raw_args)
+                            if args_error:
+                                # 与 OpenAI 侧同口径：参数没拿到时**不能**让上层
+                                # 当成「模型没传参」直接执行（见 _ToolCallComplete
+                                # 上的说明）。
+                                logger.warning(
+                                    "AnthropicProvider: tool-call args 不可用 name=%s id=%s len=%d: %s",
+                                    current_tool_name,
+                                    current_tool_id,
+                                    len(raw_args),
+                                    args_error,
+                                )
                             yield LLMStreamChunk.ToolCallComplete(
-                                current_tool_id, current_tool_name, args
+                                current_tool_id,
+                                current_tool_name,
+                                args,
+                                args_parse_error=args_error,
+                                raw_args_len=len(raw_args),
                             )
                             current_tool_id = None
                             current_tool_name = None
@@ -757,11 +773,26 @@ class AnthropicProvider(LLMProvider):
 
     @staticmethod
     def _safe_json(text: str) -> dict:
+        return AnthropicProvider._safe_json_checked(text)[0]
+
+    @staticmethod
+    def _safe_json_checked(text: str) -> tuple[dict, Optional[str]]:
+        """解析工具入参，并把「为什么没解析出来」一并回给调用方。
+
+        返回 ``({}, None)`` 只在**真的空入参**（无参工具）时才合法；只要
+        ``text`` 非空却解析失败，第二个返回值就是非空的失败原因 —— 上层据此
+        回一句模型看得懂的说明，而不是让它对着空参反复重试。
+        """
+        if not text.strip():
+            return {}, None
         try:
-            parsed = json.loads(text) if text.strip() else {}
-        except ValueError:
-            return {}
-        return parsed if isinstance(parsed, dict) else {}
+            parsed = json.loads(text)
+        except ValueError as error:
+            return {}, f"{type(error).__name__}: {error}"
+        if not isinstance(parsed, dict):
+            # 非对象入参（合法但不常见）：包一层交给工具自己判断，不算解析失败。
+            return {"value": parsed}, None
+        return parsed, None
 
     # --- errors -----------------------------------------------------------
     @staticmethod

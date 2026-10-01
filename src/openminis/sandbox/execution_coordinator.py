@@ -166,3 +166,37 @@ class ExecutionCoordinator:
         for shell in list(self._shells.values()):
             await shell.stop()
         self._shells.clear()
+
+    async def reap_background_jobs(self, session_prefix: str = "") -> list[int]:
+        """收掉 ``session_prefix`` 开头那些会话的 shell 里残留的后台作业。
+
+        给「一轮干完」用：ZCode 的 Bash 不允许后台执行，模型仍可能顺手写 ``... &``，
+        命令返回了但进程还在跑。前缀匹配是因为 ZCode 侧的真实 shell 键是
+        ``<宿主会话 id>:zcode``（子代理还会再挂后缀），拿宿主 id 当前缀既能命中它、
+        也不会误伤别的会话。
+        """
+        reaped: list[int] = []
+        for key, shell in list(self._shells.items()):
+            if session_prefix and not str(key).startswith(session_prefix):
+                continue
+            try:
+                reaped.extend(await shell.reap_background_jobs())
+            except Exception:  # pragma: no cover - 收尾绝不拖垮本轮
+                logger.debug("coordinator: reap failed for %s", key, exc_info=True)
+        return reaped
+
+    def shutdown_sync(self) -> None:
+        """``shutdown`` 的同步版 —— 给 ``atexit`` 用（那时没有事件循环了）。
+
+        为什么必须留一条同步路：Windows 结束父进程**不会**带走子进程。服务端正常
+        关服会走 ``lifespan``，但 Ctrl-C、任务管理器结束、崩溃退出都到不了那儿；
+        那些 bash 和它们跑着的 ``node``/``python`` 就会留在机器上继续烧 CPU。
+        """
+        shells = list(self._shells.values())
+        self._shells.clear()
+        self._last_injected_keys.clear()
+        for shell in shells:
+            try:
+                shell.stop_sync()
+            except Exception:  # pragma: no cover - 退出路径绝不抛
+                logger.debug("coordinator: sync shell stop failed", exc_info=True)

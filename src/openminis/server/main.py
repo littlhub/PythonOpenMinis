@@ -174,6 +174,15 @@ async def lifespan(app: FastAPI):  # noqa: ANN201
         await close_provider_cache()
     except Exception:  # pragma: no cover - 关服绝不能因清理失败而报错
         logger.debug("provider cache close failed", exc_info=True)
+    # 会话的持久 shell（bash）也要收 —— 且要**连子孙一起**。Windows 结束父进程
+    # 不会带走子进程，漏掉这一步，ZCode/ReAct 跑过的 shell 与它们派生的
+    # node/python 会留在机器上继续烧 CPU（用户报的「工作完没清理没用的 pid」）。
+    try:
+        from ..tools.shell_execute_tool import get_coordinator
+
+        await get_coordinator().shutdown()
+    except Exception:  # pragma: no cover - 关服清理失败不影响退出
+        logger.debug("shell coordinator shutdown failed", exc_info=True)
     logger.info("OpenMinis server stopping")
 
 
@@ -681,10 +690,13 @@ async def _safe_send(client_id: str, payload: dict[str, Any]) -> None:
     try:
         from ..sandbox.guard import sanitize_outbound
 
+        # 带上会话 id：脱敏事件按会话归集（沙箱页才能定位到具体会话），
+        # 也让「本会话自己的标识符」有据可查。
+        sid = str(payload.get("sessionId") or "")
         for key in ("text", "output", "error"):
             value = payload.get(key)
             if isinstance(value, str) and value:
-                payload[key] = sanitize_outbound(value, where="frontend")
+                payload[key] = sanitize_outbound(value, where="frontend", session_id=sid)
     except Exception:  # pragma: no cover - 脱敏失败不该丢帧
         logger.debug("frontend secret scan failed", exc_info=True)
     try:
@@ -702,6 +714,19 @@ async def _safe_send(client_id: str, payload: dict[str, Any]) -> None:
 #: 正在跑的对话轮次，key = 会话 id。对话跑在独立 task 里（不阻塞收帧循环），
 #: 否则「暂停」帧要等本轮结束才被读到，按钮就形同虚设。
 _RUNNING_CHATS: dict[str, asyncio.Task[None]] = {}
+
+#: 各会话当前轮次的起始时刻，配合 ``_CHAT_TAKEOVER_SECONDS`` 判「失控轮次」。
+_RUN_STARTED: dict[str, float] = {}
+
+#: 「暂停」后等任务真正退出的宽限期。超时就强行释放会话锁 —— 一个吞掉取消（或
+#: 卡在同步工具里）的轮次绝不能把整个会话永久锁死：那会让用户**再也无法往这个
+#: 会话插话**（每条新消息都被「上一条还在处理中」拒掉）。
+_STOP_GRACE_SECONDS = 5.0
+
+#: 单轮软上限。正常 ZCode 轮次最长也就几分钟；这里给得很宽，只用来兜「永远不
+#: 结束」的轮次 —— 前端刷新页面后本地 running 态就丢了，用户会发现消息发出去
+#: 毫无反应（被服务端拒掉）。超过这个时长的新消息可以抢占（取消旧轮次）。
+_CHAT_TAKEOVER_SECONDS = 30 * 60.0
 
 #: 即发即忘的后台任务（记忆整理等）。asyncio 只持弱引用，不存一份的话
 #: 任务可能在跑完前被 GC 回收。
@@ -758,9 +783,24 @@ async def _handle_stop(client_id: str, msg: dict[str, Any]) -> None:
     task = _RUNNING_CHATS.get(sid)
     if task is not None and not task.done():
         task.cancel()
-        # asyncio.wait 不会把子任务的取消抛给当前协程（`await task` 会）。
-        await asyncio.wait({task})
-        logger.info("chat stopped by client (%s)", sid)
+        # asyncio.wait 不会把子任务的取消抛给当前协程（`await task` 会）。加超时：
+        # 任务若吞掉取消（或卡在同步工具里）迟迟不退，连本收帧循环也会一起挂住，
+        # 「暂停」按钮就彻底成了死键 —— 用户表现为「点了没反应，也没法继续会话」。
+        try:
+            await asyncio.wait({task}, timeout=_STOP_GRACE_SECONDS)
+        except Exception:  # pragma: no cover - 取消路径不该抛出
+            logger.debug("chat stop wait failed", exc_info=True)
+    # **无条件释放会话锁**：任务即便还没退出，也不能继续占着这个会话 ——
+    # 只要它还挂在 ``_RUNNING_CHATS`` 上，后续消息就会被「上一条还在处理中」
+    # 全部拒掉，用户再也无法往这个会话里插话。
+    if _RUNNING_CHATS.get(sid) is task:
+        _RUNNING_CHATS.pop(sid, None)
+    if task is not None and not task.done():
+        logger.warning(
+            "chat stop: 会话 %s 的任务 %.1fs 宽限期内未退出，已强制释放会话锁（会话仍可继续用）",
+            sid,
+            _STOP_GRACE_SECONDS,
+        )
     await _safe_send(
         client_id, {"type": "done", "sessionId": sid, "stopped": True}
     )
@@ -833,14 +873,39 @@ async def _handle_chat(client_id: str, msg: dict[str, Any]) -> None:
     sid = str(msg.get("session_id") or msg.get("sessionId") or "").strip()
     running = _RUNNING_CHATS.get(sid)
     if sid and running is not None and not running.done():
-        await _safe_send(
-            client_id, {"type": "error", "error": "上一条还在处理中"}
+        started_at = _RUN_STARTED.get(sid)
+        # 没有起始时刻记录时**保守地当作刚起步**（不抢占）：这类任务不是本函数
+        # 注册的（测试或未来的其它入口），贸然取消它比多等一会儿危险得多。
+        age = 0.0 if started_at is None else time.time() - started_at
+        if age <= _CHAT_TAKEOVER_SECONDS:
+            await _safe_send(
+                client_id, {"type": "error", "error": "上一条还在处理中"}
+            )
+            return
+        # 跑太久了，判定失控 —— 放行新消息，先把旧轮次取消掉。会话必须始终可用。
+        logger.warning(
+            "chat for %s 已运行 %.0fs（超过 %.0fs），判定失控：取消旧轮次并放行新消息",
+            sid,
+            age,
+            _CHAT_TAKEOVER_SECONDS,
         )
-        return
+        running.cancel()
+        try:
+            await asyncio.wait({running}, timeout=_STOP_GRACE_SECONDS)
+        except Exception:  # pragma: no cover - 取消路径不该抛出
+            logger.debug("takeover wait failed", exc_info=True)
+        if _RUNNING_CHATS.get(sid) is running:
+            _RUNNING_CHATS.pop(sid, None)
     task = asyncio.create_task(_run_chat(client_id, msg))
     if sid:
         _RUNNING_CHATS[sid] = task
-        task.add_done_callback(lambda _t, key=sid: _RUNNING_CHATS.pop(key, None))
+        _RUN_STARTED[sid] = time.time()
+
+        def _clear(_t: Any, key: str = sid) -> None:
+            _RUNNING_CHATS.pop(key, None)
+            _RUN_STARTED.pop(key, None)
+
+        task.add_done_callback(_clear)
 
 
 async def _auto_organize_after_chat(every: int) -> None:
