@@ -49,8 +49,9 @@ def _pick_writable(preferred: Path, fallback_name: str) -> Path:
     fallback = Path(tempfile.gettempdir()) / fallback_name
     if _writable(fallback):
         logging.getLogger("openminis.core.context").warning(
-            "数据目录不可写：%s —— 改用 %s（重启后可能被清理，建议把 MINIS_HOME "
-            "指到一个可写的目录）",
+            "当前进程写不进数据目录 %s（只读配置 / 权限 / 沙箱限制都可能导致）"
+            "—— 本次改用 %s，重启后可能被清理；若这是正常桌面环境，请检查目录权限，"
+            "或用环境变量 MINIS_HOME 指到一个可写目录",
             preferred,
             fallback,
         )
