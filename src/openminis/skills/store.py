@@ -192,7 +192,13 @@ class SkillStore:
                 dest = self.root / src.name
                 # Never clobber: a user-edited skill stays user-edited.
                 if not (dest / SKILL_FILE).exists():
-                    shutil.copytree(src, dest)
+                    try:
+                        shutil.copytree(src, dest)
+                    except OSError:
+                        # 只读/受限环境下写不进技能目录时跳过这一个，
+                        # 不要连累后面所有内置技能和整个启动流程。
+                        logger.warning("技能 %s 装不进去，跳过", src.name, exc_info=True)
+                        continue
                     installed.append(src.name)
         self.write_builtin_tools()
         return installed
@@ -314,8 +320,14 @@ class SkillStore:
             lines.append("")
 
         dest = self.root / BUILTIN_TOOLS_SKILL
-        dest.mkdir(parents=True, exist_ok=True)
-        (dest / SKILL_FILE).write_text("\n".join(lines), encoding="utf-8")
+        try:
+            dest.mkdir(parents=True, exist_ok=True)
+            (dest / SKILL_FILE).write_text("\n".join(lines), encoding="utf-8")
+        except OSError:
+            # 数据目录只读时这份「工具清单技能」写不进去，值得一条 warning，
+            # 但绝不能把启动带走。
+            logger.warning("内置工具清单写不进去（%s），本次跳过", dest)
+            return None
         return self._read_entry(dest)
 
     # -- read ------------------------------------------------------------

@@ -23,31 +23,70 @@ from .. import __version__ as _package_version
 __all__ = ["AppContext", "app_context", "set_app_context", "reset_app_context"]
 
 
+def _writable(path: Path) -> bool:
+    """能在 ``path`` 里建目录并写文件吗（只读漫游配置、企业策略、受限沙箱都会拒）。"""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe = path / ".openminis-write-test"
+        probe.write_bytes(b"")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _pick_writable(preferred: Path, fallback_name: str) -> Path:
+    """优先用常规目录；不可写就退到系统临时目录，别让一个只读的 home 卡死启动。
+
+    退到临时目录只是「能跑起来」，重启后数据可能被系统清掉 —— 所以打一条
+    warning，并提示用 ``MINIS_HOME`` 指到真正的可写位置。
+    """
+    if _writable(preferred):
+        return preferred
+    import logging  # noqa: PLC0415 - 局部导入避免与 .logging 的循环依赖
+    import tempfile  # noqa: PLC0415
+
+    fallback = Path(tempfile.gettempdir()) / fallback_name
+    if _writable(fallback):
+        logging.getLogger("openminis.core.context").warning(
+            "数据目录不可写：%s —— 改用 %s（重启后可能被清理，建议把 MINIS_HOME "
+            "指到一个可写的目录）",
+            preferred,
+            fallback,
+        )
+        return fallback
+    return preferred
+
+
 def _default_data_dir() -> Path:
     """Pick a sane per-user data directory for the current platform."""
     # MINIS_HOME wins — used by tests and by the sandbox test-suite.
     if env := os.environ.get("MINIS_HOME"):
-        return Path(env).expanduser()
+        return _pick_writable(Path(env).expanduser(), "openminis")
 
     if sys.platform == "win32":
         base = Path.home()
-        return base / "openminis"
+        preferred = base / "openminis"
     elif sys.platform == "darwin":
         base = Path.home() / "Library" / "Application Support"
+        preferred = base / "openminis"
     else:
         base = Path(
             os.environ.get("XDG_DATA_HOME", Path.home() / ".local" / "share")
         )
-    return base / "openminis"
+        preferred = base / "openminis"
+    return _pick_writable(preferred, "openminis")
 
 
 def _default_cache_dir() -> Path:
     if sys.platform == "win32":
         base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-        return base / "openminis" / "cache"
-    if sys.platform == "darwin":
-        return Path.home() / "Library" / "Caches" / "openminis"
-    return Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "openminis"
+        preferred = base / "openminis" / "cache"
+    elif sys.platform == "darwin":
+        preferred = Path.home() / "Library" / "Caches" / "openminis"
+    else:
+        preferred = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "openminis"
+    return _pick_writable(preferred, "openminis-cache")
 
 
 @dataclass(slots=True)
@@ -128,15 +167,29 @@ class AppContext:
         return self.databases_dir / name
 
     def ensure_dirs(self) -> None:
-        """Create every managed directory. Safe to call repeatedly."""
-        for p in (
+        """Create every managed directory. Safe to call repeatedly.
+
+        单个子目录建不出来（只读、被占、盘满）只记 warning，不打断启动：
+        ``data_dir`` 已经由 ``_pick_writable`` 保证可写，剩下的失败通常是
+        暂时的，后面第一次真正用到时还会再试。
+        """
+        import logging  # noqa: PLC0415 - 避免与 .logging 循环导入
+
+        log = logging.getLogger("openminis.core.context")
+        # 直接拼路径，不走 files_dir / databases_dir 那两个「顺手 mkdir」的
+        # property —— 否则它们会在 try 外面抛，等于没兜住。
+        targets = [
             self.data_dir,
             self.cache_dir,
-            self.files_dir,
-            self.databases_dir,
-            self.workspace_dir,
-        ):
-            p.mkdir(parents=True, exist_ok=True)
+            self.data_dir / "files",
+            self.data_dir / "databases",
+            self.workspace_dir or (self.data_dir / "workspace"),
+        ]
+        for p in targets:
+            try:
+                Path(p).mkdir(parents=True, exist_ok=True)
+            except OSError as error:
+                log.warning("目录建不出来（%s）：%s", p, error)
 
     def cache_file(self, *parts: str) -> Path:
         p = self.cache_dir.joinpath(*parts)

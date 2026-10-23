@@ -1,0 +1,6 @@
+数据目录不可写：C:\Users\loo\openminis —— 改用 C:\Users\loo\AppData\Local\Temp\dsh-7V6cZm\openminis（重启后可能被清理，建议把 MINIS_HOME 指到一个可写的目录）
+数据目录不可写：C:\Users\loo\AppData\Local\openminis\cache —— 改用 C:\Users\loo\AppData\Local\Temp\dsh-7V6cZm\openminis-cache（重启后可能被清理，建议把 MINIS_HOME 指到一个可写的目录）
+INFO:     Started server process [5536]
+INFO:     Waiting for application startup.
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8899 (Press CTRL+C to quit)

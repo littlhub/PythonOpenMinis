@@ -83,11 +83,18 @@ HuggingFace 镜像（按文件取，199 MB 比 487 MB 的压缩包省一半多�
 `file`）、`POST|GET /api/speech/model/download`。识别走 `asyncio.to_thread`，
 不阻塞事件循环。
 
+## 数据目录
+
+默认 `~/openminis`（缓存 `%LOCALAPPDATA%\openminis\cache`），可用 `MINIS_HOME`
+覆盖。启动时会先探一下可写性：**目录只读就自动退到系统临时目录**并打一条
+warning，而不是直接起不来 —— 只读漫游配置、企业策略、受限沙箱都踩过这个坑。
+日志文件、内置技能安装写不进去同理：降级 + warning，不影响服务启动。
+
 ## 预编译包
 
 [Releases](https://github.com/littlhub/PythonOpenMinis/releases) 里有 Windows 包
 （`OpenMinis-<版本>-win64.zip`）：解压后运行 `OpenMinis\OpenMinis.exe`，浏览器打
-开它打印的地址即可，不需要装 Python。当前为 **1.0.4**（含上面的语音输入）。
+开它打印的地址即可，不需要装 Python。当前为 **1.0.5**（含上面的语音输入与数据目录降级）。
 
 ## Tests
 
