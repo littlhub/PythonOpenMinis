@@ -272,6 +272,141 @@ def register_into(registry: ConfigRegistry, **dependencies: Any) -> None:
         )
     )
 
+    # --- speech (local offline STT) --------------------------------------
+    # PORT: the Kotlin original registers a ``speech`` topic backed by the
+    # platform recognizer. This port has no platform recognizer, so the same
+    # topic now describes the local sherpa-onnx engine (see
+    # ``openminis.speech``). Field names stay camelCase like their Kotlin
+    # counterparts so the React settings UI can reuse the topic shape.
+    registry.register(
+        PrefsBackedField(
+            path="speech.enabled",
+            display_name="语音识别",
+            description="启用输入框 🎤 按钮和 transcribe_audio 工具的语音识别。",
+            schema=BoolSchema(),
+            default=Bool(True),
+        )
+    )
+    # 双引擎：本地 sherpa-onnx（默认，离线）或模型 API（OpenAI 兼容接口 /
+    # Ekko Studio 语音代理）。apiKey 用 SECRET_KEYS 里的键名，读取时会被打码。
+    registry.register(
+        PrefsBackedField(
+            path="speech.engine",
+            display_name="识别引擎",
+            description=(
+                "local = 本地模型（离线，不要 Key，默认）；"
+                "api = 模型 API（云端，要联网/Key，准确率更高）；"
+                "auto = 配好 API 就用 API，否则用本地。"
+            ),
+            schema=StrEnumSchema(("local", "api", "auto")),
+            default=Str("local"),
+        )
+    )
+    registry.register(
+        PrefsBackedField(
+            path="speech.apiPreset",
+            display_name="API 服务商预设",
+            description=(
+                "选择后自动填好接口地址和模型名：model（用「模型服务 → 用途分槽 → "
+                "音频」绑定的模型）/ openai / groq / siliconflow / dashscope / "
+                "studio（用本机 Ekko Studio 语音代理）/ custom / local。"
+            ),
+            schema=StrEnumSchema(
+                ("local", "model", "studio", "openai", "groq", "siliconflow", "dashscope", "custom")
+            ),
+            default=Str("local"),
+        )
+    )
+    registry.register(
+        PrefsBackedField(
+            path="speech.apiBaseUrl",
+            display_name="API 接口地址",
+            description="完整的 /audio/transcriptions 地址。留空则用预设的。",
+            schema=StrSchema(max_length=500),
+            default=Str(""),
+            risk=ConfigRisk.SENSITIVE,
+        )
+    )
+    registry.register(
+        PrefsBackedField(
+            path="speech.apiModel",
+            display_name="API 模型名",
+            description="例如 gpt-4o-transcribe、whisper-large-v3-turbo。留空则用预设的。",
+            schema=StrSchema(max_length=200),
+            default=Str(""),
+        )
+    )
+    registry.register(
+        PrefsBackedField(
+            path="speech.apiKey",
+            display_name="API Key",
+            description=(
+                "云端服务商的 Key（输出一律打码）。留空则读环境变量；"
+                "预设为 studio 时自动用 Ekko Studio 的语音代理，不用填。"
+            ),
+            schema=StrSchema(max_length=500),
+            default=Str(""),
+            risk=ConfigRisk.SENSITIVE,
+        )
+    )
+    registry.register(
+        PrefsBackedField(
+            path="speech.apiLanguage",
+            display_name="识别语言",
+            description="例如 zh、en；留空让接口自己判断。",
+            schema=StrSchema(max_length=20),
+            default=Str("zh"),
+        )
+    )
+    registry.register(
+        PrefsBackedField(
+            path="speech.apiPrompt",
+            display_name="提示词",
+            description="给模型的上下文（专有名词等），留空即可。",
+            schema=StrSchema(max_length=2000),
+            default=Str(""),
+        )
+    )
+    registry.register(
+        PrefsBackedField(
+            path="speech.apiTimeoutSeconds",
+            display_name="API 超时（秒）",
+            description="等接口返回的最长秒数。",
+            schema=IntSchema(min=5, max=600),
+            default=Int(120),
+        )
+    )
+    registry.register(
+        PrefsBackedField(
+            path="speech.numThreads",
+            display_name="Decoding threads",
+            description="CPU threads used by the speech decoder. 2 is enough for short clips.",
+            schema=IntSchema(min=1, max=16),
+            default=Int(2),
+        )
+    )
+    registry.register(
+        PrefsBackedField(
+            path="speech.decodingMethod",
+            display_name="Decoding method",
+            description="greedy_search is fastest; modified_beam_search is slightly more accurate.",
+            schema=StrEnumSchema(("greedy_search", "modified_beam_search")),
+            default=Str("greedy_search"),
+        )
+    )
+    registry.register(
+        PrefsBackedField(
+            path="speech.flushSilenceSeconds",
+            display_name="Trailing silence (seconds)",
+            description=(
+                "Silence appended before finishing a clip, so the last syllable "
+                "is not swallowed. Raise to 1.0 if words get cut."
+            ),
+            schema=DoubleSchema(min=0.0, max=3.0),
+            default=Double(0.8),
+        )
+    )
+
     # --- browser ---------------------------------------------------------
     registry.register(
         PrefsBackedField(

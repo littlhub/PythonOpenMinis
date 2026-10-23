@@ -14,8 +14,11 @@ bundled as data rather than compiled in, so the running binary resolves
 ``web/dist`` through ``server.main._resolve_web_dist``.
 """
 
+import importlib.util
 import os
 from pathlib import Path
+
+from PyInstaller.utils.hooks import collect_dynamic_libs
 
 ROOT = Path(SPECPATH).resolve().parent  # python/
 PKG = ROOT / "src" / "openminis"
@@ -82,13 +85,29 @@ for _driver in sorted((PKG / "plugins" / "drivers").glob("*.py")):
     if _driver.stem != "__init__":
         hiddenimports.append("openminis.plugins.drivers." + _driver.stem)
 
-# Nothing in this project needs a GUI toolkit or a numerical stack. Excluding
-# them keeps the bundle honest instead of shipping dead weight — and a
-# stray import inside a try/except just warns, it does not break anything.
+# 语音识别（本地 sherpa-onnx 引擎）在函数里延迟导入 sherpa_onnx —— 静态扫描
+# 看不见，冻结版会退化成「引擎不可用」。模块本身 + 它的原生库（onnxruntime
+# 的 DLL）都要收；sherpa_onnx 依赖 numpy，所以 numpy 不能再进 excludes。
+# 没装 sherpa-onnx 的机器照常打包，只是本地引擎不可用（设置页会提示）。
+binaries: list[tuple[str, str]] = []
+for _mod in ("sherpa_onnx", "_sherpa_onnx"):
+    try:
+        _spec = importlib.util.find_spec(_mod)
+    except (ImportError, ValueError):
+        _spec = None
+    if _spec is not None:
+        hiddenimports.append(_mod)
+        binaries += collect_dynamic_libs(_mod)
+if "sherpa_onnx" not in hiddenimports:
+    print("WARNING: sherpa_onnx not installed - the local speech engine will be unavailable")
+
+# GUI toolkit / numerical stack nobody in this project imports. numpy is NOT
+# excluded: onnxruntime needs it. A stray import inside a try/except only
+# warns, so a wrong exclusion here surfaces as a missing feature, not a crash.
 excludes = [
     "tkinter",
     "matplotlib",
-    "numpy",
+    "torch",
     "pandas",
     "scipy",
     "IPython",
@@ -102,7 +121,7 @@ onefile = os.environ.get("OPENMINIS_ONEFILE") == "1"
 a = Analysis(
     [str(ROOT / "app.py")],
     pathex=[str(ROOT / "src")],
-    binaries=[],
+    binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],

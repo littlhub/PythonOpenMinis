@@ -56,7 +56,10 @@ function useConfigTopic(topic: string) {
       setError(null)
       setSaved(null)
       try {
-        await api.configSet(path, value)
+        const r = await api.configSet(path, value)
+        // 服务器可能改写了值（打码的 Key 存回来就是「没改」）——以它为准，
+        // 否则输入框会一直显示「••• (hidden)」而用户以为改成功了。
+        setValues((v) => ({ ...v, [path]: r.newValue }))
         setSaved(`已保存 ${path} ✓`)
         setTimeout(() => setSaved(null), 2200)
         return true
@@ -677,6 +680,427 @@ export function LogsPage(props: { onBack: () => void }) {
 
 // ---------------------------------------------------------------------------
 // MCP 集成
+// ---------------------------------------------------------------------------
+// 语音识别 — 本地离线 STT（speech.* 主题）
+// ---------------------------------------------------------------------------
+// PORT: 没有 Kotlin 页面对应物。Android 走系统 SpeechRecognizer，没有可调项；
+// 桌面版换成双引擎（本地 sherpa-onnx / 模型 API），才第一次有了这些旋钮。
+// 「本地 / API」可随时互换：本地引擎离线、不要 Key；API 引擎走任意 OpenAI
+// 兼容 /audio/transcriptions，准确率更高但音频要发给服务商。模型是否装好由
+// /api/speech/status 直接读盘回答，下载进度由 /api/speech/model/download 轮询。
+const ENGINE_OPTIONS: [string, string][] = [
+  ['local', '本地模型（离线，默认）'],
+  ['api', '模型 API（云端）'],
+  ['auto', '自动（配好 API 就用 API）'],
+]
+
+/** 文本类字段：本地草稿 + 「保存」才写盘（每敲一个字就校验太吵）。 */
+function DraftInput(props: {
+  fieldKey: string
+  draft: Record<string, string>
+  current: string
+  placeholder?: string
+  type?: 'text' | 'password'
+  onDraft: (key: string, value: string) => void
+  onCommit: () => void
+}) {
+  const raw = props.draft[props.fieldKey]
+  const value = raw !== undefined ? raw : props.current
+  return (
+    <input
+      type={props.type ?? 'text'}
+      value={value}
+      placeholder={props.placeholder}
+      autoComplete="off"
+      onChange={(e) => props.onDraft(props.fieldKey, e.target.value)}
+      onBlur={props.onCommit}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') props.onCommit()
+      }}
+    />
+  )
+}
+
+export function SpeechPage(props: { onBack: () => void }) {
+  const { fields, values, error, saved, setField } = useConfigTopic('speech')
+  const st = useAsync(() => api.speechStatus(), [])
+
+  // 文本字段草稿：只有点「保存」/ 回车 / 失焦才提交，避免逐字 PUT。
+  const [draft, setDraft] = useState<Record<string, string>>({})
+  const [rowError, setRowError] = useState<string | null>(null)
+  const [starting, setStarting] = useState(false)
+
+  const download = st.data?.download
+
+  // 下载在后台线程里跑：只要还在 downloading/extracting 就每 1.5 秒拉一次进度，
+  // 结束了再刷新一次整体状态（模型出现在新目录后 ok 才算数）。
+  useEffect(() => {
+    const phase = download?.phase
+    if (phase !== 'downloading' && phase !== 'extracting') return
+    const timer = setTimeout(() => {
+      void api
+        .speechDownloadProgress()
+        .then(() => st.reload())
+        .catch(() => st.reload())
+    }, 1500)
+    return () => clearTimeout(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [download?.phase, download?.elapsedMs])
+
+  // 下载结束：重新读盘，让「模型文件」那一行和识别器状态跟上。
+  const prevPhase = useRef(download?.phase)
+  useEffect(() => {
+    const phase = download?.phase
+    if (phase === 'done' && prevPhase.current !== 'done') st.reload()
+    prevPhase.current = phase
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [download?.phase])
+
+  if (!fields) return <DetailShell title="语音识别" onBack={props.onBack}><Spinner /></DetailShell>
+
+  const info = st.data
+  const str = (path: string, fallback = '') => String(values[path] ?? fallback)
+  const engineSetting = str('speech.engine', 'local')
+  const preset = str('speech.apiPreset', 'local')
+  const presetDefaults = info?.presetDefaults ?? {}
+  const presetDefault = presetDefaults[preset] ?? { base_url: '', model: '', key_env: '' }
+  const hasApiKey = !!fields.find((f) => f.path === 'speech.apiKey')?.hasSecret
+  const slotModel = info?.slotModel
+
+  const commit = (path: string) => {
+    const next = draft[path]
+    if (next === undefined || next === str(path)) {
+      setDraft((d) => {
+        const { [path]: _drop, ...rest } = d
+        return rest
+      })
+      return
+    }
+    void setField(path, next).then((ok) => {
+      if (ok) {
+        setDraft((d) => {
+          const { [path]: _drop, ...rest } = d
+          return rest
+        })
+        st.reload()
+      }
+    })
+  }
+
+  const onDraft = (key: string, value: string) => setDraft((d) => ({ ...d, [key]: value }))
+
+  const startDownload = async () => {
+    setStarting(true)
+    setRowError(null)
+    try {
+      await api.speechDownloadModel()
+    } catch (e) {
+      setRowError((e as Error).message)
+    } finally {
+      setStarting(false)
+      st.reload()
+    }
+  }
+
+  const changePreset = async (name: string) => {
+    setRowError(null)
+    // 先存预设，再把地址/模型填成该预设的默认值（空 = 用预设自带的）。
+    if (!(await setField('speech.apiPreset', name))) return
+    const p = presetDefaults[name]
+    if (!p) return
+    setDraft({})
+    if (str('speech.apiBaseUrl') && str('speech.apiBaseUrl') !== p.base_url) {
+      await setField('speech.apiBaseUrl', '')
+    }
+    if (str('speech.apiModel') && str('speech.apiModel') !== p.model) {
+      await setField('speech.apiModel', '')
+    }
+    // 选「本地」预设等于不用 API 了。
+    if (name === 'local' && engineSetting === 'api') await setField('speech.engine', 'local')
+    st.reload()
+  }
+
+  const busy = download?.phase === 'downloading' || download?.phase === 'extracting'
+  const isLocal = info?.engine !== 'api'
+
+  return (
+    <DetailShell
+      title="语音识别"
+      subtitle="输入框 🎤 按钮与 transcribe_audio 工具共用。默认走本地 sherpa-onnx 中英双语模型（离线，音频不出本机）；也可以切成模型 API。"
+      onBack={props.onBack}
+      extra={
+        <div className="row-actions">
+          <button className="btn-soft" onClick={st.reload} disabled={st.loading}>刷新</button>
+        </div>
+      }
+    >
+      <StatusLine ok={saved} err={error ?? rowError} />
+
+      <SectionCard title="识别引擎" hint={info ? `当前：${info.engines[info.engine]?.label ?? info.engine}` : undefined}>
+        {st.loading && !info ? (
+          <Spinner />
+        ) : st.error ? (
+          <p className="error">{st.error}</p>
+        ) : info && (
+          <>
+            <Row label="引擎" desc="本地 = 离线模型；API = 把音频发给你选的语音接口。改动立即生效。">
+              <select value={engineSetting} onChange={(e) => void setField('speech.engine', e.target.value)}>
+                {ENGINE_OPTIONS.map(([v, label]) => (
+                  <option key={v} value={v}>{label}</option>
+                ))}
+              </select>
+            </Row>
+            <Row
+              label="就绪状态"
+              desc={
+                info.engine === 'api'
+                  ? [info.api?.model, info.api?.baseUrl].filter(Boolean).join(' · ') || '接口未配置'
+                  : info.root ?? info.managedDir
+              }
+            >
+              <span className={`pill ${info.ok ? 'ok' : 'warn'}`}>
+                {info.ok ? '可用' : '不可用'}
+              </span>
+            </Row>
+            <Row label="识别器" desc="本地引擎首次调用时加载权重（约 3–5 秒），之后常驻复用。">
+              <span className={`pill ${info.loaded ? 'ok' : ''}`}>
+                {info.engine === 'api' ? `API（${info.api?.auth === 'studio' ? 'Studio 代理' : 'Key'}）` : info.loaded ? '已加载' : '未加载'}
+              </span>
+            </Row>
+            <Row label="采样率 / 语言" desc="浏览器按这个采样率录音，所以不需要重采样。">
+              <code>
+                {info.sampleRate} Hz · {info.languages.join(' / ')}
+              </code>
+            </Row>
+            {info.error && <p className="error">{info.error}</p>}
+            {info.warnings.length > 0 && (
+              <Note kind="warn">
+                {info.warnings.map((w) => (
+                  <span key={w}>
+                    {w}
+                    <br />
+                  </span>
+                ))}
+              </Note>
+            )}
+          </>
+        )}
+      </SectionCard>
+
+      {!isLocal && (
+        <SectionCard title="模型 API">
+          <Row label="服务商预设" desc={preset === 'studio' ? '自动读取本机 Ekko Studio 的语音代理，不用填 Key。' : preset === 'model' ? '直接用「设置 → 模型服务 → 用途分槽 → 音频」绑定的那个模型，Key / 地址都从厂商实例读，下面三项不用填。' : presetDefault.key_env ? `留空 Key 时自动读环境变量 ${presetDefault.key_env}。` : '选好预设后，地址和模型留空就用预设的。'}>
+            <select value={preset} onChange={(e) => void changePreset(e.target.value)}>
+              {Object.entries(info?.presets ?? {}).map(([name, label]) => (
+                <option key={name} value={name}>{label}</option>
+              ))}
+            </select>
+          </Row>
+          {preset === 'model' && (
+            <Row
+              label="音频槽位"
+              desc={slotModel?.bound ? `${slotModel.endpoint}` : '还没绑定：去「模型服务 → 用途分槽 → 音频」选厂商实例 + 模型。'}
+            >
+              <span className={`pill ${slotModel?.bound ? 'ok' : 'warn'}`}>
+                {slotModel?.bound ? `${slotModel.instanceId} · ${slotModel.model}` : '未绑定'}
+              </span>
+            </Row>
+          )}
+          {preset !== 'model' && (
+          <>
+          <Row label="接口地址" desc="完整的 /audio/transcriptions 地址。" >
+            <DraftInput
+              fieldKey="speech.apiBaseUrl"
+              draft={draft}
+              current={str('speech.apiBaseUrl')}
+              placeholder={presetDefault.base_url || 'https://…/v1/audio/transcriptions'}
+              onDraft={onDraft}
+              onCommit={() => commit('speech.apiBaseUrl')}
+            />
+          </Row>
+          <Row label="模型名" desc="例如 gpt-4o-transcribe、whisper-large-v3-turbo。">
+            <DraftInput
+              fieldKey="speech.apiModel"
+              draft={draft}
+              current={str('speech.apiModel')}
+              placeholder={presetDefault.model || '模型 ID'}
+              onDraft={onDraft}
+              onCommit={() => commit('speech.apiModel')}
+            />
+          </Row>
+          <Row
+            label="API Key"
+            desc={hasApiKey ? '已保存（显示为占位符）。想换 Key 就直接输入新值；留空 = 不变。' : preset === 'studio' ? 'Studio 预设一般不用填。' : '保存后只显示占位符，明文不会回到浏览器。'}
+          >
+            <DraftInput
+              fieldKey="speech.apiKey"
+              draft={draft}
+              current={hasApiKey ? '' : str('speech.apiKey')}
+              type="password"
+              placeholder={hasApiKey ? '•••••••• (已配置，留空不变)' : 'sk-…'}
+              onDraft={onDraft}
+              onCommit={() => commit('speech.apiKey')}
+            />
+          </Row>
+          </>
+          )}
+          <Row label="识别语言" desc="zh / en…；留空让接口自己判断。">
+            <DraftInput
+              fieldKey="speech.apiLanguage"
+              draft={draft}
+              current={str('speech.apiLanguage')}
+              placeholder="zh"
+              onDraft={onDraft}
+              onCommit={() => commit('speech.apiLanguage')}
+            />
+          </Row>
+          <Row label="提示词" desc="给模型的上下文（专有名词等），可留空。">
+            <DraftInput
+              fieldKey="speech.apiPrompt"
+              draft={draft}
+              current={str('speech.apiPrompt')}
+              placeholder="例如：Ekko、OpenMinis"
+              onDraft={onDraft}
+              onCommit={() => commit('speech.apiPrompt')}
+            />
+          </Row>
+          <Row label="超时（秒）" desc="等接口返回的最长秒数。">
+            <input
+              type="number" min={5} max={600}
+              value={Number(str('speech.apiTimeoutSeconds', '120'))}
+              onChange={(e) => void setField('speech.apiTimeoutSeconds', Number(e.target.value))}
+            />
+          </Row>
+          <Note kind="info">
+            文本输入框改完点「保存」或直接回车；切换预设会把地址 / 模型重置成该预设的默认值。
+          </Note>
+          <div className="row-actions">
+            <button
+              className="btn-soft"
+              disabled={Object.keys(draft).length === 0}
+              onClick={() => {
+                for (const k of Object.keys(draft)) commit(k)
+              }}
+            >
+              保存所有修改
+            </button>
+          </div>
+        </SectionCard>
+      )}
+
+      <SectionCard
+        title="本地模型"
+        hint={info ? `下载到 ${info.managedDir}` : undefined}
+        extra={
+          <button onClick={() => void startDownload()} disabled={busy || starting}>
+            {busy ? '下载中…' : info?.ok && info.engine !== 'api' ? '重新下载' : '下载模型'}
+          </button>
+        }
+      >
+        {info && (
+          <>
+            <Row label="模型" desc={info.root ?? `尚未安装，点右上角「下载模型」（约 200 MB，装好后离线可用）`}>
+              <span className={`pill ${info.localReady ? 'ok' : 'warn'}`}>
+                {info.localReady ? '文件齐全' : '未安装'}
+              </span>
+            </Row>
+            {download && download.phase !== 'idle' && (
+              <div className="download-block">
+                <MiniBar
+                  label={download.phase === 'extracting' ? '解压中' : download.phase === 'done' ? '已完成' : '下载中'}
+                  frac={download.percent ? download.percent / 100 : 0}
+                  bytes={download.received}
+                  sub={
+                    download.phase === 'downloading'
+                      ? `${download.percent ?? 0}% · ${fmtBytes(download.speedBytesPerSec)}/s · ${download.source ?? ''}`
+                      : download.message || download.phase
+                  }
+                />
+                {download.phase === 'error' && (
+                  <p className="error">
+                    {download.error ?? download.message}
+                    {download.source && <>（来源：{download.source}）</>}
+                  </p>
+                )}
+              </div>
+            )}
+            <Note kind="info">
+              下载源依次尝试 GitHub Release、镜像与 Hugging Face 镜像；装到数据目录下的 models/，
+              不改动程序目录。装好后点「刷新」即可看到「文件齐全」。
+            </Note>
+          </>
+        )}
+      </SectionCard>
+
+      <SectionCard title="本地识别参数">
+        {fields.map((f) => {
+          const value = values[f.path]
+          if (f.path === 'speech.enabled') {
+            return (
+              <Row key={f.path} label={f.displayName} desc={f.description}>
+                <input
+                  type="checkbox"
+                  checked={!!value}
+                  onChange={(e) => void setField(f.path, e.target.checked)}
+                />
+              </Row>
+            )
+          }
+          if (f.path === 'speech.numThreads') {
+            return (
+              <Row key={f.path} label={f.displayName} desc={f.description}>
+                <input
+                  type="number" min={1} max={16}
+                  value={Number(value ?? 2)}
+                  onChange={(e) => void setField(f.path, Number(e.target.value))}
+                />
+              </Row>
+            )
+          }
+          if (f.path === 'speech.decodingMethod') {
+            return (
+              <Row key={f.path} label={f.displayName} desc={f.description}>
+                <select
+                  value={String(value ?? 'greedy_search')}
+                  onChange={(e) => void setField(f.path, e.target.value)}
+                >
+                  <option value="greedy_search">greedy_search（最快）</option>
+                  <option value="modified_beam_search">modified_beam_search（更准）</option>
+                </select>
+              </Row>
+            )
+          }
+          if (f.path === 'speech.flushSilenceSeconds') {
+            return (
+              <Row key={f.path} label={f.displayName} desc={f.description}>
+                <div className="range-wrap">
+                  <input
+                    type="range" min={0} max={3} step={0.1}
+                    value={Number(value ?? 0.8)}
+                    onChange={(e) => void setField(f.path, Number(e.target.value))}
+                  />
+                  <code>{Number(value ?? 0.8).toFixed(1)}s</code>
+                </div>
+              </Row>
+            )
+          }
+          return null
+        })}
+      </SectionCard>
+
+      <Note kind="info">
+        线程数 / 解码方式改动后，下一次识别会重建识别器（约 5 秒）；切到 API 会顺手释放
+        本地模型占用的内存。关掉「启用」则 🎤 按钮与 transcribe_audio 工具都会明确拒绝，
+        而不是静默失败。
+      </Note>
+      {/* 「保存所有修改」以外还有零散草稿时提示一下，免得以为已经生效。 */}
+      {Object.keys(draft).length > 0 && (
+        <Note kind="warn">有 {Object.keys(draft).length} 项修改还没保存（回车或点「保存所有修改」）。</Note>
+      )}
+    </DetailShell>
+  )
+}
+
 // ---------------------------------------------------------------------------
 export function McpPage(props: { onBack: () => void }) {
   return (

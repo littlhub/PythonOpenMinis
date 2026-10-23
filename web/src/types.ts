@@ -1,5 +1,21 @@
 /** Types mirroring the FastAPI payloads in openminis/server/main.py. */
 
+/** 本地语音模型的下载进度（GET /api/speech/model/download）。 */
+export interface SpeechDownloadState {
+  phase: 'idle' | 'downloading' | 'extracting' | 'done' | 'error'
+  message: string
+  source: string | null
+  received: number
+  total: number
+  percent: number | null
+  speedBytesPerSec: number
+  elapsedMs: number
+  error: string | null
+  target: string | null
+  startedAt: number | null
+  finishedAt: number | null
+}
+
 export interface ConfigFieldInfo {
   path: string
   displayName: string
@@ -10,6 +26,8 @@ export interface ConfigFieldInfo {
   scope: string
   unavailableReason: string | null
   value: unknown
+  /** 敏感项明文已被打码（后端有值）。前端据此提示「留空不变」。 */
+  hasSecret?: boolean
 }
 
 export interface ConfigUpdateResult {

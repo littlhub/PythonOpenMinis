@@ -14,6 +14,7 @@ import type {
   FsRoot,
   GuardEvent,
   GuardEventList,
+  SpeechDownloadState,
   GuardLiveItem,
   GuardScope,
   HealthInfo,
@@ -489,6 +490,89 @@ export const api = {
     const form = new FormData()
     form.append('file', file)
     const res = await fetch(`${API}/upload`, { method: 'POST', body: form })
+    if (!res.ok) {
+      const detail = await res.json().catch(() => ({ detail: res.statusText }))
+      throw new Error(detail?.detail ?? res.statusText)
+    }
+    return res.json()
+  },
+
+  /**
+   * 本地语音识别（🎤 按钮）。同样不能用 ``request()`` —— multipart 要浏览器自己
+   * 带 boundary。返回的 ``text`` 直接插进输入框：以前这里插的是 ``blob:`` URL，
+   * 只有创建它的标签页能解析，模型收到的是个死链。
+   */
+  speechStatus: () =>
+    request<{
+      ok: boolean
+      enabled: boolean
+      /** 实际生效的引擎：local | api（auto 已解析成其中之一）。 */
+      engine: 'local' | 'api'
+      /** 设置里存的原值：local | api | auto。 */
+      engineSetting: 'local' | 'api' | 'auto'
+      engines: Record<string, { label: string }>
+      presets: Record<string, string>
+      /** 每个预设自带的地址 / 模型 / Key 环境变量。 */
+      presetDefaults: Record<string, { base_url: string; model: string; key_env: string }>
+      /** 「模型服务 → 用途分槽 → 音频」绑定的模型（预设选「音频槽位模型」时用它）。 */
+      slotModel?: {
+        bound: boolean
+        instanceId: string | null
+        instanceType: string | null
+        model: string | null
+        endpoint: string | null
+      }
+      model: string | null
+      root: string | null
+      /** 模型目录里逐个文件的校验结果（缺哪个、字节数对不对）。 */
+      files: Record<string, unknown>
+      engineReady?: boolean
+      loaded: boolean
+      error: string | null
+      warnings: string[]
+      /** 引擎输入采样率 —— 浏览器按它录音，两边一致就不用重采样。 */
+      sampleRate: number
+      languages: string[]
+      sherpaOnnxVersion: string
+      /** 走 API 时的配置摘要（Key 不出后端）。 */
+      api?: {
+        preset: string
+        baseUrl: string
+        model: string
+        auth: string
+        language: string
+        timeoutSeconds: number
+      }
+      localReady?: boolean
+      /** 本地模型下载进度；phase=idle 表示没在下载。 */
+      download: SpeechDownloadState
+      /** 本地模型装在哪（下载目标目录）。 */
+      managedDir: string
+    }>('/speech/status'),
+
+  /** 开始（或继续）后台下载本地模型；重复调用只回报当前进度。 */
+  speechDownloadModel: (sources?: string) =>
+    request<Record<string, unknown>>(
+      `/speech/model/download${sources ? `?sources=${encodeURIComponent(sources)}` : ''}`,
+      { method: 'POST' },
+    ),
+
+  speechDownloadProgress: () => request<SpeechDownloadState>('/speech/model/download'),
+
+  speechTranscribe: async (
+    blob: Blob,
+    filename = 'clip.wav',
+  ): Promise<{
+    ok: boolean
+    text: string
+    engine: 'local' | 'api'
+    model: string
+    durationMs: number
+    audioMs: number
+  }> => {
+    const form = new FormData()
+    form.append('file', blob, filename)
+    const res = await fetch(`${API}/speech/transcribe`, { method: 'POST', body: form })
     if (!res.ok) {
       const detail = await res.json().catch(() => ({ detail: res.statusText }))
       throw new Error(detail?.detail ?? res.statusText)

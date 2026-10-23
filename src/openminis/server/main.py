@@ -70,6 +70,7 @@ from .subagents_api import router as subagents_router
 from .system_api import router as system_router
 from .appearance_api import router as appearance_router
 from .plugins_api import router as plugins_router
+from .speech_api import router as speech_router
 from .upload_api import router as upload_router
 from .usage_api import router as usage_router
 
@@ -214,6 +215,7 @@ app.include_router(scheduled_router)
 app.include_router(usage_router)
 app.include_router(appearance_router)
 app.include_router(upload_router)
+app.include_router(speech_router)
 app.include_router(guard_router)
 
 
@@ -290,6 +292,27 @@ async def config_topics() -> list[str]:
     return _registry().topics()
 
 
+#: What the UI shows instead of a secret; a PUT carrying it back means "unchanged".
+REDACTED_PLACEHOLDER = "••• (hidden)"
+
+#: Scalar paths whose value never leaves the backend unmasked.
+_SECRET_FIELD_SUFFIXES = ("apiKey", "oauthToken", "manualOAuthToken", "password", "token")
+
+
+def _redact_field(field: Any, value: Any) -> Any:
+    """Mask a secret scalar (``speech.apiKey`` …) before it reaches the browser."""
+    if not _is_secret_path(str(getattr(field, "path", ""))):
+        return value
+    raw = getattr(value, "value", value)
+    if isinstance(raw, str) and raw and not raw.startswith("$$"):
+        return type(value)(REDACTED_PLACEHOLDER)
+    return value
+
+
+def _is_secret_path(path: str) -> bool:
+    return path.rsplit(".", 1)[-1] in _SECRET_FIELD_SUFFIXES
+
+
 @app.get("/api/config")
 async def config_list(topic: str | None = None) -> list[dict[str, Any]]:
     registry = _registry()
@@ -302,6 +325,8 @@ async def config_list(topic: str | None = None) -> list[dict[str, Any]]:
     for f in fields:
         if f is None:
             continue
+        value = f.read()
+        redacted = json.loads(_redact_field(f, value).json_string())
         out.append(
             {
                 "path": f.path,
@@ -312,7 +337,11 @@ async def config_list(topic: str | None = None) -> list[dict[str, Any]]:
                 "risk": f.risk.value,
                 "scope": f.scope,
                 "unavailableReason": f.unavailable_reason,
-                "value": json.loads(f.read().json_string()),
+                # 敏感项（API Key 之类）只给前端一个占位符，明文不出后端。
+                "value": redacted,
+                # 「已配置」标志：明文被打了码，前端只能靠这个判断要不要提示
+                # 「留空不变」。空值 / 未打码的值都算没配置。
+                "hasSecret": redacted != json.loads(value.json_string()),
             }
         )
     return out
@@ -335,7 +364,7 @@ async def config_get(path: str) -> Any:
     field = _registry().resolve_field(path)
     if field is None:
         raise HTTPException(status_code=404, detail=f"unknown_path: {path}")
-    return json.loads(field.read().json_string())
+    return json.loads(_redact_field(field, field.read()).json_string())
 
 
 @app.put("/api/config/{path:path}")
@@ -355,12 +384,33 @@ async def config_set(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     except ConfigError as e:
         raise HTTPException(status_code=400, detail=str(e)) from None
 
+    # 前端拿到的是打码后的 Key，原样存回来等于把真 Key 覆盖掉 —— 这种情况
+    # 视为「没改」，直接返回当前（同样打码的）值。
+    raw_value = getattr(parsed, "value", None)
+    if _is_secret_path(path) and raw_value == REDACTED_PLACEHOLDER:
+        current = field.read()
+        return {
+            "path": path,
+            "oldValue": json.loads(_redact_field(field, current).json_string()),
+            "newValue": json.loads(_redact_field(field, current).json_string()),
+        }
+
     old = field.read()
     field.write(parsed)
+    # 语音引擎的选择 / 解码参数变了，缓存的识别器就过期了（切到 API 时还把
+    # 之前占着的 200 MB 权重放掉）；下一次识别按新设置重建。导入放函数里，
+    # 免得没装 sherpa-onnx 的机器连服务都起不来。
+    if path.startswith("speech."):
+        try:
+            from ..speech import drop_recognizer_if_loaded
+
+            drop_recognizer_if_loaded()
+        except Exception:  # noqa: BLE001 - 配置保存不该因为引擎没就绪而失败
+            logger.debug("speech engine reset skipped", exc_info=True)
     return {
         "path": path,
-        "oldValue": json.loads(old.json_string()),
-        "newValue": json.loads(parsed.json_string()),
+        "oldValue": json.loads(_redact_field(field, old).json_string()),
+        "newValue": json.loads(_redact_field(field, parsed).json_string()),
     }
 
 
@@ -571,6 +621,13 @@ async def settings_put(payload: dict[str, Any]) -> dict[str, Any]:
         store.apply_full(payload)
     except SettingsError as e:
         raise HTTPException(status_code=400, detail=str(e)) from None
+    # 「音频」槽位可能刚换过模型 / 网关地址，语音引擎要按新绑定重建。
+    try:
+        from ..speech import drop_recognizer_if_loaded as _drop
+
+        _drop()
+    except Exception:
+        logger.debug("speech engine reset skipped", exc_info=True)
     return _settings_view(store)
 
 

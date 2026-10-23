@@ -22,6 +22,7 @@ import type {
 import { RUNNING_SESSIONS_EVENT as RUNNING_EVENT } from '../types'
 import { RightPanel } from './RightPanel'
 import { openImagePreview } from './ImageLightbox'
+import { MIN_RECORD_MS, WavRecorder } from '../wavRecorder'
 
 // 多会话并行后 messages/seen 都按会话从 map 里取；没有内容时返回同一个空数组，
 // 免得每次渲染新建引用、把子组件全带上重渲。
@@ -2098,12 +2099,13 @@ function Composer({
 }) {
   const [draft, setDraft] = useState('')
   const [recording, setRecording] = useState(false)
+  const [transcribing, setTranscribing] = useState(false)
+  const [recError, setRecError] = useState<string | null>(null)
   const [attachBusy, setAttachBusy] = useState(false)
   const [attachError, setAttachError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const imageInputRef = useRef<HTMLInputElement | null>(null)
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null)
-  const audioChunksRef = useRef<Blob[]>([])
+  const recorderRef = useRef<WavRecorder | null>(null)
 
   /**
    * 草稿里的图片引用 —— 渲染成输入框上方的缩略图，让「我要发哪张图」看得见
@@ -2207,34 +2209,53 @@ function Composer({
   }
 
   const startRecording = async () => {
+    setRecError(null)
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true })
-      const mr = new MediaRecorder(stream)
-      mediaRecorderRef.current = mr
-      audioChunksRef.current = []
-      mr.ondataavailable = (e) => {
-        if (e.data.size > 0) audioChunksRef.current.push(e.data)
-      }
-      mr.onstop = () => {
-        const blob = new Blob(audioChunksRef.current, { type: 'audio/webm' })
-        const url = URL.createObjectURL(blob)
-        insertTool(`🎤 [语音消息](${url})`)
-      }
-      mr.start()
+      const recorder = new WavRecorder()
+      await recorder.start()
+      recorderRef.current = recorder
       setRecording(true)
-    } catch {
-      insertTool('⚠️ 无法访问麦克风')
+    } catch (err) {
+      recorderRef.current = null
+      setRecording(false)
+      setRecError((err as Error).message || '无法访问麦克风')
     }
   }
 
-  const stopRecording = () => {
-    const mr = mediaRecorderRef.current
-    if (mr && mr.state !== 'inactive') {
-      mr.stop()
-    }
-    mediaRecorderRef.current = null
+  const stopRecording = async () => {
+    const recorder = recorderRef.current
+    recorderRef.current = null
     setRecording(false)
+    if (!recorder) return
+
+    const clip = recorder.stop()
+    if (!clip) return
+    if (clip.durationMs < MIN_RECORD_MS) {
+      setRecError(`录音太短（${clip.durationMs}ms），请按住说完整一句`)
+      return
+    }
+
+    // 录音已经结束，识别还要一两秒 —— 单独的状态，避免把「识别中」显示成
+    // 「上传中」，也避免用户以为按钮没反应又点一次。
+    setTranscribing(true)
+    try {
+      const result = await api.speechTranscribe(clip.blob, 'clip.wav')
+      const text = result.text.trim()
+      if (!text) {
+        setRecError('没识别出内容，请靠近麦克风重试')
+        return
+      }
+      // 前后各留一个空格，免得直接粘在已有文字上连成一句。
+      insertTool(` ${text} `)
+    } catch (err) {
+      setRecError((err as Error).message)
+    } finally {
+      setTranscribing(false)
+    }
   }
+
+  // 组件卸载（或切会话）时麦克风必须松开，否则录音指示灯一直亮着。
+  useEffect(() => () => recorderRef.current?.cancel(), [])
 
   return (
     <form
@@ -2345,6 +2366,19 @@ function Composer({
         {attachError && (
           <div className="composer-note err">附件上传失败：{attachError}</div>
         )}
+        {recError && (
+          <div className="composer-note err">
+            语音识别失败：{recError}
+            <button
+              type="button"
+              className="composer-note-x"
+              title="关闭提示"
+              onClick={() => setRecError(null)}
+            >
+              ×
+            </button>
+          </div>
+        )}
         {queued > 0 && (
           <div className="composer-note">
             📥 已排队 {queued} 条，本轮结束后自动发送
@@ -2356,12 +2390,20 @@ function Composer({
       <div className="composer-right">
         <button
           type="button"
-          className={`composer-rec-btn ${recording ? 'recording' : ''}`}
-          disabled={disabled}
+          className={`composer-rec-btn ${recording ? 'recording' : ''} ${
+            transcribing ? 'transcribing' : ''
+          }`}
+          disabled={disabled || transcribing}
           onClick={recording ? stopRecording : startRecording}
-          title={recording ? '停止录音' : '语音输入'}
+          title={
+            transcribing
+              ? '本地识别中…'
+              : recording
+                ? '停止录音并识别'
+                : '语音输入（本地离线识别）'
+          }
         >
-          🎤
+          {transcribing ? '⏳' : '🎤'}
         </button>
         {busy && (
           <button

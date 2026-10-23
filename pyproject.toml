@@ -35,6 +35,16 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# --- speech (本地离线语音识别) ---
+# Optional on purpose: sherpa-onnx ships the ONNX runtime (~200 MB) and the
+# zipformer weights are another ~200 MB. Installs that never record audio
+# should not pay for it. The 🎤 button degrades to a "未安装" hint when this
+# extra is missing — see openminis/speech/stt_core.py.
+speech = [
+    "numpy>=1.26",
+    "sherpa-onnx>=1.10",
+]
+
 dev = [
     "pytest>=8.2",
     "pytest-asyncio>=0.23",

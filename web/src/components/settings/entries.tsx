@@ -10,6 +10,7 @@ export type SetPageId =
   | 'appearance'
   | 'soul'
   | 'skills'
+  | 'speech'
   | 'memory'
   | 'mcp'
   | 'env'
@@ -115,6 +116,14 @@ export const GROUPS: SettingsGroupDef[] = [
         subtitle: '已移植工具目录(Shell / 文件 / 视觉 / 记忆 / 浏览器)',
         icon: '🧩',
         tint: BLUE,
+        kind: 'page',
+      },
+      {
+        id: 'speech',
+        title: '语音识别',
+        subtitle: '本地离线中英双语转写 · 线程 / 解码方式 / 尾部静音',
+        icon: '🎙️',
+        tint: GREEN,
         kind: 'page',
       },
       {

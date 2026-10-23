@@ -2155,6 +2155,20 @@ button.link.danger {
 }
 .composer-note.err { color: #b42318; }
 
+/* 提示右侧的关闭按钮（语音识别失败的提示可以自己关掉，不用等下次录音） */
+.composer-note-x {
+  margin-left: 6px;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0 2px;
+  cursor: pointer;
+  opacity: 0.6;
+}
+.composer-note-x:hover { opacity: 1; }
+
 /* 用户气泡里的附件（图片缩略图 + 文件芯片） */
 .bubble-attachments {
   display: flex;
@@ -2309,6 +2323,12 @@ button.link.danger {
 @keyframes pulse-rec {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.6; }
+}
+
+.composer-rec-btn.transcribing {
+  border-color: var(--accent);
+  color: var(--accent);
+  cursor: progress;
 }
 
 .composer-rec-btn:disabled {

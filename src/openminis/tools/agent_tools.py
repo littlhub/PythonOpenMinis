@@ -35,6 +35,7 @@ from .search_files_tool import SearchFilesTool
 from .send_tool import SendTool
 from .shell_execute_tool import ShellExecuteTool
 from .subagent_tool import SubagentDelegateTool
+from .transcribe_audio_tool import TranscribeAudioTool
 from .skill_use_tool import SkillUseTool
 from .vision_group_resolver import VisionGroupResolver
 from .web_fetch_tool import WebFetchTool
@@ -74,6 +75,10 @@ class AgentTools:
         out.append(BrowserUseTool.definition())
         out.append(WebFetchTool.definition())
         out.append(WebSearchTool.definition())
+        # 本地语音转写 —— 与 read_image 同一动机：附件默认只带路径，模型需要
+        # 一个工具才能「听见」音频内容。引擎依赖是可选装，调用时会明确报错，
+        # 所以 schema 无条件暴露是安全的（与 web_search 同一策略）。
+        out.append(TranscribeAudioTool.definition())
         # 把本地产物（生成的图/报告/下载）交付给用户。也是**硬停收尾阶段唯一
         # 允许调用的工具**（agent_runtime 的 send-only 收尾轮），必须常驻 ——
         # 否则收尾链空转，用户既拿不到产物也拿不到总结。

@@ -19,6 +19,7 @@ import {
   McpPage,
   MountFoldersPage,
   PermissionsPage,
+  SpeechPage,
   StoragePage,
 } from './settings/system'
 
@@ -44,6 +45,7 @@ export function SettingsView() {
   if (page === 'appearance') return <AppearancePage onBack={onBack} />
   if (page === 'soul') return <SoulPage onBack={onBack} go={go} />
   if (page === 'skills') return <SkillsPage onBack={onBack} go={go} />
+  if (page === 'speech') return <SpeechPage onBack={onBack} />
   if (page === 'memory') return <MemoryPage onBack={onBack} />
   if (page === 'mcp') return <McpPage onBack={onBack} />
   if (page === 'env') return <EnvVarsPage onBack={onBack} />

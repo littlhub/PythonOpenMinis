@@ -39,6 +39,7 @@ from ..tools.shell_execute_tool import ShellExecuteTool
 from ..tools.subagent_tool import SubagentDelegateTool
 from ..tools.skill_use_tool import SkillUseTool
 from ..tools.tool_execution_result import ToolExecutionResult
+from ..tools.transcribe_audio_tool import TranscribeAudioTool
 from ..tools.vision_group_resolver import VisionGroupResolver
 from ..tools.web_fetch_tool import WebFetchTool
 from ..tools.web_search_tool import WebSearchTool
@@ -188,6 +189,7 @@ BUILTIN_IDENTITIES: list[Identity] = [
             "web_fetch",
             "web_search",
             "read_image",
+            "transcribe_audio",
             "image_gen",
             "subagent_delegate",
             "skill_use",
@@ -215,6 +217,7 @@ BUILTIN_IDENTITIES: list[Identity] = [
             "web_fetch",
             "web_search",
             "read_image",
+            "transcribe_audio",
             "image_gen",
             "subagent_delegate",
             "skill_use",
@@ -240,6 +243,7 @@ BUILTIN_IDENTITIES: list[Identity] = [
             "ls",
             "search_files",
             "read_image",
+            "transcribe_audio",
             "skill_use",
             "memory_write",
             "memory_get",
@@ -272,6 +276,7 @@ IDENTITY_TOOL_MATCH: dict[str, list[str]] = {
         "web_fetch",
         "web_search",
         "read_image",
+        "transcribe_audio",
         "image_gen",
         "subagent_delegate",
         "skill_use",
@@ -289,6 +294,7 @@ IDENTITY_TOOL_MATCH: dict[str, list[str]] = {
         "web_fetch",
         "web_search",
         "read_image",
+        "transcribe_audio",
         "image_gen",
         "subagent_delegate",
         "skill_use",
@@ -304,6 +310,7 @@ IDENTITY_TOOL_MATCH: dict[str, list[str]] = {
         "ls",
         "search_files",
         "read_image",
+        "transcribe_audio",
         "image_gen",
         "skill_use",
         "memory_write",
@@ -346,6 +353,8 @@ def _tool_desc(tool_id: str) -> str:
             return LsTool.definition().description
         if tool_id == "search_files":
             return SearchFilesTool.definition().description
+        if tool_id == "transcribe_audio":
+            return TranscribeAudioTool.definition().description
         if tool_id == "web_fetch":
             return WebFetchTool.definition().description
         if tool_id == "web_search":
@@ -431,6 +440,12 @@ TOOL_CATALOG: list[dict] = [
         "name": "搜索文件",
         "description": _tool_desc("search_files"),
         "category": "Files",
+    },
+    {
+        "id": "transcribe_audio",
+        "name": "语音转文字",
+        "description": _tool_desc("transcribe_audio"),
+        "category": "Vision",
     },
     {
         "id": "web_fetch",
@@ -810,6 +825,10 @@ def build_tool_registry(enabled_ids: list[str]) -> dict[str, ToolExecutor]:
         elif tool_id == "search_files":
             out[tool_id] = _wrap_async_static_executor(
                 SearchFilesTool.definition(), SearchFilesTool.execute
+            )
+        elif tool_id == "transcribe_audio":
+            out[tool_id] = _wrap_async_static_executor(
+                TranscribeAudioTool.definition(), TranscribeAudioTool.execute
             )
         elif tool_id == "web_fetch":
             out[tool_id] = _wrap_async_static_executor(

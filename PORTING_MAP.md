@@ -115,7 +115,7 @@
 | `ui/` | 93,961 | pending（拆为 Python ViewModel + React 组件，见 PORTING.md §6） |
 | `sandbox/` | 15,580 | pending |
 | `provider/` | 10,870 | pending |
-| `speech/` | 7,880 | pending |
+| `speech/` | 7,880 | **partial** — Android 走系统 `SpeechRecognizer`（桌面无对应物），改为自建本地引擎：`speech/stt_core.py`（sherpa-onnx 流式 zipformer，WAV 解析/重采样/ffmpeg 兜底）+ `speech/engine.py`（进程级识别器单例、配置读取、`transcribe_path`/`transcribe_bytes`）done；`server/speech_api.py` 挂 `GET /api/speech/status` 与 `POST /api/speech/transcribe`；前端 🎤 由 `web/src/wavRecorder.ts` 录 16k 单声道 WAV 后上传，识别文本写回输入框（原先插的是后端读不到的 `blob:` URL）。`correction/` 待翻 |
 | `debug/` | 5,780 | pending |
 | `backup/` | 5,671 | pending |
 | `browser/` | 4,193 | pending |
