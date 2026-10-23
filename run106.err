@@ -1,6 +1,0 @@
-当前进程写不进数据目录 C:\Users\loo\openminis（只读配置 / 权限 / 沙箱限制都可能导致）—— 本次改用 C:\Users\loo\AppData\Local\Temp\dsh-7V6cZm\openminis，重启后可能被清理；若这是正常桌面环境，请检查目录权限，或用环境变量 MINIS_HOME 指到一个可写目录
-当前进程写不进数据目录 C:\Users\loo\AppData\Local\openminis\cache（只读配置 / 权限 / 沙箱限制都可能导致）—— 本次改用 C:\Users\loo\AppData\Local\Temp\dsh-7V6cZm\openminis-cache，重启后可能被清理；若这是正常桌面环境，请检查目录权限，或用环境变量 MINIS_HOME 指到一个可写目录
-INFO:     Started server process [3840]
-INFO:     Waiting for application startup.
-INFO:     Application startup complete.
-INFO:     Uvicorn running on http://127.0.0.1:8899 (Press CTRL+C to quit)

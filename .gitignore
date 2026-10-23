@@ -27,6 +27,10 @@ tmp/
 .coverage
 htmlcov/
 
+# 本地调试输出（启动时把 stdout/stderr 重定向到仓库根，别让它们进版本库）
+/*.out
+/*.err
+
 # Local snapshot / tooling binaries (not part of the port)
 .ccjcode_versions/
 ccjcode1.exe
