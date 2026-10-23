@@ -94,7 +94,7 @@ warning，而不是直接起不来 —— 只读漫游配置、企业策略、�
 
 [Releases](https://github.com/littlhub/PythonOpenMinis/releases) 里有 Windows 包
 （`OpenMinis-<版本>-win64.zip`）：解压后运行 `OpenMinis\OpenMinis.exe`，浏览器打
-开它打印的地址即可，不需要装 Python。当前为 **1.0.5**（含上面的语音输入与数据目录降级）。
+开它打印的地址即可，不需要装 Python。当前为 **1.0.4**（含上面的语音输入与数据目录降级）。
 
 ## Tests
 
