@@ -84,18 +84,34 @@ def setup_logging(
     root.addHandler(console_handler)
 
     # --- rotating file (logcat persistence parity) -----------------------
-    path = log_file or (app_context().cache_dir / "logs" / "minis.log")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    file_handler = logging.handlers.RotatingFileHandler(
-        path, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
+    # 日志是锦上添花，不是启动前提。缓存目录可能只读（企业策略、只读漫游配置、
+    # 受限沙箱、盘满……），原来的写法会让一个 PermissionError 在 startup 阶段
+    # 把整个服务打死。这里按「指定路径 → 缓存目录 → 系统临时目录 → 只留控制台」
+    # 逐级降级，永远不因为写不了日志而拒绝启动。
+    formatter = logging.Formatter(
+        "%(asctime)s %(levelname)-7s %(name)s [%(threadName)s]: %(message)s"
     )
-    file_handler.setFormatter(
-        logging.Formatter(
-            "%(asctime)s %(levelname)-7s %(name)s [%(threadName)s]: %(message)s"
-        )
-    )
-    file_handler.setLevel(logging.DEBUG)
-    root.addHandler(file_handler)
+    candidates: list[Path] = [Path(log_file) if log_file else app_context().cache_dir / "logs" / "minis.log"]
+    try:
+        import tempfile  # noqa: PLC0415 - only needed for the fallback
+
+        candidates.append(Path(tempfile.gettempdir()) / "openminis-logs" / "minis.log")
+    except Exception:  # pragma: no cover - 连 tempfile 都拿不到时保持原样
+        pass
+    for candidate in candidates:
+        try:
+            candidate.parent.mkdir(parents=True, exist_ok=True)
+            file_handler = logging.handlers.RotatingFileHandler(
+                candidate, maxBytes=max_bytes, backupCount=backup_count, encoding="utf-8"
+            )
+        except OSError:
+            continue
+        file_handler.setFormatter(formatter)
+        file_handler.setLevel(logging.DEBUG)
+        root.addHandler(file_handler)
+        break
+    else:
+        root.warning("日志文件不可写，本次只输出到控制台：%s", candidates[0])
 
     root.propagate = False
     _CONFIGURED = True

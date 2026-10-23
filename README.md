@@ -64,6 +64,31 @@ Once `web/dist` exists, FastAPI serves it directly from
 before building, `/` now returns a page telling you the command to run
 rather than a bare 404.
 
+## 语音输入（语音识别）
+
+聊天框的 🎤 是**真的转写**，不是塞一个本地 `blob:` 链接：浏览器录音 → 服务端识别 →
+文字回填到输入框。两条引擎，在「设置 → 语音识别」里切：
+
+| 引擎 | 说明 |
+|---|---|
+| 本地 sherpa-onnx（默认） | 离线，热词多语言中英混合；首次要在设置页点「下载模型」（约 199 MB，落盘到 `<data_dir>/models/`） |
+| 模型 API | 任意 OpenAI 兼容的 `/audio/transcriptions`（OpenAI / Groq / 硅基流动 / 百炼 / 自建），需要 Key |
+
+模型下载按顺序试 GitHub Release → `gh-proxy.com` / `ghproxy.net` 加速镜像 →
+HuggingFace 镜像（按文件取，199 MB 比 487 MB 的压缩包省一半多）。断流会从断点
+续传，同一台机器重来只补缺的文件；装完逐个校验字节数。也可以手动把模型目录放进
+`<data_dir>/models/<MODEL_ID>`，或设环境变量 `EKKO_STT_MODEL_DIR`。
+
+服务端路由：`GET /api/speech/status`、`POST /api/speech/transcribe`（multipart
+`file`）、`POST|GET /api/speech/model/download`。识别走 `asyncio.to_thread`，
+不阻塞事件循环。
+
+## 预编译包
+
+[Releases](https://github.com/littlhub/PythonOpenMinis/releases) 里有 Windows 包
+（`OpenMinis-<版本>-win64.zip`）：解压后运行 `OpenMinis\OpenMinis.exe`，浏览器打
+开它打印的地址即可，不需要装 Python。当前为 **1.0.4**（含上面的语音输入）。
+
 ## Tests
 
 ```bash
