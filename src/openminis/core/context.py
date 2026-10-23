@@ -35,27 +35,74 @@ def _writable(path: Path) -> bool:
         return False
 
 
-def _pick_writable(preferred: Path, fallback_name: str) -> Path:
-    """优先用常规目录；不可写就退到系统临时目录，别让一个只读的 home 卡死启动。
+def _temp_roots() -> list[Path]:
+    """候选临时目录，按优先级。
 
-    退到临时目录只是「能跑起来」，重启后数据可能被系统清掉 —— 所以打一条
-    warning，并提示用 ``MINIS_HOME`` 指到真正的可写位置。
+    刻意不用 ``tempfile.gettempdir()``：它在 ``TEMP`` / ``TMP`` 都没设时会退到
+    **当前工作目录**，于是数据就落在 exe 旁边 —— 看起来像「绿色 / U 盘版」，
+    其实只是环境变量丢了。这里宁可退到 home 下的隐藏目录，也不碰 cwd。
     """
+    out: list[Path] = []
+    for name in ("TEMP", "TMP", "TMPDIR"):
+        value = os.environ.get(name)
+        if value:
+            out.append(Path(value).expanduser())
+    home = Path.home()
+    if sys.platform == "win32":
+        out.append(home / "AppData" / "Local" / "Temp")
+    else:
+        out.append(Path("/tmp"))
+    out.append(home / ".openminis-tmp")
+    return out
+
+
+def _pick_temp(fallback_name: str) -> Path | None:
+    for root in _temp_roots():
+        candidate = root / fallback_name
+        if _writable(candidate):
+            return candidate
+    return None
+
+
+def _pick_writable(preferred: Path, fallback_name: str) -> Path:
+    """优先用常规目录；只有「目录还不存在且建不出来」才退到临时目录。
+
+    关键约束：**已经有数据的目录永远优先**。哪怕当前进程写不进去，也要沿用它
+    把原来的数据读出来 —— 换到临时目录等于让用户看到一个空应用，比写失败更糟。
+    只有全新安装、又碰上只读 home 时，才临时兜底。
+    """
+    import logging  # noqa: PLC0415 - 局部导入避免与 .logging 的循环依赖
+
+    log = logging.getLogger("openminis.core.context")
+
+    if preferred.exists():
+        if not _writable(preferred):
+            log.warning(
+                "数据目录 %s 已存在但当前进程写不进去（只读 / 权限 / 沙箱）—— "
+                "仍按原路径使用，原有数据照常读取，新增写入会失败；"
+                "要恢复写入请修目录权限或用 MINIS_HOME 换位置（会另起一份数据）",
+                preferred,
+            )
+        return preferred
+
     if _writable(preferred):
         return preferred
-    import logging  # noqa: PLC0415 - 局部导入避免与 .logging 的循环依赖
-    import tempfile  # noqa: PLC0415
 
-    fallback = Path(tempfile.gettempdir()) / fallback_name
-    if _writable(fallback):
-        logging.getLogger("openminis.core.context").warning(
-            "当前进程写不进数据目录 %s（只读配置 / 权限 / 沙箱限制都可能导致）"
-            "—— 本次改用 %s，重启后可能被清理；若这是正常桌面环境，请检查目录权限，"
-            "或用环境变量 MINIS_HOME 指到一个可写目录",
+    fallback = _pick_temp(fallback_name)
+    if fallback is not None:
+        log.warning(
+            "数据目录 %s 不存在也建不出来（只读配置 / 权限 / 沙箱限制）"
+            "—— 本次临时改用 %s，重启后可能被清理；"
+            "要长期使用请用 MINIS_HOME 指到一个可写目录",
             preferred,
             fallback,
         )
         return fallback
+    log.warning(
+        "数据目录 %s 建不出来，也没有可用的临时目录兜底 —— 会继续用原路径，"
+        "写入失败的地方会逐条报错",
+        preferred,
+    )
     return preferred
 
 

@@ -141,6 +141,17 @@ def main() -> None:
     # 后端 app（复用 server 模块里已装配路由/静态托管的 FastAPI 实例）
     from openminis.server.main import app as fastapi_app  # noqa: PLC0415
 
+    # 把实际用的数据目录打出来：换目录（MINIS_HOME / 临时兜底）时，
+    # 用户一眼就能看出「为什么原来看得到的东西不见了」。
+    try:
+        from openminis.core.context import app_context  # noqa: PLC0415
+
+        ctx = app_context()
+        print(f"[OpenMinis] 数据目录 {ctx.data_dir}")
+        print(f"[OpenMinis] 缓存目录 {ctx.cache_dir}")
+    except Exception:  # pragma: no cover - 只影响一行提示
+        pass
+
     vite_proc: subprocess.Popen[bytes] | None = None
     if args.dev:
         vite_proc = _start_vite()
